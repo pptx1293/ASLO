@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#07090e">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>ASLO Mobile — Sign Language Neural Studio</title>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <!-- Mobile Stylesheet -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/mobile.css') }}?v=mobile_v2">
+</head>
+
+<body>
+
+    <!-- ── Ambient Background Glow ──────────────────────────────────────── -->
+    <div class="m-ambient-glow"></div>
+
+    <!-- ── Mobile Header ────────────────────────────────────────────────── -->
+    <header class="mobile-header">
+        <a href="/" class="mobile-brand" title="ASLO Sign Studio">
+            <span class="brand-icon">🤟</span>
+            <div class="brand-title">ASLO <span class="brand-badge">MOBILE</span></div>
+        </a>
+
+        <div class="mobile-header-actions">
+            <!-- Audio Speech Mute / Unmute Toggle -->
+            <button class="btn-mobile-icon" id="btn-sound-toggle" onclick="toggleSound()" title="Toggle Voice Readout">
+                <svg id="icon-sound-on" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                </svg>
+                <svg id="icon-sound-off" style="display:none;" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                    <line x1="23" y1="9" x2="17" y2="15"></line>
+                    <line x1="17" y1="9" x2="23" y2="15"></line>
+                </svg>
+            </button>
+
+            <!-- Gesture Dictionary Sheet Trigger -->
+            <button class="btn-mobile-icon" onclick="openDictionary()" title="Gesture Dictionary">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+                </svg>
+            </button>
+
+            <!-- Switch to Desktop Cockpit -->
+            <a href="/" class="btn-mobile-icon" title="Switch to Desktop Version">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                    <line x1="8" y1="21" x2="16" y2="21"></line>
+                    <line x1="12" y1="17" x2="12" y2="21"></line>
+                </svg>
+            </a>
+        </div>
+    </header>
+
+    <!-- ── Main Scrollable Content ──────────────────────────────────────── -->
+    <main class="mobile-content">
+
+        <!-- ── Sci-Fi Viewfinder Container ──────────────────────────────── -->
+        <section class="mobile-cam-box" id="mobile-cam-box">
+            <!-- HUD Sci-Fi Corner Brackets -->
+            <div class="m-hud-corner m-hud-tl"></div>
+            <div class="m-hud-corner m-hud-tr"></div>
+            <div class="m-hud-corner m-hud-bl"></div>
+            <div class="m-hud-corner m-hud-br"></div>
+
+            <!-- Top HUD Overlay Row -->
+            <div class="m-hud-top-bar">
+                <!-- Recording Radar Pill -->
+                <div class="m-hud-tag rec-tag" id="m-hud-rec-tag">
+                    <span class="m-radar-ping"></span>
+                    <span class="m-rec-dot" id="m-rec-dot"></span>
+                    <span id="m-rec-status">STANDBY</span>
+                </div>
+
+                <!-- Dominant Hand Selector Quick-Switch -->
+                <div class="m-hand-switch" id="m-hand-switch" title="Dominant Signing Hand">
+                    <button class="m-hand-opt active" id="hand-opt-right" onclick="setDominantHand('right')">
+                        <span>✋</span> Right
+                    </button>
+                    <button class="m-hand-opt" id="hand-opt-left" onclick="setDominantHand('left')">
+                        <span>🤚</span> Left
+                    </button>
+                </div>
+
+                <!-- Camera Quick Actions (Switch & Mirror) -->
+                <div class="m-hud-actions">
+                    <button class="m-hud-btn" id="m-btn-mirror" onclick="toggleCameraMirror()" title="Mirror Viewfinder">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2v20M8 6L4 12l4 6M16 6l4 6-4 6"/>
+                        </svg>
+                    </button>
+                    <button class="m-hud-btn" id="m-btn-switch-cam" onclick="switchCamera()" title="Switch Front/Rear Camera">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M20 10V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v3"></path>
+                            <path d="M4 14v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"></path>
+                            <polyline points="7 7 10 4 7 1"></polyline>
+                            <polyline points="17 17 14 20 17 23"></polyline>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Video Stream -->
+            <img class="mobile-cam-img" id="mobile-cam-img" src="/video_feed" alt="Live Camera Stream">
+
+            <!-- Video Drop Fallback Placeholder -->
+            <div class="m-cam-fallback" id="m-cam-fallback" style="display:none;">
+                <div class="m-fallback-icon">📷</div>
+                <div class="m-fallback-text">Camera Reconnecting…</div>
+                <button class="m-fallback-btn" onclick="reconnectCam()">Tap to Reload Feed</button>
+            </div>
+
+            <!-- ── Prominent Dynamic Gesture Countdown Banner ──────────── -->
+            <div class="m-dyn-banner" id="m-dyn-banner" style="display:none;">
+                <div class="m-dyn-header">
+                    <span class="m-dyn-pulse-ring"></span>
+                    <span class="m-dyn-icon">⏳</span>
+                    <span>DYNAMIC SIGN IN PROGRESS</span>
+                </div>
+                <div class="m-dyn-title" id="m-dyn-title">HOW ARE YOU</div>
+                <div class="m-dyn-timer" id="m-dyn-timer">2.8s</div>
+                <div class="m-dyn-bar-track">
+                    <div class="m-dyn-bar-fill" id="m-dyn-bar-fill"></div>
+                </div>
+                <div class="m-dyn-caption">Complete sequence & hold end posture</div>
+            </div>
+
+            <!-- Bottom HUD Viewfinder Telemetry -->
+            <div class="m-hud-bottom-bar">
+                <div class="m-hud-tele-pill" id="m-hud-motion">
+                    <span class="m-tele-dot"></span>
+                    <span id="m-motion-label">STATIC</span>
+                </div>
+
+                <!-- Stability Buffer Dots -->
+                <div class="m-stability-cluster" id="m-stability-cluster" title="Sign Stability Confirmation">
+                    <span class="m-stab-label">STABILITY</span>
+                    <div class="m-stab-dots" id="m-stab-dots">
+                        <!-- Populated dynamically (8 segments) -->
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Current Sign Hero Card ───────────────────────────────────── -->
+        <section class="m-card m-sign-card">
+            <div class="m-sign-left">
+                <span class="m-label-tag">CURRENT DETECTED SIGN</span>
+                <div class="m-sign-val-wrapper">
+                    <div class="m-sign-val" id="m-sign-val">—</div>
+                    <span class="m-sign-sub" id="m-sign-sub">Standby</span>
+                </div>
+            </div>
+
+            <div class="m-sign-right">
+                <div class="m-conf-badge-box">
+                    <span class="m-conf-caption">CONFIDENCE</span>
+                    <div class="m-conf-pill" id="m-conf-pill">0%</div>
+                </div>
+                <div class="m-hand-pill-box">
+                    <span class="m-hand-pill" id="m-hand-pill">💤 Standby</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Live Translated Sentence Box ─────────────────────────────── -->
+        <section class="m-card m-transcript-card">
+            <div class="m-transcript-header">
+                <div class="m-transcript-title-group">
+                    <span class="m-label-tag">TRANSLATED SENTENCE</span>
+                    <span class="m-char-stats" id="m-char-stats">0 words · 0 chars</span>
+                </div>
+            </div>
+            
+            <div class="m-transcript-box empty" id="m-transcript-box">
+                <span class="m-text-content">(Waiting for signs… sign START to begin)</span>
+                <span class="m-cursor" id="m-cursor">|</span>
+            </div>
+
+            <!-- Quick Tactile Action Controls -->
+            <div class="m-quick-actions">
+                <button class="btn-m-action speak" onclick="speakTranscript()" title="Read aloud">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                        <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                    </svg>
+                    <span>Speak</span>
+                </button>
+                <button class="btn-m-action" onclick="copyTranscript()" title="Copy sentence">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                    </svg>
+                    <span>Copy</span>
+                </button>
+                <button class="btn-m-action" onclick="backspaceTranscript()" title="Undo last word">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"></path>
+                        <line x1="18" y1="9" x2="12" y2="15"></line>
+                        <line x1="12" y1="9" x2="18" y2="15"></line>
+                    </svg>
+                    <span>Undo</span>
+                </button>
+                <button class="btn-m-action danger" onclick="clearTranscript()" title="Clear sentence">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="3 6 5 6 21 6"></polyline>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    </svg>
+                    <span>Clear</span>
+                </button>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- ── Mobile Bottom Floating Touch Bar ─────────────────────────────── -->
+    <nav class="mobile-bottom-dock">
+        <!-- Giant Primary Recording Toggle Button -->
+        <button class="btn-m-rec" id="btn-m-rec-toggle" onclick="toggleRecording()">
+            <span class="m-rec-btn-glow"></span>
+            <span class="m-rec-icon" id="m-rec-btn-icon">⏺</span>
+            <span id="m-rec-btn-text">Start Recording</span>
+        </button>
+
+        <!-- Quick Switch Camera Hardware -->
+        <button class="btn-dock-icon" onclick="switchCamera()" title="Switch Front/Rear Camera">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 10V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v3"></path>
+                <path d="M4 14v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"></path>
+                <polyline points="7 7 10 4 7 1"></polyline>
+                <polyline points="17 17 14 20 17 23"></polyline>
+            </svg>
+        </button>
+
+        <!-- Quick Dictionary Sheet Trigger -->
+        <button class="btn-dock-icon" onclick="openDictionary()" title="Gesture Dictionary">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+            </svg>
+        </button>
+    </nav>
+
+    <!-- ── Toast Feedback Notification ──────────────────────────────────── -->
+    <div class="m-toast" id="m-toast">Notification</div>
+
+    <!-- ── Mobile Gesture Dictionary Bottom Sheet ──────────────────────── -->
+    <div class="m-modal" id="m-dict-modal" onclick="if(event.target === this) closeDictionary()">
+        <div class="m-sheet">
+            <!-- Pull Handle -->
+            <div class="m-sheet-drag-handle"></div>
+
+            <div class="m-sheet-header">
+                <div class="m-sheet-title-group">
+                    <h3 class="m-sheet-title">Sign Dictionary</h3>
+                    <span class="m-sheet-badge">43 Supported Signs</span>
+                </div>
+                <button class="btn-sheet-close" onclick="closeDictionary()">✕</button>
+            </div>
+
+            <!-- Instant Search Input -->
+            <div class="m-search-box">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                <input type="text" id="m-dict-search" placeholder="Search signs (e.g. 'hello', 'how are you', 'A')…" oninput="filterDictionary(this.value)">
+            </div>
+
+            <div class="m-sheet-content" id="m-dict-content">
+                <div class="m-dict-section" data-cat="dynamic">
+                    <div class="m-cat-title dyn">
+                        <span>⚡ DYNAMIC SEQUENCES</span>
+                        <span class="m-cat-sub">Start from frame 1</span>
+                    </div>
+                    <div class="m-grid">
+                        <div class="m-gesture-chip dyn" data-name="how are you">⚡ How are you</div>
+                        <div class="m-gesture-chip dyn" data-name="nice to meet you">⚡ Nice to meet you</div>
+                        <div class="m-gesture-chip dyn" data-name="j">⚡ J</div>
+                        <div class="m-gesture-chip dyn" data-name="z">⚡ Z</div>
+                    </div>
+                </div>
+
+                <div class="m-dict-section" data-cat="control">
+                    <div class="m-cat-title control">
+                        <span>🎮 CONTROL SIGNS</span>
+                        <span class="m-cat-sub">Universal commands</span>
+                    </div>
+                    <div class="m-grid">
+                        <div class="m-gesture-chip ctl-start" data-name="start">START</div>
+                        <div class="m-gesture-chip ctl-stop" data-name="stop">STOP</div>
+                        <div class="m-gesture-chip ctl-space" data-name="space">SPACE</div>
+                        <div class="m-gesture-chip ctl-backspace" data-name="backspace">BACKSPACE</div>
+                        <div class="m-gesture-chip" data-name="neutral">NEUTRAL</div>
+                    </div>
+                </div>
+
+                <div class="m-dict-section" data-cat="phrases">
+                    <div class="m-cat-title phrase">
+                        <span>💬 WORDS & PHRASES</span>
+                        <span class="m-cat-sub">Two-way communication</span>
+                    </div>
+                    <div class="m-grid">
+                        <div class="m-gesture-chip" data-name="hello">Hello</div>
+                        <div class="m-gesture-chip" data-name="thank you">Thank you</div>
+                        <div class="m-gesture-chip" data-name="i love you">I love you</div>
+                        <div class="m-gesture-chip" data-name="love">Love</div>
+                        <div class="m-gesture-chip" data-name="fine">Fine (Dual Hand)</div>
+                        <div class="m-gesture-chip" data-name="me">ME</div>
+                        <div class="m-gesture-chip" data-name="you">YOU</div>
+                    </div>
+                </div>
+
+                <div class="m-dict-section" data-cat="alphabets">
+                    <div class="m-cat-title alpha">
+                        <span>🔤 ALPHABETS A–Y</span>
+                        <span class="m-cat-sub">Fingerspelling</span>
+                    </div>
+                    <div class="m-grid alpha-grid">
+                        <div class="m-gesture-chip" data-name="a">A</div>
+                        <div class="m-gesture-chip" data-name="b">B</div>
+                        <div class="m-gesture-chip" data-name="c">C</div>
+                        <div class="m-gesture-chip" data-name="d">D</div>
+                        <div class="m-gesture-chip" data-name="e">E</div>
+                        <div class="m-gesture-chip" data-name="f">F</div>
+                        <div class="m-gesture-chip" data-name="g">G</div>
+                        <div class="m-gesture-chip" data-name="h">H</div>
+                        <div class="m-gesture-chip" data-name="k">K</div>
+                        <div class="m-gesture-chip" data-name="l">L</div>
+                        <div class="m-gesture-chip" data-name="m">M</div>
+                        <div class="m-gesture-chip" data-name="n">N</div>
+                        <div class="m-gesture-chip" data-name="o">O</div>
+                        <div class="m-gesture-chip" data-name="p">P</div>
+                        <div class="m-gesture-chip" data-name="q">Q</div>
+                        <div class="m-gesture-chip" data-name="r">R</div>
+                        <div class="m-gesture-chip" data-name="s">S</div>
+                        <div class="m-gesture-chip" data-name="t">T</div>
+                        <div class="m-gesture-chip" data-name="u">U</div>
+                        <div class="m-gesture-chip" data-name="v">V</div>
+                        <div class="m-gesture-chip" data-name="w">W</div>
+                        <div class="m-gesture-chip" data-name="x">X</div>
+                        <div class="m-gesture-chip" data-name="y">Y</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mobile Controller Script -->
+    <script src="{{ url_for('static', filename='js/mobile.js') }}?v=mobile_v2"></script>
+</body>
+
+</html>

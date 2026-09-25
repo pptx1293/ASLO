@@ -37,26 +37,26 @@ def main():
     print(f"Found {num_classes} classes: {label_encoder.classes_}")
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y_encoded, test_size=0.2, random_state=42
+        X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
     )
     print(f"Training samples: {X_train.shape[0]}, Testing samples: {X_test.shape[0]}")
 
     inp = layers.Input(shape=(X_train.shape[1],))
     x = layers.GaussianNoise(0.02)(inp)
 
-    x = layers.Dense(128, activation="relu", kernel_regularizer=regularizers.l2(0.001))(
+    x = layers.Dense(256, activation="relu", kernel_regularizer=regularizers.l2(0.0005))(
         x
     )
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
+    x = layers.Dropout(0.35)(x)
 
-    x = layers.Dense(64, activation="relu", kernel_regularizer=regularizers.l2(0.001))(
+    x = layers.Dense(128, activation="relu", kernel_regularizer=regularizers.l2(0.0005))(
         x
     )
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.3)(x)
+    x = layers.Dropout(0.25)(x)
 
-    x = layers.Dense(32, activation="relu", kernel_regularizer=regularizers.l2(0.001))(
+    x = layers.Dense(64, activation="relu", kernel_regularizer=regularizers.l2(0.0005))(
         x
     )
     x = layers.BatchNormalization()(x)

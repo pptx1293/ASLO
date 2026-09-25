@@ -156,17 +156,26 @@ def extract_features(hands_res) -> list[float]:
     return feats
 
 
-def extract_primary_hand_features(hands_res) -> list[float]:
+def extract_primary_hand_features(hands_res, dominant_hand="right") -> list[float]:
     """Returns features with the secondary (resting) hand zeroed out to prevent noise in 1-hand gestures."""
     results = _Results(hands_res)
 
+    # In _Results:
+    # results.left_hand_landmarks  = user's physical RIGHT hand (mirrored label 'Right')
+    # results.right_hand_landmarks = user's physical LEFT hand (mirrored label 'Left')
     if results.left_hand_landmarks and results.right_hand_landmarks:
-        y_l = results.left_hand_landmarks.landmark[0].y
-        y_r = results.right_hand_landmarks.landmark[0].y
-        if y_l < y_r:
+        if dominant_hand == "left":
+            results.left_hand_landmarks = None
+        elif dominant_hand == "right":
             results.right_hand_landmarks = None
         else:
-            results.left_hand_landmarks = None
+            # Auto mode: prioritize the hand with wrist positioned higher in camera (smaller y)
+            y_r = results.left_hand_landmarks.landmark[0].y
+            y_l = results.right_hand_landmarks.landmark[0].y
+            if y_r <= y_l:
+                results.right_hand_landmarks = None
+            else:
+                results.left_hand_landmarks = None
 
     feats = []
 
@@ -197,52 +206,225 @@ def extract_primary_hand_features(hands_res) -> list[float]:
     return feats
 
 
-def apply_heuristics(hands_res, label):
-    results = _Results(hands_res)
+def extract_two_hand_features(right_hand_landmarks, left_hand_landmarks) -> list[float]:
+    """Deterministically extracts 226-dim features with:
+    Slot 0 = right_hand_landmarks (user's physical Right hand)
+    Slot 1 = left_hand_landmarks (user's physical Left hand)
+    Prevents MediaPipe handedness inversion from swapping slots."""
+    feats = []
+
+    if right_hand_landmarks:
+        feats += _normalised_hand(right_hand_landmarks)
+    else:
+        feats += [0.0] * 63
+
+    if left_hand_landmarks:
+        feats += _normalised_hand(left_hand_landmarks)
+    else:
+        feats += [0.0] * 63
+
+    if right_hand_landmarks:
+        feats += _thumb_distances(right_hand_landmarks)
+        feats += _joint_angles(right_hand_landmarks)
+        feats += _fingertip_distances(right_hand_landmarks)
+    else:
+        feats += [0.0] * 50
+
+    if left_hand_landmarks:
+        feats += _thumb_distances(left_hand_landmarks)
+        feats += _joint_angles(left_hand_landmarks)
+        feats += _fingertip_distances(left_hand_landmarks)
+    else:
+        feats += [0.0] * 50
+
+    return feats
+
+
+class _MirroredHand:
+    class _LM:
+        def __init__(self, x, y, z):
+            self.x = x
+            self.y = y
+            self.z = z
+
+    def __init__(self, hand_landmarks):
+        self.landmark = [
+            self._LM(1.0 - lm.x, lm.y, lm.z) for lm in hand_landmarks.landmark
+        ]
+
+
+def extract_single_hand_features(hand_landmarks, is_left_hand=False) -> list[float]:
+    """Extracts features for a single hand placed in Slot 0 (indices 0..62 and 126..175).
+    If is_left_hand=True, horizontally mirrors coordinates so the geometry matches
+    the model's single-hand training distributions with high accuracy."""
+    target = _MirroredHand(hand_landmarks) if is_left_hand else hand_landmarks
+    norm_hand = _normalised_hand(target)
+    thumb_d = _thumb_distances(target)
+    j_ang = _joint_angles(target)
+    tip_d = _fingertip_distances(target)
+    return norm_hand + [0.0] * 63 + thumb_d + j_ang + tip_d + [0.0] * 50
+
+
+def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, route_mode="STATIC"):
+    if hand_or_res is None:
+        return str(label).upper()
     label = str(label).lower()
 
-    if label in ["n", "t"] and (
-        results.left_hand_landmarks or results.right_hand_landmarks
-    ):
-        hand = (
-            results.left_hand_landmarks
-            if results.left_hand_landmarks
-            else results.right_hand_landmarks
-        )
-        pts = [_coords(lm) for lm in hand.landmark]
-        wrist = pts[0]
-        scale = max(float(np.linalg.norm((pt - wrist)[:2])) for pt in pts)
-        if scale < 1e-6:
-            scale = 1.0
-
-        pts_norm = [(pt - wrist) / scale for pt in pts]
-        d_idx_pip = float(np.linalg.norm(pts_norm[4][:2] - pts_norm[6][:2]))
-        d_thumb_idx_tip = float(np.linalg.norm(pts_norm[4][:2] - pts_norm[8][:2]))
-
-        if d_idx_pip <= 0.16:
-            label = "t"
+    if hasattr(hand_or_res, "landmark"):
+        hand = hand_or_res
+    else:
+        results = _Results(hand_or_res)
+        if results.left_hand_landmarks:
+            hand = results.left_hand_landmarks
+            is_left_hand = False
+        elif results.right_hand_landmarks:
+            hand = results.right_hand_landmarks
+            is_left_hand = True
         else:
-            if d_thumb_idx_tip <= 0.28:
-                label = "t"
+            return label.upper()
+
+    target = _MirroredHand(hand) if is_left_hand else hand
+    pts = [_coords(lm) for lm in target.landmark]
+    wrist = pts[0]
+    scale = max(float(np.linalg.norm((pt - wrist)[:2])) for pt in pts)
+    if scale < 1e-6:
+        scale = 1.0
+
+    pts_norm = [(pt - wrist) / scale for pt in pts]
+
+    # Finger extension ratios (tip distance from wrist vs MCP distance from wrist)
+    idx_ext = float(np.linalg.norm(pts[8][:2] - wrist[:2]) / (np.linalg.norm(pts[5][:2] - wrist[:2]) + 1e-6))
+    mid_ext = float(np.linalg.norm(pts[12][:2] - wrist[:2]) / (np.linalg.norm(pts[9][:2] - wrist[:2]) + 1e-6))
+    ring_ext = float(np.linalg.norm(pts[16][:2] - wrist[:2]) / (np.linalg.norm(pts[13][:2] - wrist[:2]) + 1e-6))
+    pky_ext = float(np.linalg.norm(pts[20][:2] - wrist[:2]) / (np.linalg.norm(pts[17][:2] - wrist[:2]) + 1e-6))
+
+    palm_scale = float(np.linalg.norm(pts[9][:2] - wrist[:2]) + 1e-6)
+    d_thb_idx_pip = float(np.linalg.norm(pts_norm[4][:2] - pts_norm[6][:2]))
+    d_thb_mid_pip = float(np.linalg.norm(pts_norm[4][:2] - pts_norm[10][:2]))
+    dy_thb_idx_pip = float(pts_norm[4][1] - pts_norm[6][1])  # y is positive downward
+
+    # ── 1. STATIC RESOLUTION FOR DYNAMIC KEYFRAMES (Z_START / Z_END / J_START) ──
+    # If the user is stationary (route_mode == "STATIC"), dynamic gesture Z or J cannot occur.
+    # Disambiguate to the actual static sign being held: X, P, Q, D
+    idx_tip_pip = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[6][:2]))
+    idx_dy = float(pts_norm[8][1] - pts_norm[5][1])
+
+    if route_mode == "STATIC" and label in ["z_start", "z_end", "z"]:
+        if idx_tip_pip <= 0.30 and idx_ext < 1.65 and idx_dy < 0.05:
+            return "X"
+        elif idx_dy > 0.65:
+            return "Q"
+        elif 0.05 <= idx_dy <= 0.65:
+            return "P"
+        elif idx_dy < -0.30:
+            return "D"
+        return "X"
+
+    # ── 2. X HOOK DETECTION (Index bent hook, remaining fingers in fist) ────────
+    # In 'X', index PIP-to-tip is folded into a small hook while other fingers are in fist.
+    is_hooked_idx = (idx_tip_pip <= 0.28 and mid_ext < 1.25 and ring_ext < 1.25 and pky_ext < 1.25 and idx_dy < 0.10)
+    if is_hooked_idx and label in ["x", "d", "l", "z_start", "z_end", "z"]:
+        return "X"
+
+    # ── 3. P vs Q DISAMBIGUATION (Index & thumb pointing downward) ─────────────
+    if label in ["p", "q"]:
+        if idx_dy > 0.35:
+            return "Q"
+        else:
+            return "P"
+
+    # ── 4. E vs O DISAMBIGUATION ───────────────────────────────────────────────
+    # In 'O', all 4 fingers curve OUTWARD in a loop touching the thumb (idx_ext >= 1.05, mid_ext >= 1.05).
+    # In 'E', all 4 fingers are tightly folded flat against the palm (idx_ext < 1.05, mid_ext < 1.05),
+    # with fingertips resting on top of the thumb.
+    if label in ["e", "o"]:
+        if idx_ext < 1.05 and mid_ext < 1.05 and ring_ext < 1.05:
+            return "E"
+        elif idx_ext >= 1.05 and mid_ext >= 1.05:
+            return "O"
+
+    # ── 5. HARD ANATOMICAL CHECK: 'A' vs 'Y' ──────────────────────────────────
+    # In 'A', all 4 fingers (including pinky) are folded into a fist (pky_ext < 1.15).
+    # In 'Y', the pinky MUST be extended upward (pky_ext > 1.35).
+    if label == "y" and pky_ext < 1.15:
+        # Check if it's S or T or A
+        if dy_thb_idx_pip >= 0.10:
+            return "S"
+        elif d_thb_idx_pip < 0.15:
+            return "T"
+        elif dy_thb_idx_pip < 0.02 and d_thb_mid_pip > 0.18:
+            return "A"
+        return "A"
+    elif label == "a" and pky_ext > 1.35:
+        return "Y"
+
+    # ── 6. HARD ANATOMICAL CHECK: 'I love you' vs 'J_START' / 'Y' / 'E' / 'A' ─
+    if "love" in label and (idx_ext < 1.25 or pky_ext < 1.25):
+        if pky_ext > 1.30 and idx_ext < 1.15 and mid_ext < 1.15:
+            d_pip_raw = float(np.linalg.norm(pts[4][:2] - pts[6][:2]) / palm_scale)
+            if d_pip_raw > 0.45:
+                return "Y"
             else:
-                label = "n"
+                return "J_START"
+        if idx_ext < 1.05 and mid_ext < 1.05 and ring_ext < 1.05 and pky_ext < 1.05:
+            # All 4 fingers folded flat against palm
+            if dy_thb_idx_pip >= 0.0 and d_thb_idx_pip < 0.18:
+                return "E"
+            elif dy_thb_idx_pip < 0.02 and d_thb_mid_pip > 0.18:
+                return "A"
+            elif dy_thb_idx_pip >= 0.10:
+                return "S"
+            return "E"
+        if idx_ext < 1.20 and mid_ext < 1.20 and ring_ext < 1.20 and pky_ext < 1.20:
+            if dy_thb_idx_pip < 0.02 and d_thb_mid_pip > 0.18:
+                return "A"
+            elif dy_thb_idx_pip >= 0.10:
+                return "S"
+            elif d_thb_idx_pip < 0.15:
+                return "T"
+            return "A"
 
-    elif label in ["u", "v", "r"] and (
-        results.left_hand_landmarks or results.right_hand_landmarks
-    ):
-        hand = (
-            results.left_hand_landmarks
-            if results.left_hand_landmarks
-            else results.right_hand_landmarks
-        )
-        pts = [_coords(lm) for lm in hand.landmark]
-        wrist = pts[0]
-        scale = max(float(np.linalg.norm((pt - wrist)[:2])) for pt in pts)
-        if scale < 1e-6:
-            scale = 1.0
+    # ── 7. J_START DETECTION (Pinky extended, index/mid/ring folded, thumb curled) ──
+    d_pip_raw = float(np.linalg.norm(pts[4][:2] - pts[6][:2]) / palm_scale)
+    if label == "y" and pky_ext > 1.30 and idx_ext < 1.15 and mid_ext < 1.15 and d_pip_raw <= 0.45:
+        return "J_START"
 
-        pts_norm = [(pt - wrist) / scale for pt in pts]
+    # ── 8. ANATOMICAL FIST DISAMBIGUATION (A vs S vs T vs N vs E) ─────────────
+    all_fist_fingers = (idx_ext < 1.25 and mid_ext < 1.25 and ring_ext < 1.25 and pky_ext < 1.25)
+    if all_fist_fingers and label in ["a", "s", "t", "n", "m", "e"]:
+        # E: All fingers folded flat against palm, fingertips resting on thumb
+        if label == "e":
+            return "E"
 
+        # Check A vs S vs T vs N:
+        # A: Thumb tip is strictly upright along the radial side of the fist
+        if dy_thb_idx_pip < 0.02 and d_thb_mid_pip > 0.18:
+            return "A"
+
+        # S: Thumb is folded across the front of fingers (lower down across middle)
+        if label in ["a", "s"] and dy_thb_idx_pip >= 0.10:
+            return "S"
+
+        # Check N vs T:
+        # T: Thumb tip is tucked tightly between index and middle fingers (d_thb_idx_pip < 0.15)
+        # N: Thumb tip is tucked under index & middle (d_thb_idx_pip >= 0.15)
+        if label in ["n", "t"]:
+            if d_thb_idx_pip < 0.15:
+                return "T"
+            else:
+                return "N"
+
+    # ── 9. SOFT HEURISTICS (Protected by model confidence >= 0.85) ────────────
+    if confidence is not None and confidence >= 0.85:
+        return label.upper()
+
+    if label in ["n", "t"]:
+        if d_thb_idx_pip < 0.15:
+            return "T"
+        else:
+            return "N"
+
+    elif label in ["u", "v", "r"]:
         x_dir = pts_norm[5][:2] - pts_norm[17][:2]
         n_dir = np.linalg.norm(x_dir)
         if n_dir > 1e-6:

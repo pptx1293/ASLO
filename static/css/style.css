@@ -261,12 +261,24 @@ button:focus-visible {
     justify-content: center;
     overflow: hidden;
     user-select: none;
+    transition: box-shadow 0.3s ease;
+}
+
+.cam-panel.recording {
+    box-shadow: inset 0 0 0 2px rgba(239, 68, 68, 0.7), inset 0 0 24px rgba(239, 68, 68, 0.2);
+}
+
+.cam-panel.recording .hud-corner {
+    border-color: rgba(239, 68, 68, 0.9);
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.5);
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
 }
 
 #camera-feed {
     width: 100%;
     height: 100%;
-    object-fit: contain;
+    object-fit: cover;
+    object-position: center;
     display: block;
     background: #030508;
     transform: translateZ(0);
@@ -331,6 +343,48 @@ button:focus-visible {
     100% { transform: scale(0.9); opacity: 1; }
 }
 
+/* ── Clean Broadcast Viewfinder Recording Tag ── */
+.hud-tag.rec-tag {
+    transition: all 0.25s ease;
+    font-weight: 600;
+}
+
+.hud-tag.rec-tag.paused {
+    border-color: rgba(245, 158, 11, 0.4);
+    background: rgba(20, 16, 10, 0.85);
+    color: #fbbf24;
+}
+
+.hud-tag.rec-tag.active {
+    border-color: rgba(239, 68, 68, 0.6);
+    background: rgba(25, 10, 10, 0.85);
+    color: #fca5a5;
+    box-shadow: 0 0 12px rgba(239, 68, 68, 0.3);
+}
+
+.rec-dot-amber {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #f59e0b;
+    box-shadow: 0 0 6px #f59e0b;
+}
+
+.rec-dot-red {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #ef4444;
+    box-shadow: 0 0 8px #ef4444;
+    animation: recPulse 1.2s infinite;
+}
+
+@keyframes recPulse {
+    0% { transform: scale(0.85); opacity: 0.6; }
+    50% { transform: scale(1.4); opacity: 1; }
+    100% { transform: scale(0.85); opacity: 0.6; }
+}
+
 .hud-controls {
     position: absolute;
     bottom: 20px;
@@ -361,6 +415,22 @@ button:focus-visible {
     transform: translateY(-2px);
 }
 
+.hud-btn.is-switching {
+    pointer-events: none;
+    opacity: 0.7;
+    color: var(--cyan);
+    border-color: rgba(0, 240, 255, 0.5);
+}
+
+.hud-btn.is-switching svg {
+    animation: hudSpin 0.7s linear infinite;
+}
+
+@keyframes hudSpin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
 .cam-fallback {
     position: absolute;
     inset: 0;
@@ -385,6 +455,309 @@ button:focus-visible {
     align-items: center;
     justify-content: center;
     font-size: 1.6rem;
+}
+
+/* ── Camera Telemetry HUD Overlay (Floating Cockpit Instrument) ────────── */
+.cam-telemetry-hud {
+    position: absolute;
+    top: 60px;
+    left: 16px;
+    width: 200px;
+    max-width: calc(100% - 32px);
+    background: rgba(9, 13, 22, 0.90);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(0, 240, 255, 0.22);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.65), 0 0 15px rgba(0, 240, 255, 0.1);
+    z-index: 25;
+    transition: width 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s ease, border-color 0.2s ease;
+    user-select: none;
+    overflow: hidden;
+}
+
+.cam-telemetry-hud:hover {
+    border-color: rgba(0, 240, 255, 0.4);
+    box-shadow: 0 10px 36px rgba(0, 0, 0, 0.75), 0 0 20px rgba(0, 240, 255, 0.18);
+}
+
+.cam-hud-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 8px;
+    background: rgba(14, 20, 32, 0.75);
+    border-bottom: 1px solid var(--border-subtle);
+    gap: 6px;
+}
+
+.cam-hud-title {
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.cam-hud-title svg {
+    color: var(--cyan);
+    width: 11px;
+    height: 11px;
+}
+
+.cam-hud-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.cam-telemetry-hud .state-pill {
+    padding: 2px 6px;
+    font-size: 0.58rem;
+    gap: 4px;
+}
+
+.cam-telemetry-hud .state-pill.active::before {
+    width: 5px;
+    height: 5px;
+}
+
+.cam-hud-toggle-btn {
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.cam-hud-toggle-btn svg {
+    width: 10px;
+    height: 10px;
+}
+
+.cam-hud-toggle-btn:hover {
+    color: var(--cyan);
+    background: rgba(0, 240, 255, 0.14);
+    border-color: rgba(0, 240, 255, 0.4);
+}
+
+.cam-hud-body {
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    max-height: 420px;
+    overflow-y: auto;
+    transition: all 0.25s ease;
+}
+
+/* Compact HUD tuning */
+.cam-telemetry-hud .gesture-hero-box {
+    margin-bottom: 2px;
+    padding: 8px 10px;
+    border-radius: 6px;
+}
+
+.cam-telemetry-hud .gesture-primary-label {
+    font-size: 0.60rem;
+}
+
+.cam-telemetry-hud .hand-badge {
+    font-size: 0.55rem;
+    padding: 1px 5px;
+}
+
+.cam-telemetry-hud #gesture-label {
+    font-size: 1.45rem;
+    line-height: 1.1;
+}
+
+.cam-telemetry-hud .dual-hand-monitor {
+    gap: 5px;
+    margin-bottom: 2px;
+}
+
+.cam-telemetry-hud .hand-track-card {
+    padding: 5px 6px;
+    border-radius: 6px;
+}
+
+.cam-telemetry-hud .hand-track-head {
+    margin-bottom: 3px;
+}
+
+.cam-telemetry-hud .hand-track-title {
+    font-size: 0.54rem;
+}
+
+.cam-telemetry-hud .hand-track-badge {
+    font-size: 0.52rem;
+    padding: 1px 4px;
+}
+
+.cam-telemetry-hud .hand-track-sign {
+    font-size: 0.85rem;
+    min-width: 16px;
+}
+
+.cam-telemetry-hud .hand-track-meter {
+    height: 4px;
+}
+
+.cam-telemetry-hud .hand-track-pct {
+    font-size: 0.58rem;
+}
+
+.cam-telemetry-hud .telemetry-row {
+    margin-bottom: 4px;
+}
+
+.cam-telemetry-hud .telemetry-name {
+    font-size: 0.58rem;
+}
+
+.cam-telemetry-hud .telemetry-value {
+    font-size: 0.62rem;
+}
+
+.cam-telemetry-hud .meter-track {
+    height: 4px;
+}
+
+.cam-telemetry-hud .stab-segments {
+    height: 7px;
+    gap: 2px;
+}
+
+.cam-telemetry-hud .rec-status-strip {
+    margin-top: 2px;
+    padding: 4px 7px;
+    border-radius: 5px;
+}
+
+.cam-telemetry-hud .rec-dot {
+    width: 6px;
+    height: 6px;
+}
+
+.cam-telemetry-hud .rec-text {
+    font-size: 0.62rem;
+}
+
+/* Collapsed / Minimized HUD State */
+.cam-telemetry-hud.collapsed {
+    width: auto;
+    background: rgba(9, 13, 22, 0.92);
+}
+
+.cam-telemetry-hud.collapsed .cam-hud-header {
+    border-bottom: none;
+    padding: 5px 8px;
+}
+
+.cam-telemetry-hud.collapsed .cam-hud-body {
+    display: none;
+}
+
+.cam-telemetry-hud.collapsed .icon-minimize {
+    display: none;
+}
+
+.cam-telemetry-hud.collapsed .icon-expand {
+    display: block !important;
+}
+
+/* ── Camera Telemetry Recent Signs Trail ──────────────────────────────── */
+.cam-recent-trail-container {
+    margin-top: 1px;
+    padding-top: 5px;
+    border-top: 1px dashed rgba(255, 255, 255, 0.1);
+}
+
+.cam-recent-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 3px;
+    font-size: 0.58rem;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: var(--text-muted);
+    letter-spacing: 0.6px;
+}
+
+.cam-recent-hint {
+    color: var(--cyan);
+    font-size: 0.52rem;
+    font-weight: 600;
+}
+
+.cam-recent-trail {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    overflow-x: auto;
+    padding: 1px 0 2px 0;
+    scrollbar-width: none;
+}
+
+.cam-recent-trail::-webkit-scrollbar {
+    display: none;
+}
+
+.cam-recent-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 0.65rem;
+    color: #ffffff;
+    background: rgba(0, 240, 255, 0.1);
+    border: 1px solid rgba(0, 240, 255, 0.35);
+    box-shadow: 0 0 6px rgba(0, 240, 255, 0.15);
+    white-space: nowrap;
+    transition: all 0.2s ease;
+    flex-shrink: 0;
+}
+
+.cam-recent-chip.latest {
+    background: linear-gradient(135deg, rgba(0, 240, 255, 0.28), rgba(16, 185, 129, 0.22));
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px rgba(0, 240, 255, 0.4);
+    transform: scale(1.04);
+}
+
+.cam-recent-placeholder {
+    font-size: 0.62rem;
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+@keyframes popChip {
+    from { transform: scale(0.6); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+}
+
+@media (max-width: 980px) {
+    .cam-telemetry-hud {
+        top: 56px;
+        right: 12px;
+        left: 12px;
+        width: auto;
+        max-width: none;
+    }
 }
 
 /* ── Console / Telemetry Deck (Right Deck) ────────────────────────────── */
@@ -522,6 +895,90 @@ button:focus-visible {
     box-shadow: 0 0 6px var(--emerald);
 }
 
+/* ── Dominant Hand Selector Switch ───────────────────────────────────── */
+.header-right-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.hand-selector {
+    display: inline-flex;
+    align-items: center;
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-pill);
+    padding: 2px;
+    gap: 2px;
+}
+
+.hand-pill {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text-muted);
+    font-size: 0.65rem;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.hand-pill:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.hand-pill.active {
+    background: var(--cyan-dim);
+    color: var(--cyan);
+    border-color: rgba(0, 240, 255, 0.4);
+    box-shadow: 0 0 8px rgba(0, 240, 255, 0.25);
+}
+
+/* ── Hand Detection Separation Badges ────────────────────────────────── */
+.hand-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.65rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 2px 8px;
+    border-radius: var(--radius-pill);
+    transition: all 0.25s ease;
+}
+
+.hand-badge.hand-right {
+    background: rgba(0, 240, 255, 0.12);
+    color: var(--cyan);
+    border: 1px solid rgba(0, 240, 255, 0.4);
+    box-shadow: 0 0 8px rgba(0, 240, 255, 0.25);
+}
+
+.hand-badge.hand-left {
+    background: rgba(168, 85, 247, 0.15);
+    color: #c084fc;
+    border: 1px solid rgba(168, 85, 247, 0.4);
+    box-shadow: 0 0 8px rgba(168, 85, 247, 0.25);
+}
+
+.hand-badge.hand-both {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--emerald);
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.25);
+}
+
+.hand-badge.hand-none {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    border: 1px solid var(--border-subtle);
+}
+
 /* ── Meters & Equalizers ─────────────────────────────────────────────── */
 .telemetry-row {
     margin-bottom: 12px;
@@ -630,11 +1087,69 @@ button:focus-visible {
 }
 
 /* ── Audio & Speech Command Center ───────────────────────────────────── */
+.stt-lang-picker {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.stt-select {
+    background: rgba(14, 18, 26, 0.95);
+    color: var(--cyan);
+    border: 1px solid rgba(0, 240, 255, 0.3);
+    border-radius: var(--radius-sm);
+    padding: 4px 8px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    cursor: pointer;
+    outline: none;
+    transition: all 0.2s ease;
+}
+
+.stt-select:hover, .stt-select:focus {
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px var(--cyan-glow);
+}
+
+.stt-select option {
+    background: #0e121a;
+    color: #f8fafc;
+}
+
+.stt-live-panel {
+    background: rgba(7, 10, 16, 0.75);
+    border: 1px solid rgba(0, 240, 255, 0.15);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.stt-visualizer {
+    width: 100%;
+    height: 32px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.35);
+    display: block;
+}
+
+.stt-live-preview {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-accent);
+    min-height: 18px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .audio-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 8px;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
 }
 
 .btn-command {
@@ -642,7 +1157,7 @@ button:focus-visible {
     align-items: center;
     justify-content: center;
     gap: 8px;
-    padding: 10px 12px;
+    padding: 9px 12px;
     border-radius: var(--radius-sm);
     font-size: 0.8rem;
     font-weight: 600;
@@ -650,6 +1165,8 @@ button:focus-visible {
     border: 1px solid var(--border-subtle);
     color: var(--text-primary);
     transition: all 0.2s ease;
+    cursor: pointer;
+    user-select: none;
 }
 
 .btn-command:hover {
@@ -669,15 +1186,15 @@ button:focus-visible {
 }
 
 .btn-command.recording {
-    background: rgba(244, 63, 94, 0.15);
-    border-color: rgba(244, 63, 94, 0.45);
+    background: rgba(244, 63, 94, 0.18);
+    border-color: rgba(244, 63, 94, 0.6);
     color: #ff99a8;
-    animation: borderGlowRed 1.8s infinite alternate;
+    animation: borderGlowRed 1.2s infinite alternate;
 }
 
 @keyframes borderGlowRed {
     0% { box-shadow: 0 0 4px rgba(244, 63, 94, 0.2); }
-    100% { box-shadow: 0 0 14px rgba(244, 63, 94, 0.45); }
+    100% { box-shadow: 0 0 16px rgba(244, 63, 94, 0.6); }
 }
 
 .btn-speak-sentence {
@@ -691,6 +1208,30 @@ button:focus-visible {
     background: linear-gradient(135deg, rgba(0, 240, 255, 0.18), rgba(168, 85, 247, 0.18));
     border-color: var(--cyan);
     box-shadow: 0 0 14px rgba(0, 240, 255, 0.25);
+}
+
+.stt-footer-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.stt-toggle-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+}
+
+.stt-toggle-label input[type="checkbox"] {
+    accent-color: var(--cyan);
+    cursor: pointer;
 }
 
 .stt-indicator {
@@ -715,12 +1256,48 @@ button:focus-visible {
     animation: radarPulse 1.2s infinite;
 }
 
-/* ── Sentence Translation Canvas ─────────────────────────────────────── */
+/* ── Sentence Translation & Dialogue Canvas ──────────────────────────── */
 .sentence-card {
     display: flex;
     flex-direction: column;
     flex: 1 1 auto;
-    min-height: 160px;
+    min-height: 180px;
+}
+
+.view-switch-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: var(--radius-sm);
+    padding: 2px;
+}
+
+.view-tab-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 8px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    border-radius: 5px;
+    border: 1px solid transparent;
+    background: transparent;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.view-tab-btn.active {
+    background: rgba(0, 240, 255, 0.12);
+    color: var(--cyan);
+    border-color: rgba(0, 240, 255, 0.28);
+    box-shadow: 0 0 8px rgba(0, 240, 255, 0.15);
+}
+
+.view-tab-btn:hover:not(.active) {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
 }
 
 .sentence-header-tools {
@@ -758,6 +1335,71 @@ button:focus-visible {
     overflow-y: auto;
     margin-bottom: 8px;
     position: relative;
+    max-height: 180px;
+}
+
+.dialogue-viewport {
+    padding: 8px 10px;
+}
+
+.dialogue-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.dialogue-placeholder {
+    font-size: 0.75rem;
+    font-style: italic;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 24px 10px;
+}
+
+.dialogue-bubble {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-subtle);
+    animation: fadeInBubble 0.2s ease-out;
+}
+
+.dialogue-bubble.voice {
+    border-left: 3px solid var(--purple);
+    background: rgba(168, 85, 247, 0.06);
+}
+
+.dialogue-bubble.signer {
+    border-left: 3px solid var(--emerald);
+    background: rgba(16, 185, 129, 0.06);
+}
+
+.dialogue-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.66rem;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+}
+
+.dialogue-sender {
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.dialogue-body {
+    font-size: 0.85rem;
+    color: #f1f5f9;
+    line-height: 1.35;
+}
+
+@keyframes fadeInBubble {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
 }
 
 #sentence-box {
@@ -1164,3 +1806,258 @@ button:focus-visible {
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: 0.5; transform: scale(0.9); }
 }
+
+
+/* ── Dual-Hand Independent Real-Time Monitor ──────────────────────────── */
+.dual-hand-monitor {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.hand-track-card {
+    background: rgba(10, 14, 22, 0.65);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    transition: all 0.25s ease;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.hand-track-card.active-driver {
+    background: rgba(0, 240, 255, 0.06);
+    border-color: rgba(0, 240, 255, 0.45);
+    box-shadow: 0 0 14px rgba(0, 240, 255, 0.15);
+}
+
+.hand-track-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.hand-track-title {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--text-secondary);
+    letter-spacing: 0.5px;
+}
+
+.hand-track-badge {
+    font-family: var(--font-mono);
+    font-size: 0.58rem;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 10px;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+}
+
+.badge-idle {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+}
+
+.badge-ready {
+    background: rgba(255, 170, 0, 0.15);
+    color: #ffaa00;
+    border: 1px solid rgba(255, 170, 0, 0.3);
+}
+
+.badge-active {
+    background: rgba(0, 255, 170, 0.18);
+    color: #00ffaa;
+    border: 1px solid rgba(0, 255, 170, 0.4);
+    box-shadow: 0 0 8px rgba(0, 255, 170, 0.25);
+}
+
+.hand-track-body {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.hand-track-sign {
+    font-family: var(--font-mono);
+    font-size: 1.15rem;
+    font-weight: 800;
+    color: #ffffff;
+    min-width: 24px;
+    text-align: center;
+}
+
+.hand-track-meter {
+    flex: 1;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.hand-track-meter-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.15s ease;
+}
+
+.right-fill {
+    background: linear-gradient(90deg, var(--cyan), #00ffaa);
+}
+
+.left-fill {
+    background: linear-gradient(90deg, #d946ef, #8b5cf6);
+}
+
+.hand-track-pct {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    min-width: 26px;
+    text-align: right;
+}
+
+/* ── Dynamic Gesture Watchdog Countdown Banner ────────────────────────── */
+.dynamic-timer-banner {
+    position: absolute;
+    top: 68px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 25;
+    background: rgba(10, 15, 26, 0.90);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1.5px solid rgba(0, 240, 255, 0.55);
+    border-radius: var(--radius-md);
+    padding: 10px 22px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    min-width: 260px;
+    max-width: 90%;
+    box-shadow: 0 0 25px rgba(0, 240, 255, 0.35), 0 8px 30px rgba(0, 0, 0, 0.65);
+    animation: dynTimerPulse 1.6s infinite alternate ease-in-out;
+    pointer-events: none;
+}
+
+@keyframes dynTimerPulse {
+    0% {
+        border-color: rgba(0, 240, 255, 0.55);
+        box-shadow: 0 0 20px rgba(0, 240, 255, 0.25);
+    }
+    100% {
+        border-color: rgba(255, 176, 32, 0.85);
+        box-shadow: 0 0 32px rgba(255, 176, 32, 0.45);
+    }
+}
+
+.dyn-timer-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--amber);
+}
+
+.dyn-pulse-ring {
+    width: 8px;
+    height: 8px;
+    background: var(--amber);
+    border-radius: 50%;
+    box-shadow: 0 0 10px var(--amber);
+    animation: pulseRing 1s infinite alternate;
+}
+
+@keyframes pulseRing {
+    0% { transform: scale(0.85); opacity: 0.7; }
+    100% { transform: scale(1.3); opacity: 1; }
+}
+
+.dyn-timer-name {
+    color: #fff;
+    font-family: var(--font-sans);
+    font-weight: 800;
+}
+
+.dyn-timer-countdown {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+}
+
+.dyn-timer-val {
+    font-family: var(--font-mono);
+    font-size: 2rem;
+    font-weight: 800;
+    color: var(--cyan);
+    letter-spacing: -0.02em;
+    text-shadow: 0 0 14px rgba(0, 240, 255, 0.7);
+}
+
+.dyn-timer-bar-track {
+    width: 100%;
+    height: 6px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius-pill);
+    overflow: hidden;
+}
+
+.dyn-timer-bar-fill {
+    height: 100%;
+    width: 100%;
+    background: linear-gradient(90deg, var(--cyan), var(--amber));
+    border-radius: var(--radius-pill);
+    transition: width 0.12s linear;
+    box-shadow: 0 0 8px var(--cyan);
+}
+
+.dyn-time-text {
+    color: var(--cyan) !important;
+    font-weight: 700 !important;
+}
+
+.dyn-meter-track {
+    background: rgba(0, 240, 255, 0.1) !important;
+}
+
+.dyn-meter-fill {
+    background: linear-gradient(90deg, var(--cyan), var(--amber)) !important;
+    box-shadow: 0 0 8px var(--cyan) !important;
+}
+
+.state-pill.dynamic-active {
+    background: rgba(255, 176, 32, 0.2) !important;
+    color: #ffc247 !important;
+    border: 1px solid rgba(255, 176, 32, 0.6) !important;
+    box-shadow: 0 0 14px rgba(255, 176, 32, 0.4) !important;
+    animation: dynPillBlink 0.9s infinite alternate;
+}
+
+@keyframes dynPillBlink {
+    0% { opacity: 0.85; }
+    100% { opacity: 1; filter: drop-shadow(0 0 6px #ffb020); }
+}
+
+.btn-mobile-link {
+    text-decoration: none;
+    color: var(--text-primary);
+    background: rgba(0, 240, 255, 0.1);
+    border: 1px solid rgba(0, 240, 255, 0.35);
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+}
+
+.btn-mobile-link:hover {
+    background: rgba(0, 240, 255, 0.22);
+    border-color: var(--cyan);
+    box-shadow: 0 0 12px rgba(0, 240, 255, 0.3);
+}
+

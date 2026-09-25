@@ -13,31 +13,11 @@
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
     <!-- Stylesheet -->
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=cam_fit_cover">
 </head>
 
 <body>
 
-    <!-- ── Audio Engine Unlock & Welcome Dialog ────────────────────────── -->
-    <div id="welcome-modal" class="modal-backdrop">
-        <div class="welcome-modal">
-            <div class="welcome-icon-glow">🤟</div>
-            <h2 class="welcome-title">Welcome to ASLO Studio</h2>
-            <p class="welcome-desc">
-                High-performance real-time sign language translation powered by MediaPipe & Neural Networks. Enable audio to unlock speech synthesis and voice input.
-            </p>
-            <div class="soundwave-anim">
-                <div class="soundwave-bar"></div>
-                <div class="soundwave-bar"></div>
-                <div class="soundwave-bar"></div>
-                <div class="soundwave-bar"></div>
-                <div class="soundwave-bar"></div>
-            </div>
-            <button class="btn-enter-studio" onclick="unlockAudio()">
-                Initialize Audio & Launch Studio
-            </button>
-        </div>
-    </div>
 
     <!-- ── Topbar Navigation ───────────────────────────────────────────── -->
     <header class="topbar">
@@ -50,6 +30,14 @@
         </div>
 
         <div class="topbar-actions">
+            <a href="/mobile" class="btn-header-tool btn-mobile-link" title="Open Mobile Version">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect>
+                    <line x1="12" y1="18" x2="12.01" y2="18"></line>
+                </svg>
+                <span>Mobile App</span>
+            </a>
+
             <button class="btn-header-tool" onclick="openGestureModal()" title="View supported gestures (Shortcut: ?)">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
@@ -77,10 +65,29 @@
             <div class="hud-header">
                 <div class="hud-tag">
                     <span class="radar-ping"></span>
-                    <span>CAM 01 · LIVE FEED</span>
+                    <span id="hud-cam-name">CAM 0 · LIVE FEED</span>
+                </div>
+                <div class="hud-tag rec-tag paused" id="hud-rec-tag">
+                    <span class="rec-dot-amber" id="hud-rec-dot"></span>
+                    <span id="hud-rec-status">STANDBY</span>
                 </div>
                 <div class="hud-tag" id="hud-confidence">
                     <span>--% CONF</span>
+                </div>
+            </div>
+
+            <!-- Dynamic Gesture Watchdog Countdown Banner -->
+            <div class="dynamic-timer-banner" id="dynamic-timer-banner" style="display:none;">
+                <div class="dyn-timer-badge">
+                    <span class="dyn-pulse-ring"></span>
+                    <span class="dyn-timer-icon">⏳</span>
+                    <span class="dyn-timer-name" id="dyn-timer-name">DYNAMIC SIGN</span>
+                </div>
+                <div class="dyn-timer-countdown">
+                    <span class="dyn-timer-val" id="dyn-timer-val">2.8s</span>
+                </div>
+                <div class="dyn-timer-bar-track">
+                    <div class="dyn-timer-bar-fill" id="dyn-timer-bar-fill"></div>
                 </div>
             </div>
 
@@ -99,8 +106,87 @@
                 </button>
             </div>
 
+            <!-- ── Camera HUD: Neural Telemetry & Recent Signs Overlay ── -->
+            <div class="cam-telemetry-hud" id="cam-telemetry-hud">
+                <div class="cam-hud-header">
+                    <div class="cam-hud-title">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                            <circle cx="12" cy="12" r="2"></circle>
+                            <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path>
+                        </svg>
+                        <span>Neural Telemetry</span>
+                    </div>
+                    <div class="cam-hud-header-actions">
+                        <span class="state-pill" id="state-pill">STANDBY</span>
+                        <button class="cam-hud-toggle-btn" id="cam-hud-toggle-btn" onclick="toggleCamTelemetryHud()" title="Minimize / Expand Telemetry (Shortcut: H)">
+                            <svg class="icon-minimize" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                <line x1="5" y1="12" x2="19" y2="12"></line>
+                            </svg>
+                            <svg class="icon-expand" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="display:none;">
+                                <polyline points="15 3 21 3 21 9"></polyline>
+                                <polyline points="9 21 3 21 3 15"></polyline>
+                                <line x1="21" y1="3" x2="14" y2="10"></line>
+                                <line x1="3" y1="21" x2="10" y2="14"></line>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="cam-hud-body" id="cam-hud-body">
+                    <!-- Current Sign -->
+                    <div class="gesture-hero-box">
+                        <div class="gesture-primary">
+                            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+                                <span class="gesture-primary-label">Current Sign</span>
+                                <span class="hand-badge hand-none" id="hand-badge">Standby</span>
+                            </div>
+                            <span id="gesture-label">—</span>
+                        </div>
+                    </div>
+
+                    <!-- Dynamic Gesture Watchdog Timer Telemetry Row -->
+                    <div class="telemetry-row dynamic-timer-telemetry" id="dynamic-timer-telemetry" style="display:none;">
+                        <div class="telemetry-label-row">
+                            <span class="telemetry-name">DYNAMIC TIMER</span>
+                            <span class="telemetry-value dyn-time-text" id="dyn-telemetry-time">2.8s</span>
+                        </div>
+                        <div class="meter-track dyn-meter-track">
+                            <div class="meter-fill dyn-meter-fill" id="dyn-telemetry-bar"></div>
+                        </div>
+                    </div>
+
+                    <!-- Confidence Gauge -->
+                    <div class="telemetry-row">
+                        <div class="telemetry-label-row">
+                            <span class="telemetry-name">CONFIDENCE</span>
+                            <span class="telemetry-value" id="conf-text">0%</span>
+                        </div>
+                        <div class="meter-track">
+                            <div class="meter-fill" id="conf-bar"></div>
+                        </div>
+                    </div>
+
+                    <!-- Stability Bar -->
+                    <div class="telemetry-row">
+                        <div class="telemetry-label-row">
+                            <span class="telemetry-name">STABILITY</span>
+                            <span class="telemetry-value" id="stab-text">0/15</span>
+                        </div>
+                        <div class="stab-segments" id="stab-segments"></div>
+                    </div>
+                </div>
+            </div>
+
             <!-- HUD Viewfinder Controls -->
             <div class="hud-controls">
+                <button class="hud-btn" id="btn-switch-cam" onclick="switchCamera()" title="Switch Camera (Shortcut: X)">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M20 10V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v3"></path>
+                        <path d="M4 14v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"></path>
+                        <polyline points="7 7 10 4 7 1"></polyline>
+                        <polyline points="17 17 14 20 17 23"></polyline>
+                    </svg>
+                </button>
                 <button class="hud-btn" id="btn-mirror" onclick="toggleCameraMirror()" title="Mirror Feed">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M12 2v20M8 6L4 12l4 6M16 6l4 6-4 6"/>
@@ -118,110 +204,25 @@
         <aside class="console">
             <div class="console-scrollable">
 
-                <!-- Telemetry Card: Live Detection & Confidence -->
-                <section class="card">
-                    <div class="card-header">
-                        <span class="card-title">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                                <circle cx="12" cy="12" r="2"></circle>
-                                <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path>
-                            </svg>
-                            Neural Telemetry
-                        </span>
-                        <span class="state-pill" id="state-pill">STANDBY</span>
-                    </div>
-
-                    <!-- Hero Detected Sign -->
-                    <div class="gesture-hero-box">
-                        <div class="gesture-primary">
-                            <span class="gesture-primary-label">Current Sign</span>
-                            <span id="gesture-label">—</span>
-                        </div>
-                    </div>
-
-                    <!-- Confidence Gauge -->
-                    <div class="telemetry-row">
-                        <div class="telemetry-label-row">
-                            <span class="telemetry-name">CONFIDENCE</span>
-                            <span class="telemetry-value" id="conf-text">0%</span>
-                        </div>
-                        <div class="meter-track">
-                            <div class="meter-fill" id="conf-bar"></div>
-                        </div>
-                    </div>
-
-                    <!-- 15-Frame Segmented Stability Buffer -->
-                    <div class="telemetry-row">
-                        <div class="telemetry-label-row">
-                            <span class="telemetry-name">NEURAL BUFFER STABILITY</span>
-                            <span class="telemetry-value" id="stab-text">0/15</span>
-                        </div>
-                        <div class="stab-segments" id="stab-segments"></div>
-                    </div>
-
-                    <!-- Recording Trigger Prompt -->
-                    <div class="rec-status-strip">
-                        <div class="rec-dot" id="rec-dot"></div>
-                        <span class="rec-text" id="rec-label">Paused — sign START to begin recording</span>
-                    </div>
-                </section>
-
-                <!-- Audio & Speech Command Center -->
-                <section class="card">
-                    <div class="card-header">
-                        <span class="card-title">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                                <line x1="12" y1="19" x2="12" y2="23"></line>
-                                <line x1="8" y1="23" x2="16" y2="23"></line>
-                            </svg>
-                            Audio & Voice Hub
-                        </span>
-                    </div>
-
-                    <div class="audio-grid">
-                        <button id="stt-btn" class="btn-command" onclick="toggleVoiceRecording()" title="Speak to append words (Shortcut: V)">
-                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                            </svg>
-                            <span id="stt-btn-text">Voice Input</span>
-                        </button>
-
-                        <button id="tts-toggle-btn" class="btn-command active" onclick="toggleTTS()" title="Mute/Unmute Speech Synthesis (Shortcut: M)">
-                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                                <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                            </svg>
-                            <span id="tts-toggle-text">TTS Enabled</span>
-                        </button>
-
-                        <button id="btn-speak-sentence" class="btn-command btn-speak-sentence" onclick="speakWholeSentence()" title="Speak Complete Sentence (Shortcut: S)">
-                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <polygon points="5 3 19 12 5 21 5 3"></polygon>
-                            </svg>
-                            <span>Speak Translation</span>
-                        </button>
-                    </div>
-
-                    <div id="stt-indicator" class="stt-indicator">
-                        <span class="stt-dot"></span>
-                        <span>Voice input standby</span>
-                    </div>
-                </section>
-
-                <!-- Sentence Translation Canvas -->
+                <!-- Sentence Translation & Dialogue Canvas (Primary Focus: User's Recent Text & Conversation) -->
                 <section class="card sentence-card">
                     <div class="card-header">
-                        <span class="card-title">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                                <polyline points="4 7 4 4 20 4 20 7"></polyline>
-                                <line x1="9" y1="20" x2="15" y2="20"></line>
-                                <line x1="12" y1="4" x2="12" y2="20"></line>
-                            </svg>
-                            Translation Canvas
-                        </span>
+                        <div class="view-switch-tabs">
+                            <button id="tab-canvas" class="view-tab-btn active" onclick="switchCanvasTab('canvas')">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                    <polyline points="4 7 4 4 20 4 20 7"></polyline>
+                                    <line x1="9" y1="20" x2="15" y2="20"></line>
+                                    <line x1="12" y1="4" x2="12" y2="20"></line>
+                                </svg>
+                                <span>Translation Canvas</span>
+                            </button>
+                            <button id="tab-dialogue" class="view-tab-btn" onclick="switchCanvasTab('dialogue')">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                                </svg>
+                                <span>Dialogue Log</span>
+                            </button>
+                        </div>
 
                         <div class="sentence-header-tools">
                             <button class="tool-icon-btn" onclick="copySentence()" title="Copy to clipboard">
@@ -240,13 +241,94 @@
                         </div>
                     </div>
 
-                    <div class="sentence-viewport">
+                    <div class="sentence-viewport" id="viewport-canvas">
                         <div id="sentence-box" class="empty">(empty)</div>
+                    </div>
+
+                    <div class="sentence-viewport dialogue-viewport" id="viewport-dialogue" style="display:none;">
+                        <div id="dialogue-feed" class="dialogue-feed">
+                            <div class="dialogue-placeholder">Two-way conversation log will appear here as signs and voice are captured.</div>
+                        </div>
                     </div>
 
                     <div class="sentence-footer">
                         <span id="char-count">0 chars</span>
                         <span id="word-count">0 words</span>
+                    </div>
+                </section>
+
+                <!-- Audio & Speech Command Center -->
+                <section class="card stt-card">
+                    <div class="card-header">
+                        <span class="card-title">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                                <line x1="12" y1="19" x2="12" y2="23"></line>
+                                <line x1="8" y1="23" x2="16" y2="23"></line>
+                            </svg>
+                            Audio & Speech Hub (STT & TTS)
+                        </span>
+
+                        <!-- Language Selector -->
+                        <div class="stt-lang-picker">
+                            <select id="stt-lang-select" class="stt-select" onchange="changeSTTLanguage(this.value)" title="Select Speech Recognition Language">
+                                <option value="en-US" selected>🇺🇸 English (US)</option>
+                                <option value="vi-VN">🇻🇳 Vietnamese</option>
+                                <option value="es-ES">🇪🇸 Spanish</option>
+                                <option value="fr-FR">🇫🇷 French</option>
+                                <option value="de-DE">🇩🇪 German</option>
+                                <option value="ja-JP">🇯🇵 Japanese</option>
+                                <option value="ko-KR">🇰🇷 Korean</option>
+                                <option value="zh-CN">🇨🇳 Chinese</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Live Waveform & Transcription Preview -->
+                    <div class="stt-live-panel" id="stt-live-panel">
+                        <canvas id="stt-visualizer" class="stt-visualizer" width="340" height="32"></canvas>
+                        <div id="stt-live-preview" class="stt-live-preview">Click "Voice Input" or press [V] to speak</div>
+                    </div>
+
+                    <div class="audio-grid">
+                        <!-- Browser Mic Voice Input -->
+                        <button id="stt-btn" class="btn-command" onclick="toggleVoiceRecording()" title="Speak to transcribe (Shortcut: V)">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                            </svg>
+                            <span id="stt-btn-text">Voice Input</span>
+                        </button>
+
+                        <!-- TTS Mute/Unmute -->
+                        <button id="tts-toggle-btn" class="btn-command active" onclick="toggleTTS()" title="Mute/Unmute Speech Synthesis (Shortcut: M)">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                                <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                            </svg>
+                            <span id="tts-toggle-text">TTS Enabled</span>
+                        </button>
+
+                        <!-- Speak Translation -->
+                        <button id="btn-speak-sentence" class="btn-command btn-speak-sentence" onclick="speakWholeSentence()" title="Speak Complete Sentence (Shortcut: S)">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                            </svg>
+                            <span>Speak Text</span>
+                        </button>
+                    </div>
+
+                    <!-- Target Destination Selector & Status Indicator -->
+                    <div class="stt-footer-bar">
+                        <label class="stt-toggle-label" title="When active, voice transcription appends directly to the Translation Canvas">
+                            <input type="checkbox" id="stt-append-checkbox" checked>
+                            <span>Append to Canvas</span>
+                        </label>
+                        <div id="stt-indicator" class="stt-indicator">
+                            <span class="stt-dot"></span>
+                            <span id="stt-indicator-text">Voice input standby</span>
+                        </div>
                     </div>
                 </section>
 
@@ -327,7 +409,7 @@
 
                 <!-- Alphabet Group -->
                 <div>
-                    <div class="gesture-group-title">Alphabet Letters (A – Y)</div>
+                    <div class="gesture-group-title">Alphabet Letters (A – Y) — ✋ Single Hand (Right Hand Only)</div>
                     <div class="gesture-grid">
                         <div class="gesture-badge-item" onclick="quickTeach('A'); closeGestureModal();" data-label="A">A</div>
                         <div class="gesture-badge-item" onclick="quickTeach('B'); closeGestureModal();" data-label="B">B</div>
@@ -358,7 +440,7 @@
 
                 <!-- Phrases Group -->
                 <div>
-                    <div class="gesture-group-title">Conversational Words & Phrases</div>
+                    <div class="gesture-group-title">Conversational Words & Phrases — ✋ Right Hand / ✋🤚 YOU & ME (Both/Either Hand)</div>
                     <div class="gesture-grid">
                         <div class="gesture-badge-item control-item" onclick="quickTeach('HELLO'); closeGestureModal();" data-label="HELLO">HELLO</div>
                         <div class="gesture-badge-item control-item" onclick="quickTeach('THANK YOU'); closeGestureModal();" data-label="THANK YOU">THANK YOU</div>
@@ -369,7 +451,7 @@
 
                 <!-- Control Signals Group -->
                 <div>
-                    <div class="gesture-group-title">System & Flow Control Signs</div>
+                    <div class="gesture-group-title">System & Flow Control Signs — 🙌 Two-Handed (Both Hands)</div>
                     <div class="gesture-grid">
                         <div class="gesture-badge-item control-item" onclick="quickTeach('START'); closeGestureModal();" data-label="START">START</div>
                         <div class="gesture-badge-item control-item" onclick="quickTeach('STOP'); closeGestureModal();" data-label="STOP">STOP</div>
@@ -387,7 +469,7 @@
     <div id="toast-container" class="toast-container"></div>
 
     <!-- ── Application Script ──────────────────────────────────────────── -->
-    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}?v=telemetry_cam"></script>
 
 </body>
 
