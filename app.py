@@ -1074,8 +1074,8 @@ def list_cameras():
 def set_dominant_hand():
     global dominant_hand, locked_hand, locked_counter
     global _prob_buffer_both, _prob_buffer_right, _prob_buffer_left, buffer_predictions
-    data = request.get_json()
-    if data and "hand" in data:
+    data = request.get_json(silent=True) or {}
+    if "hand" in data:
         hand = str(data["hand"]).lower().strip()
         if hand in ("right", "left", "auto"):
             dominant_hand = hand
@@ -1097,18 +1097,20 @@ def get_dominant_hand():
 @app.route("/toggle_active", methods=["POST"])
 def toggle_active():
     global is_recording
-    data = request.get_json()
-    if data and "active" in data:
-        is_recording = data["active"]
-    return jsonify({"ok": True})
+    data = request.get_json(silent=True) or {}
+    if "active" in data:
+        is_recording = bool(data["active"])
+    else:
+        is_recording = not is_recording
+    return jsonify({"ok": True, "active": is_recording})
 
 
 @app.route("/append_text", methods=["POST"])
 def append_text():
     global current_sentence
-    data = request.get_json()
-    if data and "text" in data:
-        current_sentence.append(" " + data["text"] + " ")
+    data = request.get_json(silent=True) or {}
+    if "text" in data:
+        current_sentence.append(" " + str(data["text"]).strip() + " ")
     return jsonify({"ok": True})
 
 
@@ -1204,8 +1206,8 @@ def correct_gesture():
             {"ok": False, "message": "Model is currently retraining. Please wait."}
         )
 
-    data = request.get_json()
-    if not data or "label" not in data:
+    data = request.get_json(silent=True) or {}
+    if "label" not in data:
         return jsonify({"ok": False, "message": "No label provided."})
 
     correct_label = str(data["label"]).upper().strip()
