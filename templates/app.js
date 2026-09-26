@@ -81,8 +81,8 @@ const dom = {
 // ── State Management ────────────────────────────────────────────────────────
 let isTTSEnabled = true;
 let isRecordingVoice = false;
-let isGestureRecordingActive = false;
-let lastActiveState = false;
+let isGestureRecordingActive = true;
+let lastActiveState = true;
 let lastSentenceText = "";
 let selectedSTTLanguage = "en-US";
 let audioCtx = null;

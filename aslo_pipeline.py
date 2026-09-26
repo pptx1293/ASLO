@@ -393,6 +393,10 @@ class TimerDynamicGestureManager:
         self.frame_buffer.clear()
         return f"CANCELLED ({reason}): {cancelled_name}"
 
+    def reset(self):
+        """Reset dynamic controller state."""
+        self.cancel("Reset")
+
     def update(
         self,
         coords: Optional[np.ndarray],

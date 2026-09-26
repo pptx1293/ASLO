@@ -75,7 +75,7 @@ current_word = ""
 N_FRAMES = 8
 CONFIRM_THRESHOLD = 0.40
 buffer_predictions = collections.deque(maxlen=N_FRAMES)
-is_recording = False
+is_recording = True  # Active by default: translates signs immediately without requiring manual start
 DYNAMIC_GESTURES = {"how are you", "j", "nice to meet you", "z"}
 last_dynamic_trigger_time = 0.0
 
@@ -228,6 +228,14 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         right_hand_lms = None
         left_hand_lms = None
 
+        def _to_mirrored(raw_pts):
+            if not raw_pts:
+                return []
+            return [
+                [(1.0 - p[0]) if is_mirrored else p[0], p[1], p[2] if len(p) > 2 else 0.0]
+                for p in raw_pts
+            ]
+
         if all_hands and len(all_hands) >= 2:
             r_pts, l_pts = None, None
             for h in all_hands[:2]:
@@ -245,16 +253,12 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             elif l_pts is None:
                 l_pts = all_hands[0].get("points", [])
 
-            right_hand_lms = aslo_features.HandLandmarks(r_pts)
-            left_hand_lms = aslo_features.HandLandmarks(l_pts)
+            right_hand_lms = aslo_features.HandLandmarks(_to_mirrored(r_pts))
+            left_hand_lms = aslo_features.HandLandmarks(_to_mirrored(l_pts))
         else:
-            single_lms = aslo_features.HandLandmarks(landmarks_data)
+            single_pts = _to_mirrored(landmarks_data)
+            single_lms = aslo_features.HandLandmarks(single_pts)
             is_left = (handedness == "Left")
-            if len(single_lms.landmark) >= 21 and handedness != "Right":
-                thumb_x = single_lms.landmark[4].x
-                pinky_x = single_lms.landmark[20].x
-                if thumb_x > pinky_x:
-                    is_left = True
 
             if dominant_hand == "left":
                 left_hand_lms = single_lms
