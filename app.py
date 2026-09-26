@@ -22,7 +22,7 @@ from aslo_pipeline import (
 )
 from speech_to_text import SUPPORTED_LANGUAGES, engine as stt_engine
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="templates", static_url_path="")
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 model_path = "gesture_model.keras"

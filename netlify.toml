@@ -1,0 +1,22 @@
+[build]
+  publish = "templates"
+
+[[redirects]]
+  from = "/mobile"
+  to = "/mobile.html"
+  status = 200
+
+[[redirects]]
+  from = "/static/css/*"
+  to = "/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/static/js/*"
+  to = "/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
