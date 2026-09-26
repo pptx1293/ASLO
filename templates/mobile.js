@@ -395,9 +395,9 @@ function updateTranscriptDOM() {
 }
 
 function appendSignToTranscript(sign) {
-    if (!sign || sign === "—") return;
+    if (!sign || sign === "—" || sign.toUpperCase() === "NEUTRAL" || sign.toUpperCase() === "IDLE") return;
     const clean = stripInternalSuffix(sign).trim();
-    if (!clean) return;
+    if (!clean || clean.toUpperCase() === "NEUTRAL" || clean.toUpperCase() === "IDLE") return;
 
     if (clean === "SPACE") {
         if (clientSentence.length > 0 && !clientSentence.endsWith(" ")) {
@@ -582,29 +582,61 @@ async function sendMobileLandmarks(results) {
 }
 
 // ── Mobile Client Webcam Lifecycle ──────────────────────────────────────────
+let mobileFrameLoopId = null;
+
 async function startMobileWebcam() {
     try {
         initMobileMediaPipe();
 
+        // 1. Cancel previous frame loop
+        if (mobileFrameLoopId) {
+            cancelAnimationFrame(mobileFrameLoopId);
+            mobileFrameLoopId = null;
+        }
+
+        // 2. Stop previous MediaPipe Camera helper if any
         if (mobileCamera) {
             try { await mobileCamera.stop(); } catch (e) {}
             mobileCamera = null;
         }
+
+        // 3. Stop previous stream tracks cleanly to release sensor
         if (webcamStream) {
-            webcamStream.getTracks().forEach(t => t.stop());
+            webcamStream.getTracks().forEach(t => {
+                try { t.stop(); } catch (_) {}
+            });
             webcamStream = null;
         }
 
-        const constraints = {
-            video: {
-                facingMode: { ideal: currentFacingMode },
-                width: { ideal: 480 },
-                height: { ideal: 360 }
-            },
-            audio: false
-        };
+        if (dom.webcam) {
+            try { dom.webcam.pause(); } catch (_) {}
+            dom.webcam.srcObject = null;
+        }
 
-        webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+        // 4. Request camera using exact facingMode on mobile, with ideal fallback
+        let stream = null;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    facingMode: { exact: currentFacingMode },
+                    width: { ideal: 640 },
+                    height: { ideal: 480 }
+                },
+                audio: false
+            });
+        } catch (exactErr) {
+            console.warn("[Mobile] Exact facingMode failed, falling back to ideal:", exactErr);
+            stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    facingMode: { ideal: currentFacingMode },
+                    width: { ideal: 640 },
+                    height: { ideal: 480 }
+                },
+                audio: false
+            });
+        }
+
+        webcamStream = stream;
         if (dom.webcam) {
             dom.webcam.srcObject = webcamStream;
             updateCameraMirrorDisplay();
@@ -612,31 +644,32 @@ async function startMobileWebcam() {
             dom.webcam.style.display = "block";
         }
 
-        if (typeof Camera !== "undefined" && mobileHands) {
-            mobileCamera = new Camera(dom.webcam, {
-                onFrame: async () => {
-                    if (isWebcamActive && mobileHands) {
-                        await mobileHands.send({ image: dom.webcam });
-                    }
-                },
-                width: 480,
-                height: 360
-            });
-            await mobileCamera.start();
-        } else {
-            const frameLoop = async () => {
-                if (isWebcamActive && mobileHands) {
-                    await mobileHands.send({ image: dom.webcam });
-                    requestAnimationFrame(frameLoop);
-                }
-            };
-            requestAnimationFrame(frameLoop);
-        }
-
         isWebcamActive = true;
         updateCameraMirrorDisplay();
         if (dom.camFallback) dom.camFallback.style.display = "none";
-        showToast(`Camera active: ${currentFacingMode === "user" ? "Front" : "Rear"}`);
+
+        // 5. Continuous frame processing loop directly into MediaPipe Hands
+        const onFrame = async () => {
+            if (!isWebcamActive) return;
+            if (mobileHands && dom.webcam && dom.webcam.readyState >= 2 && !dom.webcam.paused) {
+                try {
+                    await mobileHands.send({ image: dom.webcam });
+                } catch (_) {}
+            }
+            if ("requestVideoFrameCallback" in dom.webcam) {
+                dom.webcam.requestVideoFrameCallback(onFrame);
+            } else {
+                mobileFrameLoopId = requestAnimationFrame(onFrame);
+            }
+        };
+
+        if ("requestVideoFrameCallback" in dom.webcam) {
+            dom.webcam.requestVideoFrameCallback(onFrame);
+        } else {
+            mobileFrameLoopId = requestAnimationFrame(onFrame);
+        }
+
+        showToast(`Active: ${currentFacingMode === "user" ? "Front (Selfie)" : "Rear (Environment)"} Camera`);
     } catch (err) {
         console.error("[Mobile] Camera error:", err);
         isWebcamActive = false;
@@ -688,11 +721,23 @@ function applyMobileTelemetry(data) {
         return;
     }
 
-    if (!data.prediction || data.prediction === "—") {
-        if (clientStabilityBuffer.length > 0) {
-            clientStabilityBuffer.push("—");
-            if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
+    const isNeutralOrIdle = (
+        !data.prediction ||
+        data.prediction === "—" ||
+        data.is_neutral ||
+        (data.prediction && data.prediction.toUpperCase() === "NEUTRAL") ||
+        (data.raw_pred && data.raw_pred.toUpperCase() === "NEUTRAL")
+    );
+
+    if (isNeutralOrIdle) {
+        if (dom.signVal) dom.signVal.textContent = "NEUTRAL";
+        if (dom.signSub) dom.signSub.textContent = "Resting / Neutral";
+        if (clientDynamicGesture) {
+            clientDynamicGesture = null;
+            if (dom.dynBanner) dom.dynBanner.style.display = "none";
         }
+        clientStabilityBuffer = [];
+        clientLastWord = "";
         updateStabilityDots(0);
         return;
     }
@@ -712,8 +757,17 @@ function applyMobileTelemetry(data) {
         if (dom.dynTimer) dom.dynTimer.textContent = remainingSec.toFixed(1) + "s";
         if (dom.dynBarFill) dom.dynBarFill.style.width = ratio + "%";
 
-        const isEndSignal = rawPred.endsWith("_END") || rawPred === "YOU" || (rawPred === clientDynamicGesture && elapsedSec >= 0.8);
-        if (isEndSignal || remainingSec <= 0) {
+        // If user drops to neutral, abort dynamic gesture without committing!
+        if (rawPred === "NEUTRAL" || data.is_neutral) {
+            clientDynamicGesture = null;
+            if (dom.dynBanner) dom.dynBanner.style.display = "none";
+            clientStabilityBuffer = [];
+            updateStabilityDots(0);
+            return;
+        }
+
+        const isEndSignal = rawPred.endsWith("_END") || (rawPred === "YOU" && clientDynamicGesture.includes("YOU")) || (rawPred === clientDynamicGesture && elapsedSec >= 1.0);
+        if (isEndSignal) {
             const completedGesture = clientDynamicGesture;
             clientDynamicGesture = null;
             if (dom.dynBanner) dom.dynBanner.style.display = "none";
@@ -727,13 +781,22 @@ function applyMobileTelemetry(data) {
             updateStabilityDots(0);
             return;
         }
+
+        // Cancel if timeout reached without reaching the completion pose
+        if (remainingSec <= 0) {
+            clientDynamicGesture = null;
+            if (dom.dynBanner) dom.dynBanner.style.display = "none";
+            clientStabilityBuffer = [];
+            updateStabilityDots(0);
+            return;
+        }
         return;
     } else {
         if (dom.dynBanner) dom.dynBanner.style.display = "none";
     }
 
-    // 3. Initiate dynamic gesture countdown if _START gesture detected
-    if (rawPred.endsWith("_START")) {
+    // 3. Initiate dynamic gesture countdown ONLY if _START gesture detected with high confidence
+    if (rawPred.endsWith("_START") && confVal >= 0.60) {
         const candidate = cleanPred.toUpperCase();
         clientDynamicGesture = candidate;
         clientDynamicStartTime = now;
@@ -745,15 +808,19 @@ function applyMobileTelemetry(data) {
         return;
     }
 
-    // 4. Stability Buffer Smoothing (5 frames window, >=3 agreement)
+    // 4. Stability Buffer Smoothing (5 frames window, >=3 agreement, confidence >= 0.55)
     clientStabilityBuffer.push(cleanPred);
     if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
 
     const matchCount = clientStabilityBuffer.filter(p => p === cleanPred).length;
     updateStabilityDots(matchCount);
 
-    if (matchCount >= STABILITY_REQUIRED_COUNT && confVal >= 0.35) {
+    if (matchCount >= STABILITY_REQUIRED_COUNT && confVal >= 0.55) {
         const upper = cleanPred.toUpperCase();
+        if (upper === "NEUTRAL" || upper === "IDLE" || upper === "—") {
+            clientStabilityBuffer = [];
+            return;
+        }
         if (upper === "START") {
             if (!isGestureRecordingActive) {
                 isGestureRecordingActive = true;

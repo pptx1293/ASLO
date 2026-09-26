@@ -79,6 +79,10 @@ if os.path.exists(DATASET_DIR):
             FOLDER_NAMES_MAP[fname.lower().strip()] = fname
             FOLDER_NAMES_MAP[fname.lower().replace(" ", "_").strip()] = fname
 
+NEUTRAL_INDEX = None
+if label_classes is not None and "neutral" in list(label_classes):
+    NEUTRAL_INDEX = list(label_classes).index("neutral")
+
 
 def get_clean_folder_label(label: str):
     if not label or label in ("—", "none", "NONE"):
@@ -99,12 +103,19 @@ def get_clean_folder_label(label: str):
 
 
 def clean_display_label(label: str) -> str:
-    if not label or label in ("—", "none", "NONE", "IDLE"):
+    if not label or str(label).strip() in ("—", "none", "NONE", "IDLE"):
         return "—"
+    lbl_lower = str(label).strip().lower()
+    if lbl_lower in ("neutral", "idle"):
+        return "NEUTRAL"
     folder = get_clean_folder_label(label)
     if folder:
+        if folder.strip().lower() in ("neutral", "idle"):
+            return "NEUTRAL"
         return folder
     cleaned = re.sub(r'_(START|END)$', '', str(label), flags=re.IGNORECASE).strip()
+    if cleaned.lower() in ("neutral", "idle"):
+        return "NEUTRAL"
     return cleaned if cleaned else "—"
 
 
@@ -246,6 +257,12 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         both_live_gesture = label_both.upper()
         both_live_conf = conf_both
 
+        # Check if two-hand inference is neutral
+        prob_both_neutral = float(p_both[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(p_both)) else 0.0
+        if label_both.lower() == "neutral" or (prob_both_neutral >= 0.25 and conf_both < 0.65):
+            both_live_gesture = "NEUTRAL"
+            conf_both = max(prob_both_neutral, conf_both)
+
         # Right single-hand inference
         feats_r = aslo_features.extract_single_hand_features(r_lms, is_left_hand=False)
         p_r = np.array(model(np.array([feats_r], dtype=np.float32), training=False))[0]
@@ -293,12 +310,26 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         idx = int(np.argmax(probs))
         raw_pred = str(label_classes[idx])
         conf = float(probs[idx])
-        heur = aslo_features.apply_heuristics(single_lms, raw_pred, is_left_hand=False, confidence=conf)
 
-        cand_clean = clean_display_label(heur).lower()
-        if cand_clean in ("how are you", "nice to meet you", "fine"):
-            heur = "—"
-            conf = 0.0
+        # Check if neutral probability is elevated or hand is in resting position
+        wrist_y = single_lms.landmark[0].y
+        prob_neutral = float(probs[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(probs)) else 0.0
+
+        is_neutral = (
+            raw_pred.lower() == "neutral"
+            or (prob_neutral >= 0.20 and conf < 0.65)
+            or wrist_y > 0.88
+        )
+
+        if is_neutral:
+            heur = "NEUTRAL"
+            conf = max(prob_neutral, conf if raw_pred.lower() == "neutral" else 0.60)
+        else:
+            heur = aslo_features.apply_heuristics(single_lms, raw_pred, is_left_hand=False, confidence=conf)
+            cand_clean = clean_display_label(heur).lower()
+            if cand_clean in ("how are you", "nice to meet you", "fine"):
+                heur = "—"
+                conf = 0.0
 
         pred_label = heur
         confidence = conf
@@ -311,6 +342,8 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
     clean_l = clean_display_label(left_live_gesture) if left_live_gesture != "TRACKED" else "TRACKED"
     clean_both = clean_display_label(both_live_gesture)
 
+    is_neutral_signal = (clean_pred == "NEUTRAL" or pred_label == "NEUTRAL" or clean_pred == "—")
+
     return {
         "ok": True,
         "prediction": clean_pred,
@@ -320,6 +353,7 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         "dominant_hand": "right",
         "live_gesture": clean_pred,
         "live_conf": float(round(confidence, 2)),
+        "is_neutral": is_neutral_signal,
         "right_gesture": clean_r,
         "right_conf": float(round(right_live_conf, 2)),
         "left_gesture": clean_l,

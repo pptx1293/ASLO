@@ -1367,9 +1367,9 @@ function updateSentenceDOM() {
 }
 
 function appendSignToClientSentence(sign) {
-    if (!sign || sign === "—") return;
+    if (!sign || sign === "—" || sign.toUpperCase() === "NEUTRAL" || sign.toUpperCase() === "IDLE") return;
     const clean = stripInternalSuffix(sign).trim();
-    if (!clean) return;
+    if (!clean || clean.toUpperCase() === "NEUTRAL" || clean.toUpperCase() === "IDLE") return;
 
     if (clean === "SPACE") {
         if (clientSentence.length > 0 && !clientSentence.endsWith(" ")) {
@@ -1751,8 +1751,22 @@ function applyTelemetry(data) {
             statePill.className = "state-pill dynamic-active";
         }
 
-        const isEndSignal = rawPred.endsWith("_END") || rawPred === "YOU" || (rawPred === clientDynamicGesture && elapsedSec >= 0.8);
-        if (isEndSignal || remainingSec <= 0) {
+        // Abort dynamic gesture if user drops to neutral
+        if (rawPred === "NEUTRAL" || data.is_neutral) {
+            clientDynamicGesture = null;
+            if (dynBanner) dynBanner.style.display = "none";
+            if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+            if (statePill) {
+                statePill.textContent = isGestureRecordingActive ? "RECORDING" : "STANDBY";
+                statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
+            }
+            clientStabilityBuffer = [];
+            renderStability(0, STABILITY_REQUIRED_COUNT, false);
+            return;
+        }
+
+        const isEndSignal = rawPred.endsWith("_END") || (rawPred === "YOU" && clientDynamicGesture.includes("YOU")) || (rawPred === clientDynamicGesture && elapsedSec >= 1.0);
+        if (isEndSignal) {
             const completedGesture = clientDynamicGesture;
             clientDynamicGesture = null;
             if (dynBanner) dynBanner.style.display = "none";
@@ -1771,6 +1785,20 @@ function applyTelemetry(data) {
             renderStability(0, STABILITY_REQUIRED_COUNT, false);
             return;
         }
+
+        // Cancel if timeout reached without achieving the completion pose
+        if (remainingSec <= 0) {
+            clientDynamicGesture = null;
+            if (dynBanner) dynBanner.style.display = "none";
+            if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+            if (statePill) {
+                statePill.textContent = isGestureRecordingActive ? "RECORDING" : "STANDBY";
+                statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
+            }
+            clientStabilityBuffer = [];
+            renderStability(0, STABILITY_REQUIRED_COUNT, false);
+            return;
+        }
         return;
     } else {
         if (dynBanner) dynBanner.style.display = "none";
@@ -1781,8 +1809,8 @@ function applyTelemetry(data) {
         }
     }
 
-    // Initiate dynamic gesture on _START signal
-    if (rawPred.endsWith("_START")) {
+    // Initiate dynamic gesture on _START signal with high confidence
+    if (rawPred.endsWith("_START") && confVal >= 0.60) {
         const candidate = cleanPred.toUpperCase();
         clientDynamicGesture = candidate;
         clientDynamicStartTime = now;
@@ -1796,16 +1824,33 @@ function applyTelemetry(data) {
         return;
     }
 
-    // Stability Buffer Smoothing
-    if (!data.prediction || data.prediction === "—") {
-        if (clientStabilityBuffer.length > 0) {
-            clientStabilityBuffer.push("—");
-            if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
+    // Neutral / Rest Pose Gate: Do not accumulate in stability buffer or commit to sentence
+    const isNeutralOrIdle = (
+        !data.prediction ||
+        data.prediction === "—" ||
+        data.is_neutral ||
+        (data.prediction && data.prediction.toUpperCase() === "NEUTRAL") ||
+        (data.raw_pred && data.raw_pred.toUpperCase() === "NEUTRAL")
+    );
+
+    if (isNeutralOrIdle) {
+        if (dom.gestureLabel) dom.gestureLabel.textContent = "NEUTRAL";
+        if (dom.statePill) {
+            dom.statePill.textContent = isGestureRecordingActive ? "RECORDING (RESTING)" : "STANDBY (RESTING)";
+            dom.statePill.className = "state-pill standby";
         }
+        if (clientDynamicGesture) {
+            clientDynamicGesture = null;
+            if (dynBanner) dynBanner.style.display = "none";
+            if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+        }
+        clientStabilityBuffer = [];
+        clientLastWord = "";
         renderStability(0, STABILITY_REQUIRED_COUNT, false);
         return;
     }
 
+    // Stability Buffer Smoothing
     clientStabilityBuffer.push(cleanPred);
     if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
 
@@ -1813,8 +1858,12 @@ function applyTelemetry(data) {
     const isStable = matchCount >= STABILITY_REQUIRED_COUNT;
     renderStability(matchCount, STABILITY_REQUIRED_COUNT, isStable);
 
-    if (isStable && confVal >= 0.35) {
+    if (isStable && confVal >= 0.55) {
         const upper = cleanPred.toUpperCase();
+        if (upper === "NEUTRAL" || upper === "IDLE" || upper === "—") {
+            clientStabilityBuffer = [];
+            return;
+        }
         if (upper === "START") {
             if (!isGestureRecordingActive) {
                 isGestureRecordingActive = true;
