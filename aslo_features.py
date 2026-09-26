@@ -4,6 +4,38 @@ import itertools
 FEATURE_LEN = 226
 
 
+class LandmarkPoint:
+    __slots__ = ("x", "y", "z")
+
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+
+
+class HandLandmarks:
+    """Wraps raw landmark points (list of dicts, tuples, or [x, y, z] lists) into
+    a MediaPipe-compatible object exposing a .landmark attribute with 21 LandmarkPoint items."""
+
+    def __init__(self, raw_points):
+        self.landmark = []
+        if raw_points:
+            for p in raw_points:
+                if isinstance(p, dict):
+                    self.landmark.append(LandmarkPoint(p.get("x", 0.0), p.get("y", 0.0), p.get("z", 0.0)))
+                elif isinstance(p, (list, tuple)):
+                    x = p[0] if len(p) > 0 else 0.0
+                    y = p[1] if len(p) > 1 else 0.0
+                    z = p[2] if len(p) > 2 else 0.0
+                    self.landmark.append(LandmarkPoint(x, y, z))
+                elif hasattr(p, "x") and hasattr(p, "y"):
+                    self.landmark.append(LandmarkPoint(p.x, p.y, getattr(p, "z", 0.0)))
+                else:
+                    self.landmark.append(LandmarkPoint(0.0, 0.0, 0.0))
+        while len(self.landmark) < 21:
+            self.landmark.append(LandmarkPoint(0.0, 0.0, 0.0))
+
+
 class _Results:
     def __init__(self, hands_res):
         self.left_hand_landmarks = None

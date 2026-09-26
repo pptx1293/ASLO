@@ -49,13 +49,9 @@ else:
     print("Warning: gesture_model.keras or label_classes.npy not found.")
     print("Please run collect_data.py and train_model.py first.")
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=2,
-    min_detection_confidence=0.55,
-    min_tracking_confidence=0.55,
-)
+# Server-side MediaPipe Hands is disabled: Hand tracking is now executed
+# zero-latency in the client browser, transmitting only 21 landmark coordinates.
+hands = None
 
 # ── ASLO High-Performance Pipeline Modules ─────────────────────────────────
 low_light_enhancer = LowLightEnhancer(base_clip_limit=2.5, tile_grid_size=(8, 8))
@@ -176,14 +172,14 @@ def apply_clahe_preprocessing(frame_bgr):
     return low_light_enhancer.process(frame_bgr)
 
 
-def process_frame_data(frame_bgr, is_already_flipped=False):
+def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, is_mirrored=True):
     """
-    Core cloud inference engine. Processes a single video frame sent from client browser:
-    1. Preprocesses and enhances lighting
-    2. Runs MediaPipe Hands tracking
+    Core cloud inference engine. Processes 21-point coordinates sent from client browser:
+    1. Zero-latency: uses client MediaPipe landmarks, saving 100% video bandwidth & decoding CPU
+    2. Maps landmarks to HandLandmarks structures
     3. Handles physical Left vs Right hand separation
     4. Evaluates static and dynamic ASL gestures
-    5. Returns full telemetry state + landmark coordinate points for client HUD
+    5. Returns full telemetry state for client UI
     """
     global current_sentence, current_word, buffer_predictions, is_recording
     global live_gesture, live_conf, agreeing, latest_features, detected_hand
@@ -196,21 +192,8 @@ def process_frame_data(frame_bgr, is_already_flipped=False):
     global last_trigger_time, prev_active_hand, consecutive_no_hand
     global start_trigger_count, stop_trigger_count
 
-    frame = frame_bgr if is_already_flipped else cv2.flip(frame_bgr, 1)
-    h, w, _ = frame.shape
-
-    # 1. High-Speed RGB conversion with selective low-light fallback
-    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(image_rgb)
-    if not (results and results.multi_hand_landmarks):
-        # Fallback to CLAHE only if dark and initial detection missed
-        mean_val = float(np.mean(frame))
-        if mean_val < 65.0:
-            frame_enhanced, _, _ = apply_clahe_preprocessing(frame)
-            image_rgb = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2RGB)
-            results = hands.process(image_rgb)
-
-    hands_detected = bool(results and results.multi_hand_landmarks)
+    speak_alert = None
+    hands_detected = bool(landmarks_data and len(landmarks_data) >= 21)
 
     if not hands_detected:
         consecutive_no_hand += 1
@@ -244,53 +227,34 @@ def process_frame_data(frame_bgr, is_already_flipped=False):
     if hands_detected:
         right_hand_lms = None
         left_hand_lms = None
-        num_hands = len(results.multi_hand_landmarks)
 
-        # Export landmarks for client HUD drawing
-        for idx, lms in enumerate(results.multi_hand_landmarks):
-            lbl = "Hand"
-            if results.multi_handedness and idx < len(results.multi_handedness):
-                lbl = results.multi_handedness[idx].classification[0].label
-            pts = [{"x": round(lm.x, 4), "y": round(lm.y, 4), "z": round(lm.z, 4)} for lm in lms.landmark]
-            landmarks_out.append({"label": lbl, "points": pts})
+        if all_hands and len(all_hands) >= 2:
+            r_pts, l_pts = None, None
+            for h in all_hands[:2]:
+                h_label = h.get("label", "Right")
+                pts = h.get("points", [])
+                if h_label == "Right" and r_pts is None:
+                    r_pts = pts
+                elif h_label == "Left" and l_pts is None:
+                    l_pts = pts
+            if r_pts is None and l_pts is None:
+                r_pts = all_hands[0].get("points", [])
+                l_pts = all_hands[1].get("points", [])
+            elif r_pts is None:
+                r_pts = all_hands[1].get("points", [])
+            elif l_pts is None:
+                l_pts = all_hands[0].get("points", [])
 
-        if num_hands >= 2:
-            r_lms, l_lms = None, None
-            if results.multi_handedness and len(results.multi_handedness) >= 2:
-                for i in range(min(2, len(results.multi_handedness))):
-                    lbl = results.multi_handedness[i].classification[0].label
-                    if lbl == "Right" and r_lms is None:
-                        r_lms = results.multi_hand_landmarks[i]
-                    elif lbl == "Left" and l_lms is None:
-                        l_lms = results.multi_hand_landmarks[i]
-
-            if r_lms is not None and l_lms is not None:
-                right_hand_lms = r_lms
-                left_hand_lms = l_lms
-            else:
-                h0 = results.multi_hand_landmarks[0]
-                h1 = results.multi_hand_landmarks[1]
-                if h0.landmark[0].x >= h1.landmark[0].x:
-                    right_hand_lms = h0
-                    left_hand_lms = h1
-                else:
-                    right_hand_lms = h1
-                    left_hand_lms = h0
-        elif num_hands == 1:
-            single_lms = results.multi_hand_landmarks[0]
-            mp_label = "Right"
-            score = 1.0
-            if results.multi_handedness and len(results.multi_handedness) > 0:
-                mp_label = results.multi_handedness[0].classification[0].label
-                score = results.multi_handedness[0].classification[0].score
-
-            # Anatomical check: in mirrored selfie view with palm facing camera,
-            # physical Left hand has thumb pointing to the right (thumb_x > pinky_x)
-            is_left = (mp_label == "Left")
-            if score < 0.70:
+            right_hand_lms = aslo_features.HandLandmarks(r_pts)
+            left_hand_lms = aslo_features.HandLandmarks(l_pts)
+        else:
+            single_lms = aslo_features.HandLandmarks(landmarks_data)
+            is_left = (handedness == "Left")
+            if len(single_lms.landmark) >= 21 and handedness != "Right":
                 thumb_x = single_lms.landmark[4].x
                 pinky_x = single_lms.landmark[20].x
-                is_left = (thumb_x > pinky_x)
+                if thumb_x > pinky_x:
+                    is_left = True
 
             if dominant_hand == "left":
                 left_hand_lms = single_lms
@@ -655,6 +619,8 @@ def process_frame_data(frame_bgr, is_already_flipped=False):
 
     return {
         "ok": True,
+        "prediction": clean_live,
+        "confidence": float(round(live_conf, 2)),
         "status": "running",
         "detected_hand": detected_hand,
         "dominant_hand": dominant_hand,
@@ -668,6 +634,8 @@ def process_frame_data(frame_bgr, is_already_flipped=False):
         "left_conf": round(left_live_conf, 2),
         "both_gesture": clean_both,
         "both_conf": round(both_live_conf, 2),
+        "buffer_fill": len(buffer_predictions),
+        "buffer_max": N_FRAMES,
         "word": "".join(current_sentence),
         "active": is_recording,
         "agreeing": agreeing,
@@ -691,31 +659,52 @@ def mobile():
     return render_template("mobile.html")
 
 
+@app.route("/predict_landmarks", methods=["POST"])
+def predict_landmarks():
+    """Client-side landmark inference endpoint.
+    Accepts lightweight 21-point hand landmark coordinates JSON.
+    Zero image decoding, zero server-side MediaPipe, maximum speed on Render."""
+    data = request.get_json(silent=True) or {}
+    landmarks = data.get("landmarks", [])
+    handedness = data.get("handedness", "Right")
+    all_hands = data.get("all_hands", [])
+    is_mirrored = bool(data.get("is_mirrored", True))
+
+    with _inference_lock:
+        result = process_landmarks_data(
+            landmarks_data=landmarks,
+            handedness=handedness,
+            all_hands=all_hands,
+            is_mirrored=is_mirrored
+        )
+
+    return jsonify(result)
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Client-side webcam frame inference endpoint (Base64 JPEG)."""
+    """Backwards-compatible inference endpoint for client landmarks or legacy requests."""
     data = request.get_json(silent=True) or {}
-    image_data = data.get("image")
-    if not image_data:
-        return jsonify({"ok": False, "error": "No image data provided"}), 400
-
-    try:
-        if "," in image_data:
-            image_data = image_data.split(",", 1)[1]
-        img_bytes = base64.b64decode(image_data)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if frame is None:
-            return jsonify({"ok": False, "error": "Failed to decode image frame"}), 400
-
+    if "landmarks" in data:
         with _inference_lock:
-            result = process_frame_data(frame, is_already_flipped=bool(data.get("is_flipped", False)))
-
+            result = process_landmarks_data(
+                landmarks_data=data.get("landmarks", []),
+                handedness=data.get("handedness", "Right"),
+                all_hands=data.get("all_hands", []),
+                is_mirrored=bool(data.get("is_mirrored", True))
+            )
         return jsonify(result)
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "prediction": "—",
+        "confidence": 0.0,
+        "live_gesture": "—",
+        "live_conf": 0.0,
+        "active": is_recording,
+        "word": "".join(current_sentence),
+        "message": "Client-side MediaPipe is active. Send landmarks to /predict_landmarks."
+    })
 
 
 @app.route("/gesture")

@@ -92,8 +92,9 @@
             </div>
 
             <!-- HTML5 Client Webcam & Landmark Overlay Canvas -->
-            <video id="webcam" autoplay playsinline muted></video>
-            <canvas id="landmark-canvas"></canvas>
+            <video id="webcam" playsinline autoplay muted style="display:none;"></video>
+            <canvas id="output_canvas"></canvas>
+            <canvas id="landmark-canvas" style="display:none;"></canvas>
 
             <!-- Fallback Display if video drops -->
             <div class="cam-fallback" id="cam-fallback">
@@ -468,6 +469,11 @@
 
     <!-- ── Toast Container ─────────────────────────────────────────────── -->
     <div id="toast-container" class="toast-container"></div>
+
+    <!-- ── MediaPipe Client-Side Libraries ─────────────────────────────── -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
 
     <!-- ── Application Script ──────────────────────────────────────────── -->
     <script src="app.js"></script>

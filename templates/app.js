@@ -8,6 +8,7 @@
 const dom = {
     // Camera & HUD
     webcam: document.getElementById("webcam"),
+    outputCanvas: document.getElementById("output_canvas") || document.getElementById("landmark-canvas"),
     landmarkCanvas: document.getElementById("landmark-canvas"),
     cameraFeed: document.getElementById("webcam") || document.getElementById("camera-feed"),
     camFallback: document.getElementById("cam-fallback"),
@@ -336,8 +337,172 @@ async function enumerateCameras() {
     }
 }
 
+// ── Client-Side MediaPipe Hands Detector & Zero-Latency Tracker ─────────────
+let mpHands = null;
+let mpCamera = null;
+let lastPredictTime = 0;
+const PREDICT_INTERVAL_MS = 100; // ~10 requests/sec debounce for backend inference
+
+function initClientMediaPipe() {
+    if (mpHands) return mpHands;
+    if (typeof Hands === "undefined") {
+        console.warn("MediaPipe Hands library not loaded yet.");
+        return null;
+    }
+
+    try {
+        mpHands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        // Configure client-side Hands detector:
+        // maxNumHands: 2 supports both single-hand alphabet and two-handed phrase signs
+        mpHands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        const outputCanvas = dom.outputCanvas || dom.landmarkCanvas;
+        const canvasCtx = outputCanvas ? outputCanvas.getContext("2d") : null;
+
+        mpHands.onResults((results) => {
+            if (!outputCanvas || !canvasCtx) return;
+
+            // 1. Maintain canvas internal pixel dimensions to match incoming video frame
+            if (results.image) {
+                const w = results.image.width || 640;
+                const h = results.image.height || 480;
+                if (outputCanvas.width !== w || outputCanvas.height !== h) {
+                    outputCanvas.width = w;
+                    outputCanvas.height = h;
+                }
+
+                canvasCtx.save();
+                canvasCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
+                canvasCtx.drawImage(results.image, 0, 0, outputCanvas.width, outputCanvas.height);
+
+                // 2. Real-time, zero-lag hand skeleton rendering on client (30-60 FPS)
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    for (const landmarks of results.multiHandLandmarks) {
+                        // Classic white skeleton lines
+                        if (typeof drawConnectors === "function" && typeof HAND_CONNECTIONS !== "undefined") {
+                            drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {
+                                color: "#FFFFFF",
+                                lineWidth: 2.8
+                            });
+                        }
+                        // Classic red keypoint dots
+                        if (typeof drawLandmarks === "function") {
+                            drawLandmarks(canvasCtx, landmarks, {
+                                color: "#FF0000",
+                                fillColor: "#FF0000",
+                                lineWidth: 1.0,
+                                radius: 3.5
+                            });
+                        }
+                    }
+                }
+                canvasCtx.restore();
+            }
+
+            // 3. Throttled backend inference (~8-10 requests/sec, 100ms debounce)
+            const now = performance.now();
+            if (now - lastPredictTime >= PREDICT_INTERVAL_MS && !isPredicting) {
+                lastPredictTime = now;
+                sendLandmarksInference(results);
+            }
+        });
+
+        return mpHands;
+    } catch (e) {
+        console.error("Failed to initialize MediaPipe Hands:", e);
+        return null;
+    }
+}
+
+// ── Lightweight Landmark JSON Transmission ──────────────────────────────────
+async function sendLandmarksInference(results) {
+    if (isPredicting) return;
+    isPredicting = true;
+
+    try {
+        const hasHands = results && results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+        let payload = null;
+
+        if (hasHands) {
+            // Extract the 21 coordinate array [[x, y, z], ...] for the detected primary hand
+            const primaryHand = results.multiHandLandmarks[0];
+            const landmarks = primaryHand.map(pt => [
+                Number(pt.x.toFixed(5)),
+                Number(pt.y.toFixed(5)),
+                Number((pt.z || 0).toFixed(5))
+            ]);
+
+            // Handedness: "Right" or "Left"
+            let handedness = "Right";
+            if (results.multiHandedness && results.multiHandedness.length > 0) {
+                handedness = results.multiHandedness[0].label || "Right";
+            }
+
+            // Also send all detected hands if multi-hand is present (for two-handed signs)
+            const allHands = results.multiHandLandmarks.map((hand, idx) => {
+                const label = (results.multiHandedness && results.multiHandedness[idx])
+                    ? results.multiHandedness[idx].label
+                    : (idx === 0 ? handedness : (handedness === "Right" ? "Left" : "Right"));
+                return {
+                    label: label,
+                    points: hand.map(pt => [
+                        Number(pt.x.toFixed(5)),
+                        Number(pt.y.toFixed(5)),
+                        Number((pt.z || 0).toFixed(5))
+                    ])
+                };
+            });
+
+            payload = {
+                landmarks: landmarks,
+                handedness: handedness,
+                all_hands: allHands,
+                is_mirrored: isMirrored
+            };
+        } else {
+            payload = {
+                landmarks: [],
+                all_hands: [],
+                is_mirrored: isMirrored
+            };
+        }
+
+        const response = await fetch("/predict_landmarks", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            applyTelemetry(data);
+        }
+    } catch (err) {
+        // Suppress transient network frame drops
+    } finally {
+        isPredicting = false;
+    }
+}
+
 async function startClientWebcam(deviceId = null) {
     try {
+        initClientMediaPipe();
+
+        const videoElement = dom.webcam;
+        if (!videoElement) return;
+
+        if (mpCamera) {
+            try { await mpCamera.stop(); } catch (e) {}
+            mpCamera = null;
+        }
         if (webcamStream) {
             webcamStream.getTracks().forEach(t => t.stop());
             webcamStream = null;
@@ -352,27 +517,43 @@ async function startClientWebcam(deviceId = null) {
             audio: false
         };
 
-        webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
-        if (dom.webcam) {
-            dom.webcam.srcObject = webcamStream;
-            dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "scaleX(1)";
-            await dom.webcam.play();
-            dom.webcam.style.display = "block";
+        // Use Camera from @mediapipe/camera_utils to stream frames directly into hands.send()
+        if (typeof Camera !== "undefined" && mpHands) {
+            mpCamera = new Camera(videoElement, {
+                onFrame: async () => {
+                    if (isWebcamActive && mpHands) {
+                        await mpHands.send({ image: videoElement });
+                    }
+                },
+                width: 640,
+                height: 480
+            });
+            await mpCamera.start();
+        } else {
+            // Direct getUserMedia fallback
+            webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+            videoElement.srcObject = webcamStream;
+            await videoElement.play();
+            const frameLoop = async () => {
+                if (isWebcamActive && mpHands) {
+                    await mpHands.send({ image: videoElement });
+                    requestAnimationFrame(frameLoop);
+                }
+            };
+            requestAnimationFrame(frameLoop);
         }
-        if (dom.camFallback) dom.camFallback.style.display = "none";
 
         isWebcamActive = true;
+        if (dom.camFallback) dom.camFallback.style.display = "none";
         setStatusBadge("running", isGestureRecordingActive ? "Recording" : "Standby");
-        if (dom.hudCamName) dom.hudCamName.textContent = "CLIENT WEBCAM · LIVE";
-        showToast("Webcam connected — Ready to sign", "success", 2500);
+        if (dom.hudCamName) dom.hudCamName.textContent = "CLIENT WEBCAM · 60 FPS";
+        showToast("Webcam connected — Client-side tracking active", "success", 2500);
 
         await enumerateCameras();
-        requestAnimationFrame(captureAndPredictLoop);
     } catch (err) {
         console.error("Camera access failed:", err);
         isWebcamActive = false;
         setStatusBadge("error");
-        if (dom.webcam) dom.webcam.style.display = "none";
         if (dom.camFallback) {
             dom.camFallback.style.display = "flex";
             const p = dom.camFallback.querySelector("p");
@@ -399,6 +580,10 @@ function toggleFullscreen() {
 
 function toggleCameraMirror() {
     isMirrored = !isMirrored;
+    const canvas = dom.outputCanvas || dom.landmarkCanvas;
+    if (canvas) {
+        canvas.style.transform = isMirrored ? "scaleX(-1)" : "scaleX(1)";
+    }
     if (dom.webcam) {
         dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "scaleX(1)";
     }
@@ -435,52 +620,6 @@ async function switchCamera() {
                 dom.btnSwitchCam.disabled = false;
             }
         }, 600);
-    }
-}
-
-// ── Client-Side Real-Time Frame Capture & Inference Loop ───────────────────
-const FRAME_INTERVAL_MS = 25; // Ultra-fast responsiveness (~30-40 FPS pipelined)
-
-async function captureAndPredictLoop(timestamp) {
-    if (!isWebcamActive) return;
-
-    if (timestamp - lastFrameTime >= FRAME_INTERVAL_MS && !isPredicting) {
-        if (dom.webcam && dom.webcam.readyState >= 2 && dom.webcam.videoWidth > 0) {
-            lastFrameTime = timestamp;
-            isPredicting = true;
-            try {
-                if (!captureCanvas) {
-                    captureCanvas = document.createElement("canvas");
-                    captureCanvas.width = 400;
-                    captureCanvas.height = 300;
-                    captureCtx = captureCanvas.getContext("2d", { willReadFrequently: true });
-                }
-                captureCtx.drawImage(dom.webcam, 0, 0, captureCanvas.width, captureCanvas.height);
-                const base64Data = captureCanvas.toDataURL("image/jpeg", 0.60);
-
-                const response = await fetch("/predict", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        image: base64Data,
-                        is_flipped: !isMirrored
-                    })
-                });
-
-                if (response.ok) {
-                    const data = await response.json();
-                    applyTelemetry(data);
-                    drawHandLandmarks(data.landmarks);
-                }
-            } catch (err) {
-                // Ignore transient frame network drops
-            } finally {
-                isPredicting = false;
-            }
-        }
-    }
-    if (isWebcamActive) {
-        requestAnimationFrame(captureAndPredictLoop);
     }
 }
 

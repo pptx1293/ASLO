@@ -268,9 +268,152 @@ function drawMobileHandLandmarks(landmarksList) {
     }
 }
 
+// ── Mobile Client-Side MediaPipe Hands Detector ─────────────────────────────
+let mobileHands = null;
+let mobileCamera = null;
+let lastMobilePredictTime = 0;
+const MOBILE_PREDICT_INTERVAL = 100; // ~10 req/sec
+
+function initMobileMediaPipe() {
+    if (mobileHands) return mobileHands;
+    if (typeof Hands === "undefined") return null;
+
+    try {
+        mobileHands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        mobileHands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        mobileHands.onResults((results) => {
+            const canvas = dom.landmarkCanvas;
+            if (!canvas) return;
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return;
+
+            const rect = canvas.getBoundingClientRect();
+            if (canvas.width !== rect.width || canvas.height !== rect.height) {
+                canvas.width = rect.width;
+                canvas.height = rect.height;
+            }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 1. Instant zero-latency skeleton rendering
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    if (typeof drawConnectors === "function" && typeof HAND_CONNECTIONS !== "undefined") {
+                        drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {
+                            color: "#FFFFFF",
+                            lineWidth: 2.4
+                        });
+                    }
+                    if (typeof drawLandmarks === "function") {
+                        drawLandmarks(ctx, landmarks, {
+                            color: "#FF0000",
+                            fillColor: "#FF0000",
+                            lineWidth: 1.0,
+                            radius: 3.5
+                        });
+                    }
+                }
+            }
+
+            // 2. Throttled backend landmark prediction
+            const now = performance.now();
+            if (now - lastMobilePredictTime >= MOBILE_PREDICT_INTERVAL && !isPredicting) {
+                lastMobilePredictTime = now;
+                sendMobileLandmarks(results);
+            }
+        });
+
+        return mobileHands;
+    } catch (e) {
+        console.error("Mobile MediaPipe init error:", e);
+        return null;
+    }
+}
+
+async function sendMobileLandmarks(results) {
+    if (isPredicting) return;
+    isPredicting = true;
+
+    try {
+        const hasHands = results && results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+        let payload = null;
+
+        if (hasHands) {
+            const primaryHand = results.multiHandLandmarks[0];
+            const landmarks = primaryHand.map(pt => [
+                Number(pt.x.toFixed(5)),
+                Number(pt.y.toFixed(5)),
+                Number((pt.z || 0).toFixed(5))
+            ]);
+
+            let handedness = "Right";
+            if (results.multiHandedness && results.multiHandedness.length > 0) {
+                handedness = results.multiHandedness[0].label || "Right";
+            }
+
+            const allHands = results.multiHandLandmarks.map((hand, idx) => {
+                const label = (results.multiHandedness && results.multiHandedness[idx])
+                    ? results.multiHandedness[idx].label
+                    : (idx === 0 ? handedness : "Left");
+                return {
+                    label: label,
+                    points: hand.map(pt => [
+                        Number(pt.x.toFixed(5)),
+                        Number(pt.y.toFixed(5)),
+                        Number((pt.z || 0).toFixed(5))
+                    ])
+                };
+            });
+
+            payload = {
+                landmarks: landmarks,
+                handedness: handedness,
+                all_hands: allHands,
+                is_mirrored: isMirrored
+            };
+        } else {
+            payload = {
+                landmarks: [],
+                all_hands: [],
+                is_mirrored: isMirrored
+            };
+        }
+
+        const response = await fetch("/predict_landmarks", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            applyMobileTelemetry(data);
+        }
+    } catch (err) {
+        // Tolerated transient frame drops
+    } finally {
+        isPredicting = false;
+    }
+}
+
 // ── Mobile Client Webcam Lifecycle ──────────────────────────────────────────
 async function startMobileWebcam() {
     try {
+        initMobileMediaPipe();
+
+        if (mobileCamera) {
+            try { await mobileCamera.stop(); } catch (e) {}
+            mobileCamera = null;
+        }
         if (webcamStream) {
             webcamStream.getTracks().forEach(t => t.stop());
             webcamStream = null;
@@ -285,18 +428,37 @@ async function startMobileWebcam() {
             audio: false
         };
 
-        webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
-        if (dom.webcam) {
-            dom.webcam.srcObject = webcamStream;
-            dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "none";
-            await dom.webcam.play();
-            dom.webcam.style.display = "block";
+        if (typeof Camera !== "undefined" && mobileHands) {
+            mobileCamera = new Camera(dom.webcam, {
+                onFrame: async () => {
+                    if (isWebcamActive && mobileHands) {
+                        await mobileHands.send({ image: dom.webcam });
+                    }
+                },
+                width: 480,
+                height: 360
+            });
+            await mobileCamera.start();
+        } else {
+            webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+            if (dom.webcam) {
+                dom.webcam.srcObject = webcamStream;
+                dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "none";
+                await dom.webcam.play();
+                dom.webcam.style.display = "block";
+            }
+            const frameLoop = async () => {
+                if (isWebcamActive && mobileHands) {
+                    await mobileHands.send({ image: dom.webcam });
+                    requestAnimationFrame(frameLoop);
+                }
+            };
+            requestAnimationFrame(frameLoop);
         }
-        if (dom.camFallback) dom.camFallback.style.display = "none";
 
         isWebcamActive = true;
+        if (dom.camFallback) dom.camFallback.style.display = "none";
         showToast("Mobile camera active");
-        requestAnimationFrame(mobileCaptureLoop);
     } catch (err) {
         console.error("[Mobile] Camera error:", err);
         isWebcamActive = false;
@@ -307,53 +469,6 @@ async function startMobileWebcam() {
             if (t) t.textContent = "Camera access denied or busy";
         }
         showToast("Camera error: " + (err.message || err.name));
-    }
-}
-
-// ── Mobile Frame Capture & Inference Loop ──────────────────────────────────
-const MOBILE_FRAME_INTERVAL = 30; // High responsiveness
-
-async function mobileCaptureLoop(timestamp) {
-    if (!isWebcamActive) return;
-
-    if (timestamp - lastFrameTime >= MOBILE_FRAME_INTERVAL && !isPredicting) {
-        if (dom.webcam && dom.webcam.readyState >= 2 && dom.webcam.videoWidth > 0) {
-            lastFrameTime = timestamp;
-            isPredicting = true;
-            try {
-                if (!captureCanvas) {
-                    captureCanvas = document.createElement("canvas");
-                    captureCanvas.width = 400;
-                    captureCanvas.height = 300;
-                    captureCtx = captureCanvas.getContext("2d", { willReadFrequently: true });
-                }
-                captureCtx.drawImage(dom.webcam, 0, 0, captureCanvas.width, captureCanvas.height);
-                const base64Data = captureCanvas.toDataURL("image/jpeg", 0.60);
-
-                const response = await fetch("/predict", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        image: base64Data,
-                        is_flipped: !isMirrored
-                    })
-                });
-
-                if (response.ok) {
-                    const data = await response.json();
-                    applyMobileTelemetry(data);
-                    drawMobileHandLandmarks(data.landmarks);
-                }
-            } catch (err) {
-                // Silently tolerate single network frame drops
-            } finally {
-                isPredicting = false;
-            }
-        }
-    }
-
-    if (isWebcamActive) {
-        requestAnimationFrame(mobileCaptureLoop);
     }
 }
 
