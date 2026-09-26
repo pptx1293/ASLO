@@ -345,7 +345,7 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
     idx_dy = float(pts_norm[8][1] - pts_norm[5][1])
     is_hooked_idx = (idx_tip_pip <= 0.33 and idx_ext < 1.45)
 
-    if is_upright and is_fist_others and is_hooked_idx:
+    if label in ["x", "p", "q", "z", "z_start", "z_end", "d"] and is_upright and is_fist_others and is_hooked_idx:
         # Hand is upright with hooked index and other fingers in fist: DEFINITIVELY 'X'
         return "X"
 
@@ -413,8 +413,10 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
 
         # 3.3: Spread apart (V) vs Together (U)
         d_idx_mid = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[12][:2]))
-        if d_idx_mid >= 0.17:
+        if d_idx_mid >= 0.11 or (label == "v" and d_idx_mid >= 0.08):
             return "V"
+        elif label == "r" and cross_diff > 0.03:
+            return "R"
         else:
             return "U"
 
@@ -434,7 +436,7 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
         elif dy_thb_idx_pip < 0.02 and d_thb_mid_pip > 0.18:
             return "A"
         return "A"
-    elif label == "a" and pky_ext > 1.35:
+    elif label == "a" and pky_ext > 1.35 and mid_ext < 1.20 and ring_ext < 1.20:
         return "Y"
 
     # ── 6. HARD ANATOMICAL CHECK: 'I love you' vs 'J_START' / 'Y' / 'E' / 'A' ─

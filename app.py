@@ -72,14 +72,14 @@ dynamic_manager = TimerDynamicGestureManager(
 
 current_sentence = []
 current_word = ""
-N_FRAMES = 8
+N_FRAMES = 10
 CONFIRM_THRESHOLD = 0.40
 buffer_predictions = collections.deque(maxlen=N_FRAMES)
 is_recording = True  # Active by default: translates signs immediately without requiring manual start
 DYNAMIC_GESTURES = {"how are you", "j", "nice to meet you", "z"}
 last_dynamic_trigger_time = 0.0
 
-_SMOOTH_WINDOW = 5
+_SMOOTH_WINDOW = 3
 _prob_buffer_both = collections.deque(maxlen=_SMOOTH_WINDOW)
 _prob_buffer_single = collections.deque(maxlen=_SMOOTH_WINDOW)
 _prob_buffer_right = collections.deque(maxlen=_SMOOTH_WINDOW)
@@ -172,12 +172,12 @@ def apply_clahe_preprocessing(frame_bgr):
     return low_light_enhancer.process(frame_bgr)
 
 
-def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, is_mirrored=True):
+def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, is_mirrored=True, hand_type=None):
     """
     Core cloud inference engine. Processes 21-point coordinates sent from client browser:
     1. Zero-latency: uses client MediaPipe landmarks, saving 100% video bandwidth & decoding CPU
-    2. Maps landmarks to HandLandmarks structures
-    3. Handles physical Left vs Right hand separation
+    2. Enforces dataset validation: Single Left-hand gestures are rejected (dataset only has Right and Both hands)
+    3. Routes single Right-hand data to single-hand extractor, and Two-hand data to two-hand extractor
     4. Evaluates static and dynamic ASL gestures
     5. Returns full telemetry state for client UI
     """
@@ -194,6 +194,45 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
     speak_alert = None
     hands_detected = bool(landmarks_data and len(landmarks_data) >= 21)
+
+    hand_type_clean = (hand_type or "").lower().strip()
+    handedness_clean = (handedness or "").capitalize().strip()
+
+    # Check if request contains only a Left hand:
+    # Dataset contains ONLY Right Hand and Both Hands gestures (no single Left hand gestures).
+    is_left_only = False
+    if hand_type_clean == "left":
+        is_left_only = True
+    elif all_hands and len(all_hands) == 1:
+        h0_label = (all_hands[0].get("label") or "").capitalize().strip()
+        if h0_label == "Left" or (hand_type_clean != "right" and handedness_clean == "Left"):
+            is_left_only = True
+    elif not all_hands or len(all_hands) == 0:
+        if handedness_clean == "Left" and hand_type_clean != "right":
+            is_left_only = True
+
+    if hands_detected and is_left_only:
+        print("[Validation] Rejected Left-Hand-Only sign: ASLO dataset only supports Right Hand and Both Hands gestures.")
+        buffer_predictions.clear()
+        detected_hand = "left_ignored"
+        live_gesture = "—"
+        live_conf = 0.0
+        return {
+            "ok": False,
+            "prediction": None,
+            "message": "Left-hand-only signs are not supported. Please use your right hand.",
+            "detected_hand": "left_ignored",
+            "live_gesture": "—",
+            "live_conf": 0.0,
+            "right_gesture": "—",
+            "right_conf": 0.0,
+            "left_gesture": "UNSUPPORTED",
+            "left_conf": 0.0,
+            "both_gesture": "—",
+            "both_conf": 0.0,
+            "word": "".join(current_sentence),
+            "active": is_recording
+        }
 
     if not hands_detected:
         consecutive_no_hand += 1
@@ -236,39 +275,41 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
                 for p in raw_pts
             ]
 
+        is_single_mode = True
+        single_hand_lms = None
+
         if all_hands and len(all_hands) >= 2:
-            r_pts, l_pts = None, None
-            for h in all_hands[:2]:
-                h_label = h.get("label", "Right")
-                pts = h.get("points", [])
-                if h_label == "Right" and r_pts is None:
-                    r_pts = pts
-                elif h_label == "Left" and l_pts is None:
-                    l_pts = pts
-            if r_pts is None and l_pts is None:
-                r_pts = all_hands[0].get("points", [])
-                l_pts = all_hands[1].get("points", [])
-            elif r_pts is None:
-                r_pts = all_hands[1].get("points", [])
-            elif l_pts is None:
-                l_pts = all_hands[0].get("points", [])
+            # 2 hands detected: Route ONLY to two-hand feature extractors
+            h0_pts = all_hands[0].get("points", [])
+            h1_pts = all_hands[1].get("points", [])
+            h0_label = all_hands[0].get("label", "Right")
+            h1_label = all_hands[1].get("label", "Left")
+
+            if h0_label == "Right" and h1_label == "Left":
+                r_pts, l_pts = h0_pts, h1_pts
+            elif h0_label == "Left" and h1_label == "Right":
+                r_pts, l_pts = h1_pts, h0_pts
+            else:
+                # Spatial fallback in mirrored space: higher X is user's right hand
+                avg_x0 = sum(p[0] for p in h0_pts) / len(h0_pts) if h0_pts else 0.5
+                avg_x1 = sum(p[0] for p in h1_pts) / len(h1_pts) if h1_pts else 0.5
+                if avg_x0 <= avg_x1:
+                    r_pts, l_pts = h0_pts, h1_pts
+                else:
+                    r_pts, l_pts = h1_pts, h0_pts
 
             right_hand_lms = aslo_features.HandLandmarks(_to_mirrored(r_pts))
             left_hand_lms = aslo_features.HandLandmarks(_to_mirrored(l_pts))
+            single_hand_lms = right_hand_lms
+            is_single_mode = False
         else:
+            # Single Right hand detected: Route ONLY to single right-hand feature extractors
             single_pts = _to_mirrored(landmarks_data)
             single_lms = aslo_features.HandLandmarks(single_pts)
-            is_left = (handedness == "Left")
-
-            if dominant_hand == "left":
-                left_hand_lms = single_lms
-                right_hand_lms = None
-            elif is_left:
-                left_hand_lms = single_lms
-                right_hand_lms = None
-            else:
-                right_hand_lms = single_lms
-                left_hand_lms = None
+            single_hand_lms = single_lms
+            right_hand_lms = single_lms
+            left_hand_lms = None
+            is_single_mode = True
 
         coords_r, interp_r, metrics_r = keypoint_interpolator.update(right_hand_lms, "Right")
         coords_l, interp_l, metrics_l = keypoint_interpolator.update(left_hand_lms, "Left")
@@ -277,42 +318,46 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         active_scale = metrics_r.get("hand_scale", 0.15) if coords_r is not None else metrics_l.get("hand_scale", 0.15)
         route_mode, motion_speed = motion_router.update(active_coords, hand_scale=active_scale)
 
+        raw_pred = "—"
         if model is None:
+            raw_pred = "HAND DETECTED"
             raw_label = "HAND DETECTED"
             confidence = 1.0
             threshold = 0.5
-            if right_hand_lms is not None and left_hand_lms is not None:
-                detected_hand = "both"
-            elif right_hand_lms is not None:
-                detected_hand = "right"
-            else:
-                detected_hand = "left"
-        elif right_hand_lms is not None and left_hand_lms is not None:
+            detected_hand = "both" if (right_hand_lms and left_hand_lms) else ("left" if left_hand_lms else "right")
+        elif not is_single_mode and right_hand_lms is not None and left_hand_lms is not None:
             # ── CASE 1: BOTH HANDS DETECTED ──
             features_both = aslo_features.extract_two_hand_features(right_hand_lms, left_hand_lms)
             latest_features = features_both
-            p_both = np.array(model(np.array([features_both]), training=False))[0]
+            p_both = np.array(model(np.array([features_both], dtype=np.float32), training=False))[0]
             _prob_buffer_both.append(p_both)
             avg_both = np.mean(_prob_buffer_both, axis=0)
-            idx_both = np.argmax(avg_both)
+            idx_both = int(np.argmax(avg_both))
             conf_both = float(avg_both[idx_both])
             label_both = str(label_classes[idx_both])
             both_live_gesture = label_both.upper()
             both_live_conf = conf_both
 
             feats_r = aslo_features.extract_single_hand_features(right_hand_lms, is_left_hand=False)
-            p_r = np.array(model(np.array([feats_r]), training=False))[0]
+            p_r = np.array(model(np.array([feats_r], dtype=np.float32), training=False))[0]
             _prob_buffer_right.append(p_r)
             avg_r = np.mean(_prob_buffer_right, axis=0)
-            idx_r = np.argmax(avg_r)
+            idx_r = int(np.argmax(avg_r))
             conf_r = float(avg_r[idx_r])
             label_r = str(label_classes[idx_r])
             heur_r = aslo_features.apply_heuristics(right_hand_lms, label_r, is_left_hand=False, confidence=conf_r, route_mode=route_mode)
             right_live_gesture = heur_r
             right_live_conf = conf_r
 
-            left_live_gesture = "TRACKED"
-            left_live_conf = 0.0
+            feats_l = aslo_features.extract_single_hand_features(left_hand_lms, is_left_hand=True)
+            p_l = np.array(model(np.array([feats_l], dtype=np.float32), training=False))[0]
+            _prob_buffer_left.append(p_l)
+            avg_l = np.mean(_prob_buffer_left, axis=0)
+            idx_l = int(np.argmax(avg_l))
+            conf_l = float(avg_l[idx_l])
+            label_l = str(label_classes[idx_l])
+            left_live_gesture = label_l
+            left_live_conf = conf_l
 
             y_r = right_hand_lms.landmark[0].y
             y_l = left_hand_lms.landmark[0].y
@@ -327,34 +372,42 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             req_conf = 0.30 if is_control_sign else 0.40
 
             if is_two_handed and conf_both >= req_conf:
+                raw_pred = label_both
                 raw_label = label_both
                 confidence = conf_both
                 threshold = req_conf
                 detected_hand = "both"
             else:
+                raw_pred = label_r
                 threshold = CONFIRM_THRESHOLD
                 raw_label = heur_r
                 confidence = conf_r
                 detected_hand = "right"
 
-        elif right_hand_lms is not None:
-            # ── CASE 2: DOMINANT RIGHT HAND DETECTED ──
+        else:
+            # ── CASE 2: SINGLE ACTIVE SIGNING HAND ──
+            # Translates full ASL alphabet (A-Z) and single-hand signs.
+            # Strictly routed to Right hand features without mirroring or Left-hand confusion.
+            _prob_buffer_both.clear()
             detected_hand = "right"
-            single_hand = right_hand_lms
-            feats_std = aslo_features.extract_single_hand_features(single_hand, is_left_hand=False)
-            latest_features = feats_std
-            probs = np.array(model(np.array([feats_std]), training=False))[0]
-            _prob_buffer_right.append(probs)
-            avg_s = np.mean(_prob_buffer_right, axis=0)
 
+            feats_single = aslo_features.extract_single_hand_features(single_hand_lms, is_left_hand=False)
+            latest_features = feats_single
+            input_tensor = np.array([feats_single], dtype=np.float32)
+            probs = np.array(model(input_tensor, training=False))[0]
+
+            _prob_buffer_single.append(probs)
+            avg_s = np.mean(_prob_buffer_single, axis=0)
             final_idx = int(np.argmax(avg_s))
             raw_pred = str(label_classes[final_idx])
             confidence = float(avg_s[final_idx])
             threshold = 0.30 if raw_pred.upper() in ("START", "STOP", "SPACE", "BACKSPACE") else CONFIRM_THRESHOLD
 
             raw_label = aslo_features.apply_heuristics(
-                single_hand, raw_pred, is_left_hand=False, confidence=confidence, route_mode=route_mode
+                single_hand_lms, raw_pred, is_left_hand=False, confidence=confidence, route_mode=route_mode
             )
+
+            # Suppress two-handed phrase signs if only one hand is raised
             cand_clean = clean_display_label(raw_label).lower()
             if cand_clean in ("how are you", "nice to meet you", "fine"):
                 raw_label = "—"
@@ -367,60 +420,6 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             both_live_gesture = "—"
             both_live_conf = 0.0
 
-        elif left_hand_lms is not None:
-            # ── CASE 3: LEFT HAND DETECTED ──
-            _prob_buffer_both.clear()
-            _prob_buffer_right.clear()
-            _prob_buffer_left.clear()
-            detected_hand = "left"
-            single_hand = left_hand_lms
-
-            if dominant_hand == "left":
-                feats_mirr = aslo_features.extract_single_hand_features(single_hand, is_left_hand=True)
-                latest_features = feats_mirr
-                probs = np.array(model(np.array([feats_mirr]), training=False))[0]
-                _prob_buffer_single.append(probs)
-                avg_s = np.mean(_prob_buffer_single, axis=0)
-                final_idx = int(np.argmax(avg_s))
-                raw_pred = str(label_classes[final_idx])
-                confidence = float(avg_s[final_idx])
-                threshold = CONFIRM_THRESHOLD
-                raw_label = aslo_features.apply_heuristics(
-                    single_hand, raw_pred, is_left_hand=True, confidence=confidence, route_mode=route_mode
-                )
-                left_live_gesture = raw_label
-                left_live_conf = confidence
-                right_live_gesture = "—"
-                right_live_conf = 0.0
-            else:
-                # Standard mode: NO left-hand gestures in dataset.
-                # Left hand alone is tracked only; NEVER predict, translate, or trigger gestures.
-                raw_label = "—"
-                confidence = 0.0
-                left_live_gesture = "TRACKED"
-                left_live_conf = 0.0
-                right_live_gesture = "—"
-                right_live_conf = 0.0
-                threshold = CONFIRM_THRESHOLD
-
-            both_live_gesture = "—"
-            both_live_conf = 0.0
-        else:
-            _prob_buffer_both.clear()
-            _prob_buffer_single.clear()
-            _prob_buffer_right.clear()
-            _prob_buffer_left.clear()
-            raw_label = "—"
-            confidence = 0.0
-            threshold = CONFIRM_THRESHOLD
-            detected_hand = "none"
-            right_live_gesture = "—"
-            right_live_conf = 0.0
-            left_live_gesture = "—"
-            left_live_conf = 0.0
-            both_live_gesture = "—"
-            both_live_conf = 0.0
-
         live_gesture = raw_label
         live_conf = confidence
     else:
@@ -428,6 +427,7 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         _prob_buffer_single.clear()
         _prob_buffer_right.clear()
         _prob_buffer_left.clear()
+        raw_pred = "—"
         raw_label = "—"
         confidence = 0.0
         threshold = CONFIRM_THRESHOLD
@@ -553,15 +553,13 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
             if confidence > threshold:
                 count = list(buffer_predictions).count(live_gesture)
-                agreeing = len(buffer_predictions) == N_FRAMES and count >= (N_FRAMES * 0.5)
+                agreeing = len(buffer_predictions) == N_FRAMES and count >= 3
 
                 if agreeing:
                     clean_lbl = clean_target or get_clean_folder_label(live_gesture)
                     if clean_lbl:
                         clean_upper = clean_lbl.upper()
                         if clean_upper in ("FINE", "HOW ARE YOU", "NICE TO MEET YOU") and detected_hand != "both":
-                            agreeing = False
-                        elif detected_hand == "left" and dominant_hand != "left":
                             agreeing = False
 
                     if agreeing and clean_lbl and clean_lbl.lower() not in ("start", "stop"):
@@ -591,14 +589,18 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
                                 last_trigger_time = current_time
                                 if is_recording:
                                     current_sentence.append(predicted_label)
-                                    print(f"[Static Sign] Recorded: '{predicted_label}'")
+                                    print(f"[Static Sign] >>> RECORDED TO SENTENCE: '{predicted_label}' | Current Sentence: '{''.join(current_sentence)}'")
                                 else:
                                     print(f"[Static Sign] Ignored '{predicted_label}' (Recording is PAUSED / STANDBY)")
                                 buffer_predictions.clear()
             else:
                 agreeing = False
-                if list(buffer_predictions).count("—") == N_FRAMES:
+                if list(buffer_predictions).count("—") >= 4:
                     current_word = "—"
+
+        if hands_detected:
+            buf_match = list(buffer_predictions).count(live_gesture)
+            print(f"[Inference] Hand={detected_hand} | Raw={raw_pred} ({confidence:.2f}) -> Live={live_gesture} | Agree={agreeing} ({buf_match}/{len(buffer_predictions)}) | Rec={is_recording}")
 
     agreeing = bool(dynamic_manager.is_active or agreeing)
 
@@ -668,47 +670,82 @@ def predict_landmarks():
     """Client-side landmark inference endpoint.
     Accepts lightweight 21-point hand landmark coordinates JSON.
     Zero image decoding, zero server-side MediaPipe, maximum speed on Render."""
-    data = request.get_json(silent=True) or {}
-    landmarks = data.get("landmarks", [])
-    handedness = data.get("handedness", "Right")
-    all_hands = data.get("all_hands", [])
-    is_mirrored = bool(data.get("is_mirrored", True))
+    try:
+        data = request.get_json(silent=True) or {}
+        landmarks = data.get("landmarks", [])
+        handedness = data.get("handedness", "Right")
+        all_hands = data.get("all_hands") or data.get("hands") or []
+        is_mirrored = bool(data.get("is_mirrored", True))
+        hand_type = data.get("hand_type")
 
-    with _inference_lock:
-        result = process_landmarks_data(
-            landmarks_data=landmarks,
-            handedness=handedness,
-            all_hands=all_hands,
-            is_mirrored=is_mirrored
-        )
+        with _inference_lock:
+            result = process_landmarks_data(
+                landmarks_data=landmarks,
+                handedness=handedness,
+                all_hands=all_hands,
+                is_mirrored=is_mirrored,
+                hand_type=hand_type
+            )
 
-    return jsonify(result)
+        return jsonify(result)
+    except Exception as e:
+        print(f"[Error] /predict_landmarks exception: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "prediction": "—",
+            "live_gesture": "—",
+            "live_conf": 0.0,
+            "word": "".join(current_sentence),
+            "active": is_recording
+        }), 500
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
     """Backwards-compatible inference endpoint for client landmarks or legacy requests."""
-    data = request.get_json(silent=True) or {}
-    if "landmarks" in data:
-        with _inference_lock:
-            result = process_landmarks_data(
-                landmarks_data=data.get("landmarks", []),
-                handedness=data.get("handedness", "Right"),
-                all_hands=data.get("all_hands", []),
-                is_mirrored=bool(data.get("is_mirrored", True))
-            )
-        return jsonify(result)
+    try:
+        data = request.get_json(silent=True) or {}
+        if "landmarks" in data:
+            landmarks = data.get("landmarks", [])
+            handedness = data.get("handedness", "Right")
+            all_hands = data.get("all_hands") or data.get("hands") or []
+            is_mirrored = bool(data.get("is_mirrored", True))
+            hand_type = data.get("hand_type")
 
-    return jsonify({
-        "ok": True,
-        "prediction": "—",
-        "confidence": 0.0,
-        "live_gesture": "—",
-        "live_conf": 0.0,
-        "active": is_recording,
-        "word": "".join(current_sentence),
-        "message": "Client-side MediaPipe is active. Send landmarks to /predict_landmarks."
-    })
+            with _inference_lock:
+                result = process_landmarks_data(
+                    landmarks_data=landmarks,
+                    handedness=handedness,
+                    all_hands=all_hands,
+                    is_mirrored=is_mirrored,
+                    hand_type=hand_type
+                )
+            return jsonify(result)
+
+        return jsonify({
+            "ok": True,
+            "prediction": "—",
+            "confidence": 0.0,
+            "live_gesture": "—",
+            "live_conf": 0.0,
+            "active": is_recording,
+            "word": "".join(current_sentence),
+            "message": "Client-side MediaPipe is active. Send landmarks to /predict_landmarks."
+        })
+    except Exception as e:
+        print(f"[Error] /predict exception: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "prediction": "—",
+            "live_gesture": "—",
+            "live_conf": 0.0,
+            "word": "".join(current_sentence),
+            "active": is_recording
+        }), 500
 
 
 @app.route("/gesture")

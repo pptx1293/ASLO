@@ -987,6 +987,14 @@ button:focus-visible {
     box-shadow: 0 0 8px rgba(16, 185, 129, 0.25);
 }
 
+.hand-badge.hand-warning,
+.hand-badge.hand-left-ignored {
+    background: rgba(244, 63, 94, 0.18);
+    color: var(--ruby);
+    border: 1px solid rgba(244, 63, 94, 0.5);
+    box-shadow: 0 0 10px rgba(244, 63, 94, 0.3);
+}
+
 .hand-badge.hand-none {
     background: rgba(255, 255, 255, 0.05);
     color: var(--text-muted);

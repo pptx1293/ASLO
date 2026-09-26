@@ -422,17 +422,95 @@ function initClientMediaPipe() {
     }
 }
 
+let lastLeftHandToastTime = 0;
+
+/**
+ * Resolves the user's actual physical hand from MediaPipe's handedness metadata.
+ * Note: When passing unmirrored webcam feed into MediaPipe, MediaPipe's classification
+ * model outputs inverted labels ("Left" for user's Right hand, "Right" for user's Left hand).
+ */
+function getActualPhysicalHand(handednessObj) {
+    if (!handednessObj) return "Right";
+    const raw = (handednessObj.label || (handednessObj.classification && handednessObj.classification[0] && handednessObj.classification[0].label) || "").trim();
+    if (raw === "Left") return "Right";
+    if (raw === "Right") return "Left";
+    return raw || "Right";
+}
+
+function updateHandStatusUI(status) {
+    const handBadge = document.getElementById("hand-badge");
+    const hudHandText = document.getElementById("hud-hand-text");
+    const statePill = document.getElementById("state-pill");
+
+    if (status === "left_ignored") {
+        if (handBadge) {
+            handBadge.textContent = "🤚 Hand: LEFT (IGNORED)";
+            handBadge.className = "hand-badge hand-warning";
+        }
+        if (hudHandText) hudHandText.textContent = "🤚 LEFT HAND (UNSUPPORTED)";
+        if (statePill) {
+            statePill.textContent = "LEFT HAND (UNSUPPORTED)";
+            statePill.className = "state-pill standby";
+        }
+        if (dom.gestureLabel) dom.gestureLabel.textContent = "—";
+        const curSign = document.getElementById("current-sign");
+        if (curSign) curSign.textContent = "—";
+        if (dom.confBar) dom.confBar.style.width = "0%";
+        if (dom.confText) dom.confText.textContent = "0%";
+        if (dom.hudConfidence) dom.hudConfidence.textContent = "0% CONF";
+    } else if (status === "right") {
+        if (handBadge) {
+            handBadge.textContent = "✋ Hand: RIGHT";
+            handBadge.className = "hand-badge hand-right";
+        }
+        if (hudHandText) hudHandText.textContent = "✋ RIGHT HAND";
+    } else if (status === "both") {
+        if (handBadge) {
+            handBadge.textContent = "🙌 Hand: BOTH";
+            handBadge.className = "hand-badge hand-both";
+        }
+        if (hudHandText) hudHandText.textContent = "🙌 BOTH HANDS";
+    } else {
+        if (handBadge) {
+            handBadge.textContent = "Standby";
+            handBadge.className = "hand-badge hand-none";
+        }
+        if (hudHandText) hudHandText.textContent = "STANDBY";
+    }
+}
+
 // ── Lightweight Landmark JSON Transmission ──────────────────────────────────
 async function sendLandmarksInference(results) {
     if (isPredicting) return;
-    isPredicting = true;
 
-    try {
-        const hasHands = results && results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
-        let payload = null;
+    const numHands = (results && results.multiHandLandmarks) ? results.multiHandLandmarks.length : 0;
 
-        if (hasHands) {
-            // Extract the 21 coordinate array [[x, y, z], ...] for the detected primary hand
+    // Case 0: 0 hands detected -> idle / standby
+    if (numHands === 0) {
+        updateHandStatusUI("none");
+        return;
+    }
+
+    // Case 1: 1 hand detected -> check physical handedness
+    if (numHands === 1) {
+        const rawH = results.multiHandedness && results.multiHandedness[0];
+        const physicalHand = getActualPhysicalHand(rawH);
+
+        // If user is showing only their Left Hand: DO NOT send prediction requests!
+        if (physicalHand === "Left") {
+            updateHandStatusUI("left_ignored");
+            const now = performance.now();
+            if (now - lastLeftHandToastTime > 3500) {
+                lastLeftHandToastTime = now;
+                showToast("Please use your Right Hand for single-hand signs", "warning", 3500);
+            }
+            return;
+        }
+
+        // Single physical Right hand: Proceed and send tagged with hand_type: "right"
+        updateHandStatusUI("right");
+        isPredicting = true;
+        try {
             const primaryHand = results.multiHandLandmarks[0];
             const landmarks = primaryHand.map(pt => [
                 Number(pt.x.toFixed(5)),
@@ -440,55 +518,98 @@ async function sendLandmarksInference(results) {
                 Number((pt.z || 0).toFixed(5))
             ]);
 
-            // Handedness: "Right" or "Left"
-            let handedness = "Right";
-            if (results.multiHandedness && results.multiHandedness.length > 0) {
-                handedness = results.multiHandedness[0].label || "Right";
+            const payload = {
+                hand_type: "right",
+                handedness: "Right",
+                landmarks: landmarks,
+                is_mirrored: isMirrored
+            };
+
+            await sendInferenceRequest(payload);
+        } catch (err) {
+            // Suppress transient drops
+        } finally {
+            isPredicting = false;
+        }
+        return;
+    }
+
+    // Case 2: 2 hands detected -> verify one is Left and one is Right (or both present), send tagged with hand_type: "both"
+    if (numHands >= 2) {
+        updateHandStatusUI("both");
+        isPredicting = true;
+        try {
+            const hand0 = results.multiHandLandmarks[0];
+            const hand1 = results.multiHandLandmarks[1];
+            let h0Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[0]);
+            let h1Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[1]);
+
+            const h0Pts = hand0.map(pt => [Number(pt.x.toFixed(5)), Number(pt.y.toFixed(5)), Number((pt.z || 0).toFixed(5))]);
+            const h1Pts = hand1.map(pt => [Number(pt.x.toFixed(5)), Number(pt.y.toFixed(5)), Number((pt.z || 0).toFixed(5))]);
+
+            // Ensure one is Right and one is Left
+            if (h0Hand === h1Hand) {
+                const avgX0 = h0Pts.reduce((acc, p) => acc + p[0], 0) / h0Pts.length;
+                const avgX1 = h1Pts.reduce((acc, p) => acc + p[0], 0) / h1Pts.length;
+                if (avgX0 <= avgX1) {
+                    h0Hand = "Right";
+                    h1Hand = "Left";
+                } else {
+                    h0Hand = "Left";
+                    h1Hand = "Right";
+                }
             }
 
-            // Also send all detected hands if multi-hand is present (for two-handed signs)
-            const allHands = results.multiHandLandmarks.map((hand, idx) => {
-                const label = (results.multiHandedness && results.multiHandedness[idx])
-                    ? results.multiHandedness[idx].label
-                    : (idx === 0 ? handedness : (handedness === "Right" ? "Left" : "Right"));
-                return {
-                    label: label,
-                    points: hand.map(pt => [
-                        Number(pt.x.toFixed(5)),
-                        Number(pt.y.toFixed(5)),
-                        Number((pt.z || 0).toFixed(5))
-                    ])
-                };
-            });
+            const handsList = [
+                { label: h0Hand, points: h0Pts },
+                { label: h1Hand, points: h1Pts }
+            ];
 
-            payload = {
-                landmarks: landmarks,
-                handedness: handedness,
-                all_hands: allHands,
+            const payload = {
+                hand_type: "both",
+                handedness: "Both",
+                landmarks: (h0Hand === "Right" ? h0Pts : h1Pts),
+                hands: handsList,
+                all_hands: handsList,
                 is_mirrored: isMirrored
             };
-        } else {
-            payload = {
-                landmarks: [],
-                all_hands: [],
-                is_mirrored: isMirrored
-            };
+
+            await sendInferenceRequest(payload);
+        } catch (err) {
+            // Suppress transient drops
+        } finally {
+            isPredicting = false;
         }
+        return;
+    }
+}
 
-        const response = await fetch("/predict_landmarks", {
+async function sendInferenceRequest(payload) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2500);
+
+    let response = null;
+    try {
+        response = await fetch("/predict_landmarks", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: controller.signal
         });
-
-        if (response.ok) {
-            const data = await response.json();
-            applyTelemetry(data);
+        if (!response.ok && response.status === 404) {
+            response = await fetch("/predict", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
         }
-    } catch (err) {
-        // Suppress transient network frame drops
     } finally {
-        isPredicting = false;
+        clearTimeout(timeoutId);
+    }
+
+    if (response && response.ok) {
+        const data = await response.json();
+        applyTelemetry(data);
     }
 }
 
@@ -1443,10 +1564,11 @@ function applyTelemetry(data) {
     // Hand detection separation indicators
     const detectedHand = data.detected_hand || "none";
     const handMap = {
-        right: { label: "✋ Right Hand", cls: "hand-right", hud: "✋ RIGHT HAND" },
-        left:  { label: "🤚 Left Hand",  cls: "hand-left",  hud: "🤚 LEFT HAND" },
-        both:  { label: "🙌 Both Hands", cls: "hand-both",  hud: "🙌 BOTH HANDS" },
-        none:  { label: "Standby",       cls: "hand-none",  hud: "STANDBY" }
+        right: { label: "✋ Hand: RIGHT", cls: "hand-right", hud: "✋ RIGHT HAND" },
+        left:  { label: "🤚 Hand: LEFT (IGNORED)", cls: "hand-warning", hud: "🤚 LEFT HAND (UNSUPPORTED)" },
+        left_ignored: { label: "🤚 Hand: LEFT (IGNORED)", cls: "hand-warning", hud: "🤚 LEFT HAND (UNSUPPORTED)" },
+        both:  { label: "🙌 Hand: BOTH", cls: "hand-both", hud: "🙌 BOTH HANDS" },
+        none:  { label: "Standby", cls: "hand-none", hud: "STANDBY" }
     };
     const hCfg = handMap[detectedHand] || handMap.none;
     const handBadge = document.getElementById("hand-badge");
@@ -1460,14 +1582,23 @@ function applyTelemetry(data) {
     const lSign = stripInternalSuffix(data.left_gesture || "—");
     const lConf = Math.round((data.left_conf || 0) * 100);
 
+    // Toast feedback if server rejected an unsupported left-hand sign
+    if (data.prediction === null && data.message && (detectedHand === "left" || detectedHand === "left_ignored")) {
+        const now = performance.now();
+        if (now - lastLeftHandToastTime > 3500) {
+            lastLeftHandToastTime = now;
+            showToast(data.message, "warning", 3500);
+        }
+    }
+
     const hudHandText = document.getElementById("hud-hand-text");
     if (hudHandText) {
         if (detectedHand === "both") {
             hudHandText.textContent = `🙌 BOTH: ${gesture}`;
         } else if (detectedHand === "right") {
             hudHandText.textContent = `✋ RIGHT: ${rSign} (${rConf}%)`;
-        } else if (detectedHand === "left") {
-            hudHandText.textContent = `🤚 LEFT: ${lSign} (${lConf}%)`;
+        } else if (detectedHand === "left" || detectedHand === "left_ignored") {
+            hudHandText.textContent = "🤚 LEFT HAND (UNSUPPORTED)";
         } else {
             hudHandText.textContent = "STANDBY";
         }
@@ -1512,6 +1643,10 @@ function applyTelemetry(data) {
     // Live gesture label
     if (dom.gestureLabel) {
         dom.gestureLabel.textContent = gesture;
+    }
+    const currentSignEl = document.getElementById("current-sign");
+    if (currentSignEl && currentSignEl !== dom.gestureLabel) {
+        currentSignEl.textContent = gesture;
     }
 
     // Live confidence
