@@ -15,7 +15,7 @@
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700;800;900&display=swap" rel="stylesheet">
 
     <!-- Mobile Stylesheet -->
-    <link rel="stylesheet" href="/mobile.css?v=mobile_v2">
+    <link rel="stylesheet" href="mobile.css">
 </head>
 
 <body>
@@ -112,7 +112,8 @@
             </div>
 
             <!-- Video Stream -->
-            <img class="mobile-cam-img" id="mobile-cam-img" src="/video_feed" alt="Live Camera Stream">
+            <video class="mobile-cam-img" id="mobile-webcam" autoplay playsinline muted></video>
+            <canvas id="mobile-landmark-canvas"></canvas>
 
             <!-- Video Drop Fallback Placeholder -->
             <div class="m-cam-fallback" id="m-cam-fallback" style="display:none;">
@@ -358,7 +359,7 @@
     </div>
 
     <!-- Mobile Controller Script -->
-    <script src="/mobile.js?v=mobile_v2"></script>
+    <script src="mobile.js"></script>
 </body>
 
 </html>

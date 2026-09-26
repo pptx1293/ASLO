@@ -3,7 +3,9 @@
 const dom = {
     // Viewfinder
     camBox: document.getElementById("mobile-cam-box"),
-    camImg: document.getElementById("mobile-cam-img"),
+    webcam: document.getElementById("mobile-webcam"),
+    landmarkCanvas: document.getElementById("mobile-landmark-canvas"),
+    camImg: document.getElementById("mobile-webcam") || document.getElementById("mobile-cam-img"),
     camFallback: document.getElementById("m-cam-fallback"),
     recTag: document.getElementById("m-hud-rec-tag"),
     recTagText: document.getElementById("m-rec-status"),
@@ -50,10 +52,16 @@ const dom = {
 let pollTimer = null;
 let lastSentenceText = "";
 let lastActiveState = false;
-let camAutoRetryTimer = null;
 let isSoundMuted = localStorage.getItem("aslo_mobile_sound_muted") === "true";
-let isMirrored = false;
+let isMirrored = true;
 let stabilitySegmentsCount = 8;
+let webcamStream = null;
+let captureCanvas = null;
+let captureCtx = null;
+let isPredicting = false;
+let isWebcamActive = false;
+let lastFrameTime = 0;
+let currentFacingMode = "user";
 
 // Initialize Stability Dots
 function initStabilityDots() {
@@ -158,15 +166,204 @@ function speakCompletedSentence(sentenceText) {
     }, 55);
 }
 
-// ── Real-Time Telemetry Polling ─────────────────────────────────────────────
-function poll() {
-    fetch("/gesture")
-        .then(res => res.json())
-        .then(data => {
-            const active = !!data.active;
-            const liveSign = stripInternalSuffix(data.live_gesture || "—");
-            const confVal = data.live_conf || 0;
-            const confPct = Math.round(confVal * 100);
+// ── MediaPipe Hand Landmark Connections & Drawing ───────────────────────────
+const HAND_CONNECTIONS = [
+    [0, 1], [1, 2], [2, 3], [3, 4],
+    [0, 5], [5, 6], [6, 7], [7, 8],
+    [5, 9], [9, 10], [10, 11], [11, 12],
+    [9, 13], [13, 14], [14, 15], [15, 16],
+    [13, 17], [17, 18], [18, 19], [19, 20],
+    [0, 17]
+];
+
+// Temporal smoothing cache for mobile
+let mobileSmoothedHands = {};
+
+function drawMobileHandLandmarks(landmarksList) {
+    if (!dom.landmarkCanvas) return;
+    const canvas = dom.landmarkCanvas;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    if (canvas.width !== rect.width || canvas.height !== rect.height) {
+        canvas.width = rect.width;
+        canvas.height = rect.height;
+    }
+
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!landmarksList || landmarksList.length === 0) {
+        mobileSmoothedHands = {};
+        return;
+    }
+
+    const currentKeys = new Set();
+
+    landmarksList.forEach((hand, idx) => {
+        const handKey = hand.label || `hand_${idx}`;
+        currentKeys.add(handKey);
+        const rawPts = hand.points;
+        if (!rawPts || rawPts.length < 21) return;
+
+        // Exponential smoothing
+        if (!mobileSmoothedHands[handKey]) {
+            mobileSmoothedHands[handKey] = rawPts.map(p => ({ x: p.x, y: p.y }));
+        } else {
+            const prev = mobileSmoothedHands[handKey];
+            mobileSmoothedHands[handKey] = rawPts.map((p, i) => {
+                const prevP = prev[i] || p;
+                const dx = p.x - prevP.x;
+                const dy = p.y - prevP.y;
+                const distSq = dx * dx + dy * dy;
+                const alpha = distSq > 0.002 ? 0.92 : 0.65;
+                return { x: prevP.x + dx * alpha, y: prevP.y + dy * alpha };
+            });
+        }
+
+        const pts = mobileSmoothedHands[handKey];
+
+        // 1. Classic White Skeleton Connection Lines
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+        ctx.lineWidth = 2.4;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
+        ctx.shadowBlur = 3;
+
+        for (const [i, j] of HAND_CONNECTIONS) {
+            const p1 = pts[i];
+            const p2 = pts[j];
+            if (!p1 || !p2) continue;
+            ctx.beginPath();
+            ctx.moveTo(p1.x * canvas.width, p1.y * canvas.height);
+            ctx.lineTo(p2.x * canvas.width, p2.y * canvas.height);
+            ctx.stroke();
+        }
+
+        // 2. Classic Red Landmark Points
+        ctx.shadowBlur = 0;
+        for (let i = 0; i < pts.length; i++) {
+            const p = pts[i];
+            const px = p.x * canvas.width;
+            const py = p.y * canvas.height;
+            const isFingertip = (i === 4 || i === 8 || i === 12 || i === 16 || i === 20);
+            const radius = isFingertip ? 4.0 : 3.0;
+
+            ctx.beginPath();
+            ctx.arc(px, py, radius, 0, Math.PI * 2);
+            ctx.fillStyle = "#FF0000";
+            ctx.fill();
+
+            ctx.strokeStyle = "#FFFFFF";
+            ctx.lineWidth = 0.9;
+            ctx.stroke();
+        }
+    });
+
+    for (const k in mobileSmoothedHands) {
+        if (!currentKeys.has(k)) {
+            delete mobileSmoothedHands[k];
+        }
+    }
+}
+
+// ── Mobile Client Webcam Lifecycle ──────────────────────────────────────────
+async function startMobileWebcam() {
+    try {
+        if (webcamStream) {
+            webcamStream.getTracks().forEach(t => t.stop());
+            webcamStream = null;
+        }
+
+        const constraints = {
+            video: {
+                facingMode: currentFacingMode,
+                width: { ideal: 480 },
+                height: { ideal: 360 }
+            },
+            audio: false
+        };
+
+        webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+        if (dom.webcam) {
+            dom.webcam.srcObject = webcamStream;
+            dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "none";
+            await dom.webcam.play();
+            dom.webcam.style.display = "block";
+        }
+        if (dom.camFallback) dom.camFallback.style.display = "none";
+
+        isWebcamActive = true;
+        showToast("Mobile camera active");
+        requestAnimationFrame(mobileCaptureLoop);
+    } catch (err) {
+        console.error("[Mobile] Camera error:", err);
+        isWebcamActive = false;
+        if (dom.webcam) dom.webcam.style.display = "none";
+        if (dom.camFallback) {
+            dom.camFallback.style.display = "flex";
+            const t = dom.camFallback.querySelector(".m-fallback-text");
+            if (t) t.textContent = "Camera access denied or busy";
+        }
+        showToast("Camera error: " + (err.message || err.name));
+    }
+}
+
+// ── Mobile Frame Capture & Inference Loop ──────────────────────────────────
+const MOBILE_FRAME_INTERVAL = 30; // High responsiveness
+
+async function mobileCaptureLoop(timestamp) {
+    if (!isWebcamActive) return;
+
+    if (timestamp - lastFrameTime >= MOBILE_FRAME_INTERVAL && !isPredicting) {
+        if (dom.webcam && dom.webcam.readyState >= 2 && dom.webcam.videoWidth > 0) {
+            lastFrameTime = timestamp;
+            isPredicting = true;
+            try {
+                if (!captureCanvas) {
+                    captureCanvas = document.createElement("canvas");
+                    captureCanvas.width = 400;
+                    captureCanvas.height = 300;
+                    captureCtx = captureCanvas.getContext("2d", { willReadFrequently: true });
+                }
+                captureCtx.drawImage(dom.webcam, 0, 0, captureCanvas.width, captureCanvas.height);
+                const base64Data = captureCanvas.toDataURL("image/jpeg", 0.60);
+
+                const response = await fetch("/predict", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        image: base64Data,
+                        is_flipped: !isMirrored
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    applyMobileTelemetry(data);
+                    drawMobileHandLandmarks(data.landmarks);
+                }
+            } catch (err) {
+                // Silently tolerate single network frame drops
+            } finally {
+                isPredicting = false;
+            }
+        }
+    }
+
+    if (isWebcamActive) {
+        requestAnimationFrame(mobileCaptureLoop);
+    }
+}
+
+// ── Real-Time Telemetry State Processor ────────────────────────────────────
+function applyMobileTelemetry(data) {
+    if (!data) return;
+    const active = !!data.active;
+    const liveSign = stripInternalSuffix(data.live_gesture || "—");
+    const confVal = data.live_conf || 0;
+    const confPct = Math.round(confVal * 100);
 
             // 1. Camera Box & Recording HUD Status
             if (dom.camBox) {
@@ -311,10 +508,17 @@ function poll() {
             }
 
             lastActiveState = active;
+}
+
+// ── Fallback Polling (When webcam stream is idle) ───────────────────────────
+function poll() {
+    if (isWebcamActive) return;
+    fetch("/gesture")
+        .then(res => res.json())
+        .then(data => {
+            applyMobileTelemetry(data);
         })
-        .catch(err => {
-            console.warn("[Mobile] Telemetry poll failed, retrying...", err);
-        });
+        .catch(() => {});
 }
 
 // ── Control Actions ─────────────────────────────────────────────────────────
@@ -410,33 +614,21 @@ function copyTranscript() {
         .catch(() => showToast("Failed to copy"));
 }
 
-// Switch Camera Hardware
-function switchCamera() {
+// Switch Front / Back Camera
+async function switchCamera() {
     triggerHaptic(35);
-    showToast("Switching camera…");
-    fetch("/api/camera/switch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({})
-    })
-        .then(r => r.json())
-        .then(data => {
-            if (data.ok) {
-                showToast(`Switched to Camera #${data.camera_index}`);
-                reconnectCam();
-            } else {
-                showToast("Switch camera failed");
-            }
-        })
-        .catch(() => showToast("Camera switch error"));
+    currentFacingMode = (currentFacingMode === "user") ? "environment" : "user";
+    isMirrored = (currentFacingMode === "user");
+    showToast(`Switched to ${currentFacingMode === "user" ? "Front" : "Rear"} camera`);
+    await startMobileWebcam();
 }
 
 // Toggle Camera Mirror
 function toggleCameraMirror() {
     triggerHaptic(20);
     isMirrored = !isMirrored;
-    if (dom.camImg) {
-        dom.camImg.style.transform = isMirrored ? "scaleX(-1)" : "none";
+    if (dom.webcam) {
+        dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "none";
     }
     showToast(isMirrored ? "Feed mirrored" : "Feed normal");
 }
@@ -468,23 +660,7 @@ function updateDominantHandUI(hand) {
 
 // Stream Reconnect & Recovery
 function reconnectCam() {
-    if (!dom.camImg) return;
-    if (dom.camFallback) dom.camFallback.style.display = "none";
-    dom.camImg.style.display = "block";
-    dom.camImg.src = "/video_feed?t=" + Date.now();
-}
-
-if (dom.camImg) {
-    dom.camImg.onerror = () => {
-        console.warn("[Mobile Cam] Stream error, presenting fallback & retrying...");
-        if (dom.camFallback) dom.camFallback.style.display = "flex";
-        if (camAutoRetryTimer) clearTimeout(camAutoRetryTimer);
-        camAutoRetryTimer = setTimeout(reconnectCam, 2000);
-    };
-    dom.camImg.onload = () => {
-        if (dom.camFallback) dom.camFallback.style.display = "none";
-        dom.camImg.style.display = "block";
-    };
+    startMobileWebcam();
 }
 
 // ── Dictionary Bottom Sheet & Filter ────────────────────────────────────────
@@ -533,6 +709,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 });
 
-// Initialize Polling
-pollTimer = setInterval(poll, 120);
-poll();
+// Initialize Client Webcam & Fallback Polling
+startMobileWebcam();
+pollTimer = setInterval(poll, 2000);

@@ -303,40 +303,90 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
     d_thb_mid_pip = float(np.linalg.norm(pts_norm[4][:2] - pts_norm[10][:2]))
     dy_thb_idx_pip = float(pts_norm[4][1] - pts_norm[6][1])  # y is positive downward
 
-    # ── 1. STATIC RESOLUTION FOR DYNAMIC KEYFRAMES (Z_START / Z_END / J_START) ──
-    # If the user is stationary (route_mode == "STATIC"), dynamic gesture Z or J cannot occur.
-    # Disambiguate to the actual static sign being held: X, P, Q, D
+    # ── 1. X HOOK DETECTION vs P, Q, Z ─────────────────────────────────────────
+    # In 'X', the hand is UPRIGHT (knuckle is above wrist).
+    # Index finger is BENT into a crook/hook (PIP-to-tip folded).
+    # Middle, ring, and pinky are curled tightly in a fist.
+    is_upright = (pts[5][1] < pts[0][1] - 0.02)
+    is_fist_others = (mid_ext < 1.28 and ring_ext < 1.28 and pky_ext < 1.28)
     idx_tip_pip = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[6][:2]))
     idx_dy = float(pts_norm[8][1] - pts_norm[5][1])
+    is_hooked_idx = (idx_tip_pip <= 0.33 and idx_ext < 1.45)
+
+    if is_upright and is_fist_others and is_hooked_idx:
+        # Hand is upright with hooked index and other fingers in fist: DEFINITIVELY 'X'
+        return "X"
 
     if route_mode == "STATIC" and label in ["z_start", "z_end", "z"]:
-        if idx_tip_pip <= 0.30 and idx_ext < 1.65 and idx_dy < 0.05:
+        if is_upright and is_fist_others and is_hooked_idx:
             return "X"
-        elif idx_dy > 0.65:
-            return "Q"
-        elif 0.05 <= idx_dy <= 0.65:
-            return "P"
-        elif idx_dy < -0.30:
+        elif is_upright and idx_ext >= 1.30:
             return "D"
+        elif not is_upright and idx_dy > 0.30:
+            return "Q" if mid_ext < 1.20 else "P"
         return "X"
 
-    # ── 2. X HOOK DETECTION (Index bent hook, remaining fingers in fist) ────────
-    # In 'X', index PIP-to-tip is folded into a small hook while other fingers are in fist.
-    is_hooked_idx = (idx_tip_pip <= 0.28 and mid_ext < 1.25 and ring_ext < 1.25 and pky_ext < 1.25 and idx_dy < 0.10)
-    if is_hooked_idx and label in ["x", "d", "l", "z_start", "z_end", "z"]:
-        return "X"
+    if label in ["x", "d", "z"]:
+        if is_upright and is_fist_others:
+            if is_hooked_idx:
+                return "X"
+            elif idx_ext >= 1.30 and idx_tip_pip > 0.32:
+                return "D" if route_mode == "STATIC" else "Z"
 
-    # ── 3. P vs Q DISAMBIGUATION (Index & thumb pointing downward) ─────────────
+    # ── 2. P vs Q vs X (P and Q strictly point DOWNWARD) ────────────────────────
+    is_downward = (pts[8][1] > pts[0][1] - 0.02 or pts[5][1] > pts[0][1] - 0.04)
+
     if label in ["p", "q"]:
-        if idx_dy > 0.35:
-            return "Q"
+        if is_upright and is_fist_others and is_hooked_idx:
+            return "X"
+        if is_downward:
+            if mid_ext >= 1.20:
+                return "P"
+            elif idx_dy > 0.30 or mid_ext < 1.15:
+                return "Q"
+            else:
+                return "P"
+
+    # ── 3. U vs R vs V vs W DISAMBIGUATION ─────────────────────────────────────
+    # ASL anatomy:
+    # W: Exactly 3 fingers extended: Index + Middle + Ring straight up. Pinky curled.
+    # U: Index + Middle straight up, held together. Ring and Pinky curled.
+    # V: Index + Middle straight up, spread apart in 'V'. Ring and Pinky curled.
+    # R: Index + Middle straight up, crossed over each other. Ring and Pinky curled.
+    if label in ["u", "v", "r", "w"]:
+        is_ring_up = (ring_ext >= 1.25 and pts[16][1] < pts[14][1])
+        is_idx_mid_up = (idx_ext >= 1.20 and mid_ext >= 1.20)
+
+        # 3.1: W Detection (Ring finger is extended alongside index and middle)
+        if is_ring_up and is_idx_mid_up and pky_ext < 1.25:
+            return "W"
+
+        # Ring finger is curled into palm: CANNOT be W, must be U, V, or R
+        # Horizontal direction vector along knuckle line
+        x_dir = pts_norm[9][:2] - pts_norm[5][:2]
+        n_dir = np.linalg.norm(x_dir)
+        if n_dir > 1e-6:
+            x_dir = x_dir / n_dir
         else:
-            return "P"
+            x_dir = np.array([1.0, 0.0], dtype=np.float32)
+
+        proj_idx = float(np.dot(pts_norm[8][:2], x_dir))
+        proj_mid = float(np.dot(pts_norm[12][:2], x_dir))
+        # In uncrossed right hand: proj_mid > proj_idx. In crossed hand (R): index crosses over
+        cross_diff = proj_idx - proj_mid
+
+        # 3.2: Crossed fingers (R)
+        if cross_diff > 0.045:
+            return "R"
+
+        # 3.3: Spread apart (V) vs Together (U)
+        d_idx_mid = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[12][:2]))
+        if d_idx_mid >= 0.17:
+            return "V"
+        else:
+            return "U"
 
     # ── 4. E vs O DISAMBIGUATION ───────────────────────────────────────────────
-    # In 'O', all 4 fingers curve OUTWARD in a loop touching the thumb (idx_ext >= 1.05, mid_ext >= 1.05).
-    # In 'E', all 4 fingers are tightly folded flat against the palm (idx_ext < 1.05, mid_ext < 1.05),
-    # with fingertips resting on top of the thumb.
     if label in ["e", "o"]:
         if idx_ext < 1.05 and mid_ext < 1.05 and ring_ext < 1.05:
             return "E"
@@ -344,10 +394,7 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
             return "O"
 
     # ── 5. HARD ANATOMICAL CHECK: 'A' vs 'Y' ──────────────────────────────────
-    # In 'A', all 4 fingers (including pinky) are folded into a fist (pky_ext < 1.15).
-    # In 'Y', the pinky MUST be extended upward (pky_ext > 1.35).
     if label == "y" and pky_ext < 1.15:
-        # Check if it's S or T or A
         if dy_thb_idx_pip >= 0.10:
             return "S"
         elif d_thb_idx_pip < 0.15:
@@ -367,7 +414,6 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
             else:
                 return "J_START"
         if idx_ext < 1.05 and mid_ext < 1.05 and ring_ext < 1.05 and pky_ext < 1.05:
-            # All 4 fingers folded flat against palm
             if dy_thb_idx_pip >= 0.0 and d_thb_idx_pip < 0.18:
                 return "E"
             elif dy_thb_idx_pip < 0.02 and d_thb_mid_pip > 0.18:
@@ -392,29 +438,19 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
     # ── 8. ANATOMICAL FIST DISAMBIGUATION (A vs S vs T vs N vs E) ─────────────
     all_fist_fingers = (idx_ext < 1.25 and mid_ext < 1.25 and ring_ext < 1.25 and pky_ext < 1.25)
     if all_fist_fingers and label in ["a", "s", "t", "n", "m", "e"]:
-        # E: All fingers folded flat against palm, fingertips resting on thumb
         if label == "e":
             return "E"
-
-        # Check A vs S vs T vs N:
-        # A: Thumb tip is strictly upright along the radial side of the fist
         if dy_thb_idx_pip < 0.02 and d_thb_mid_pip > 0.18:
             return "A"
-
-        # S: Thumb is folded across the front of fingers (lower down across middle)
         if label in ["a", "s"] and dy_thb_idx_pip >= 0.10:
             return "S"
-
-        # Check N vs T:
-        # T: Thumb tip is tucked tightly between index and middle fingers (d_thb_idx_pip < 0.15)
-        # N: Thumb tip is tucked under index & middle (d_thb_idx_pip >= 0.15)
         if label in ["n", "t"]:
             if d_thb_idx_pip < 0.15:
                 return "T"
             else:
                 return "N"
 
-    # ── 9. SOFT HEURISTICS (Protected by model confidence >= 0.85) ────────────
+    # ── 9. CONFIDENCE CUTOFF FOR OTHER SIGNS ────────────────────────────────────
     if confidence is not None and confidence >= 0.85:
         return label.upper()
 
@@ -423,26 +459,5 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
             return "T"
         else:
             return "N"
-
-    elif label in ["u", "v", "r"]:
-        x_dir = pts_norm[5][:2] - pts_norm[17][:2]
-        n_dir = np.linalg.norm(x_dir)
-        if n_dir > 1e-6:
-            x_dir = x_dir / n_dir
-        else:
-            x_dir = np.array([1.0, 0.0], dtype=np.float32)
-
-        x_idx = float(np.dot(pts_norm[8][:2], x_dir))
-        x_mid = float(np.dot(pts_norm[12][:2], x_dir))
-        proj_diff = x_idx - x_mid
-
-        if proj_diff < -0.01:
-            label = "r"
-        else:
-            d_idx_mid = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[12][:2]))
-            if d_idx_mid > 0.12:
-                label = "v"
-            else:
-                label = "u"
 
     return label.upper()

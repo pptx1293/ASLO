@@ -7,7 +7,9 @@
 // ── DOM References ──────────────────────────────────────────────────────────
 const dom = {
     // Camera & HUD
-    cameraFeed: document.getElementById("camera-feed"),
+    webcam: document.getElementById("webcam"),
+    landmarkCanvas: document.getElementById("landmark-canvas"),
+    cameraFeed: document.getElementById("webcam") || document.getElementById("camera-feed"),
     camFallback: document.getElementById("cam-fallback"),
     hudConfidence: document.getElementById("hud-confidence"),
     hudTrackingPill: document.getElementById("hud-tracking-pill"),
@@ -93,10 +95,18 @@ let pollTimer = null;
 let lastBufMax = -1;
 let recognition = null;
 let speakTimeout = null;
-let isMirrored = false;
+let isMirrored = true;
 let recentSigns = [];
 let currentCameraIndex = 0;
 let isSwitchingCamera = false;
+let webcamStream = null;
+let captureCanvas = null;
+let captureCtx = null;
+let isPredicting = false;
+let isWebcamActive = false;
+let lastFrameTime = 0;
+let videoDeviceIds = [];
+let currentDeviceIndex = 0;
 
 // ── Camera Telemetry HUD & Recent Signs Trail ───────────────────────────────
 function toggleCamTelemetryHud() {
@@ -194,31 +204,187 @@ window.addEventListener("keydown", () => {
     unlockAudio();
 }, { once: true });
 
-let camRetryCount = 0;
-let camAutoRetryTimer = null;
+// ── MediaPipe Hand Landmark Connections & Temporal Stabilizer ───────────────
+const HAND_CONNECTIONS = [
+    [0, 1], [1, 2], [2, 3], [3, 4],          // Thumb
+    [0, 5], [5, 6], [6, 7], [7, 8],          // Index
+    [5, 9], [9, 10], [10, 11], [11, 12],     // Middle
+    [9, 13], [13, 14], [14, 15], [15, 16],   // Ring
+    [13, 17], [17, 18], [18, 19], [19, 20],  // Pinky
+    [0, 17]                                  // Palm base
+];
 
-if (dom.cameraFeed) {
-    dom.cameraFeed.onerror = () => {
-        console.warn("[Camera] Video stream dropped or hiccup, auto-reconnecting...");
-        if (camAutoRetryTimer) clearTimeout(camAutoRetryTimer);
-        camAutoRetryTimer = setTimeout(() => {
-            reconnectCamera(true);
-        }, 1000);
-    };
+// Temporal smoothing cache for jitter-free tracking
+let smoothedHands = {};
 
-    dom.cameraFeed.onload = () => {
-        camRetryCount = 0;
-        dom.cameraFeed.style.display = "block";
+function drawHandLandmarks(landmarksList) {
+    if (!dom.landmarkCanvas) return;
+    const canvas = dom.landmarkCanvas;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    if (canvas.width !== rect.width || canvas.height !== rect.height) {
+        canvas.width = rect.width;
+        canvas.height = rect.height;
+    }
+
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!landmarksList || landmarksList.length === 0) {
+        smoothedHands = {};
+        return;
+    }
+
+    const currentHandKeys = new Set();
+
+    landmarksList.forEach((hand, handIdx) => {
+        const handKey = hand.label || `hand_${handIdx}`;
+        currentHandKeys.add(handKey);
+        const rawPts = hand.points;
+        if (!rawPts || rawPts.length < 21) return;
+
+        // Exponential moving average (EMA) smoothing for rock-solid stability
+        if (!smoothedHands[handKey]) {
+            smoothedHands[handKey] = rawPts.map(p => ({ x: p.x, y: p.y }));
+        } else {
+            const prev = smoothedHands[handKey];
+            smoothedHands[handKey] = rawPts.map((p, i) => {
+                const prevP = prev[i] || p;
+                const dx = p.x - prevP.x;
+                const dy = p.y - prevP.y;
+                const distSq = dx * dx + dy * dy;
+                // Ultra-responsive: follows hand movement instantly (0.92), smooths micro-tremors when resting (0.65)
+                const alpha = distSq > 0.002 ? 0.92 : 0.65;
+                return {
+                    x: prevP.x + dx * alpha,
+                    y: prevP.y + dy * alpha
+                };
+            });
+        }
+
+        const pts = smoothedHands[handKey];
+
+        // 1. Draw Classic White Skeleton Connection Lines
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+        ctx.lineWidth = 2.8;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
+        ctx.shadowBlur = 4;
+
+        for (const [i, j] of HAND_CONNECTIONS) {
+            const p1 = pts[i];
+            const p2 = pts[j];
+            if (!p1 || !p2) continue;
+            ctx.beginPath();
+            ctx.moveTo(p1.x * canvas.width, p1.y * canvas.height);
+            ctx.lineTo(p2.x * canvas.width, p2.y * canvas.height);
+            ctx.stroke();
+        }
+
+        // 2. Draw Classic Red Landmark Points
+        ctx.shadowBlur = 0;
+        for (let i = 0; i < pts.length; i++) {
+            const p = pts[i];
+            const px = p.x * canvas.width;
+            const py = p.y * canvas.height;
+            const isFingertip = (i === 4 || i === 8 || i === 12 || i === 16 || i === 20);
+            const radius = isFingertip ? 4.5 : 3.5;
+
+            // Red circle fill
+            ctx.beginPath();
+            ctx.arc(px, py, radius, 0, Math.PI * 2);
+            ctx.fillStyle = "#FF0000";
+            ctx.fill();
+
+            // Crisp white outer ring border
+            ctx.strokeStyle = "#FFFFFF";
+            ctx.lineWidth = 1.0;
+            ctx.stroke();
+        }
+
+        // 3. Wrist Hand Label Tag
+        const wrist = pts[0];
+        if (wrist) {
+            const isRight = (hand.label === "Right");
+            const wx = Math.min(Math.max(wrist.x * canvas.width, 30), canvas.width - 30);
+            const wy = Math.min(Math.max(wrist.y * canvas.height + 22, 20), canvas.height - 10);
+            ctx.font = "700 11px 'JetBrains Mono', monospace";
+            ctx.fillStyle = "#FFFFFF";
+            ctx.textAlign = "center";
+            ctx.fillText(isRight ? "RIGHT" : "LEFT", wx, wy);
+        }
+    });
+
+    // Cleanup stale hands
+    for (const k in smoothedHands) {
+        if (!currentHandKeys.has(k)) {
+            delete smoothedHands[k];
+        }
+    }
+}
+
+// ── Client-Side Webcam Lifecycle & Enumerate Devices ──────────────────────
+async function enumerateCameras() {
+    try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        videoDeviceIds = devices.filter(d => d.kind === "videoinput").map(d => d.deviceId);
+    } catch (e) {
+        console.warn("Could not enumerate camera devices:", e);
+    }
+}
+
+async function startClientWebcam(deviceId = null) {
+    try {
+        if (webcamStream) {
+            webcamStream.getTracks().forEach(t => t.stop());
+            webcamStream = null;
+        }
+
+        const constraints = {
+            video: deviceId ? { deviceId: { exact: deviceId } } : {
+                width: { ideal: 640 },
+                height: { ideal: 480 },
+                facingMode: "user"
+            },
+            audio: false
+        };
+
+        webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+        if (dom.webcam) {
+            dom.webcam.srcObject = webcamStream;
+            dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "scaleX(1)";
+            await dom.webcam.play();
+            dom.webcam.style.display = "block";
+        }
         if (dom.camFallback) dom.camFallback.style.display = "none";
-    };
+
+        isWebcamActive = true;
+        setStatusBadge("running", isGestureRecordingActive ? "Recording" : "Standby");
+        if (dom.hudCamName) dom.hudCamName.textContent = "CLIENT WEBCAM · LIVE";
+        showToast("Webcam connected — Ready to sign", "success", 2500);
+
+        await enumerateCameras();
+        requestAnimationFrame(captureAndPredictLoop);
+    } catch (err) {
+        console.error("Camera access failed:", err);
+        isWebcamActive = false;
+        setStatusBadge("error");
+        if (dom.webcam) dom.webcam.style.display = "none";
+        if (dom.camFallback) {
+            dom.camFallback.style.display = "flex";
+            const p = dom.camFallback.querySelector("p");
+            if (p) p.textContent = "Camera access denied or busy: " + (err.message || err.name);
+        }
+        showToast("Camera access failed: " + (err.message || err.name), "error", 5000);
+    }
 }
 
 function reconnectCamera(isSilent = false) {
-    if (!dom.cameraFeed) return;
-    dom.cameraFeed.src = "/video_feed?t=" + Date.now();
-    dom.cameraFeed.style.display = "block";
-    if (dom.camFallback) dom.camFallback.style.display = "none";
-    if (!isSilent) showToast("Reconnecting video feed...", "info");
+    if (!isSilent) showToast("Restarting camera stream...", "info", 1500);
+    startClientWebcam();
 }
 
 function toggleFullscreen() {
@@ -233,13 +399,13 @@ function toggleFullscreen() {
 
 function toggleCameraMirror() {
     isMirrored = !isMirrored;
-    if (dom.cameraFeed) {
-        dom.cameraFeed.style.transform = isMirrored ? "scaleX(-1)" : "scaleX(1)";
-        showToast(isMirrored ? "Camera feed mirrored" : "Camera feed normal", "info");
+    if (dom.webcam) {
+        dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "scaleX(1)";
     }
+    showToast(isMirrored ? "Camera feed mirrored" : "Camera feed normal", "info", 1500);
 }
 
-function switchCamera(targetIndex = null) {
+async function switchCamera() {
     if (isSwitchingCamera) return;
     isSwitchingCamera = true;
 
@@ -248,37 +414,20 @@ function switchCamera(targetIndex = null) {
         dom.btnSwitchCam.disabled = true;
     }
 
-    const payload = targetIndex !== null ? { index: targetIndex } : {};
-
-    fetch("/api/camera/switch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-    })
-    .then(res => res.json())
-    .then(data => {
-        if (data.ok) {
-            currentCameraIndex = data.camera_index;
-            if (dom.hudCamName) {
-                dom.hudCamName.textContent = `CAM ${data.camera_index} · LIVE FEED`;
-            }
-            if (dom.btnSwitchCam) {
-                dom.btnSwitchCam.title = `Switch Camera (Current: CAM ${data.camera_index}, Shortcut: X)`;
-            }
-            // Reconnect feed after hardware initializes
-            setTimeout(() => {
-                reconnectCamera(true);
-            }, 350);
-            showToast(`Switched to Camera ${data.camera_index}`, "success", 2500);
+    try {
+        await enumerateCameras();
+        if (videoDeviceIds.length > 1) {
+            currentDeviceIndex = (currentDeviceIndex + 1) % videoDeviceIds.length;
+            const nextId = videoDeviceIds[currentDeviceIndex];
+            await startClientWebcam(nextId);
+            showToast(`Switched to Camera ${currentDeviceIndex + 1}`, "info", 2000);
         } else {
-            showToast(data.error || "Failed to switch camera", "error");
+            showToast("Only 1 camera detected on this system", "info", 2000);
         }
-    })
-    .catch(err => {
+    } catch (err) {
         console.error("Camera switch error:", err);
-        showToast("Network error switching camera", "error");
-    })
-    .finally(() => {
+        showToast("Error switching camera", "error");
+    } finally {
         setTimeout(() => {
             isSwitchingCamera = false;
             if (dom.btnSwitchCam) {
@@ -286,7 +435,53 @@ function switchCamera(targetIndex = null) {
                 dom.btnSwitchCam.disabled = false;
             }
         }, 600);
-    });
+    }
+}
+
+// ── Client-Side Real-Time Frame Capture & Inference Loop ───────────────────
+const FRAME_INTERVAL_MS = 25; // Ultra-fast responsiveness (~30-40 FPS pipelined)
+
+async function captureAndPredictLoop(timestamp) {
+    if (!isWebcamActive) return;
+
+    if (timestamp - lastFrameTime >= FRAME_INTERVAL_MS && !isPredicting) {
+        if (dom.webcam && dom.webcam.readyState >= 2 && dom.webcam.videoWidth > 0) {
+            lastFrameTime = timestamp;
+            isPredicting = true;
+            try {
+                if (!captureCanvas) {
+                    captureCanvas = document.createElement("canvas");
+                    captureCanvas.width = 400;
+                    captureCanvas.height = 300;
+                    captureCtx = captureCanvas.getContext("2d", { willReadFrequently: true });
+                }
+                captureCtx.drawImage(dom.webcam, 0, 0, captureCanvas.width, captureCanvas.height);
+                const base64Data = captureCanvas.toDataURL("image/jpeg", 0.60);
+
+                const response = await fetch("/predict", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        image: base64Data,
+                        is_flipped: !isMirrored
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    applyTelemetry(data);
+                    drawHandLandmarks(data.landmarks);
+                }
+            } catch (err) {
+                // Ignore transient frame network drops
+            } finally {
+                isPredicting = false;
+            }
+        }
+    }
+    if (isWebcamActive) {
+        requestAnimationFrame(captureAndPredictLoop);
+    }
 }
 
 // ── Speech-To-Text (STT) Dual-Engine Integration ───────────────────────────
@@ -1089,255 +1284,243 @@ function updateDominantHandUI(hand) {
 
 let consecutivePollFailures = 0;
 
-// ── Main Telemetry Polling Loop ─────────────────────────────────────────────
+// ── Shared Telemetry & HUD State Processor ─────────────────────────────────
+function applyTelemetry(data) {
+    if (!data) return;
+    consecutivePollFailures = 0;
+    const active = !!data.active;
+
+    if (data.status === "error") {
+        setStatusBadge("error");
+    } else {
+        setStatusBadge(data.status || "running", active ? "Recording" : "Standby");
+    }
+
+    // Sync dominant hand UI
+    if (data.dominant_hand) {
+        updateDominantHandUI(data.dominant_hand);
+    }
+
+    // Hand detection separation indicators
+    const detectedHand = data.detected_hand || "none";
+    const handMap = {
+        right: { label: "✋ Right Hand", cls: "hand-right", hud: "✋ RIGHT HAND" },
+        left:  { label: "🤚 Left Hand",  cls: "hand-left",  hud: "🤚 LEFT HAND" },
+        both:  { label: "🙌 Both Hands", cls: "hand-both",  hud: "🙌 BOTH HANDS" },
+        none:  { label: "Standby",       cls: "hand-none",  hud: "STANDBY" }
+    };
+    const hCfg = handMap[detectedHand] || handMap.none;
+    const handBadge = document.getElementById("hand-badge");
+    if (handBadge) {
+        handBadge.textContent = hCfg.label;
+        handBadge.className = "hand-badge " + hCfg.cls;
+    }
+    const gesture = stripInternalSuffix(data.live_gesture || "—");
+    const rSign = stripInternalSuffix(data.right_gesture || "—");
+    const rConf = Math.round((data.right_conf || 0) * 100);
+    const lSign = stripInternalSuffix(data.left_gesture || "—");
+    const lConf = Math.round((data.left_conf || 0) * 100);
+
+    const hudHandText = document.getElementById("hud-hand-text");
+    if (hudHandText) {
+        if (detectedHand === "both") {
+            hudHandText.textContent = `🙌 BOTH: ${gesture}`;
+        } else if (detectedHand === "right") {
+            hudHandText.textContent = `✋ RIGHT: ${rSign} (${rConf}%)`;
+        } else if (detectedHand === "left") {
+            hudHandText.textContent = `🤚 LEFT: ${lSign} (${lConf}%)`;
+        } else {
+            hudHandText.textContent = "STANDBY";
+        }
+    }
+
+    // Dual-Hand Independent Monitor Update
+    const valR = document.getElementById("val-right");
+    const meterR = document.getElementById("meter-right");
+    const pctR = document.getElementById("pct-right");
+    const badgeR = document.getElementById("badge-right");
+    const cardR = document.getElementById("track-right");
+
+    const valL = document.getElementById("val-left");
+    const meterL = document.getElementById("meter-left");
+    const pctL = document.getElementById("pct-left");
+    const badgeL = document.getElementById("badge-left");
+    const cardL = document.getElementById("track-left");
+
+    if (valR) valR.textContent = rSign;
+    if (meterR) meterR.style.width = rConf + "%";
+    if (pctR) pctR.textContent = rConf + "%";
+
+    if (valL) valL.textContent = lSign;
+    if (meterL) meterL.style.width = lConf + "%";
+    if (pctL) pctL.textContent = lConf + "%";
+
+    const isRightActive = (detectedHand === "right" || detectedHand === "both");
+    const isLeftActive = (detectedHand === "left" || detectedHand === "both");
+
+    if (badgeR) {
+        badgeR.textContent = isRightActive ? (detectedHand === "both" ? "DUAL" : "ACTIVE") : (rSign !== "—" ? "READY" : "IDLE");
+        badgeR.className = "hand-track-badge " + (isRightActive ? "badge-active" : (rSign !== "—" ? "badge-ready" : "badge-idle"));
+    }
+    if (cardR) cardR.classList.toggle("active-driver", isRightActive);
+
+    if (badgeL) {
+        badgeL.textContent = isLeftActive ? (detectedHand === "both" ? "DUAL" : "ACTIVE") : (lSign !== "—" ? "READY" : "IDLE");
+        badgeL.className = "hand-track-badge " + (isLeftActive ? "badge-active" : (lSign !== "—" ? "badge-ready" : "badge-idle"));
+    }
+    if (cardL) cardL.classList.toggle("active-driver", isLeftActive);
+
+    // Live gesture label
+    if (dom.gestureLabel) {
+        dom.gestureLabel.textContent = gesture;
+    }
+
+    // Live confidence
+    const confVal = data.live_conf || 0;
+    const pct = Math.round(confVal * 100);
+    if (dom.confBar) {
+        dom.confBar.style.width = pct + "%";
+        if (pct >= 70) {
+            dom.confBar.style.background = "linear-gradient(90deg, var(--cyan), var(--emerald))";
+        } else if (pct >= 40) {
+            dom.confBar.style.background = "linear-gradient(90deg, var(--cyan), var(--amber))";
+        } else {
+            dom.confBar.style.background = "linear-gradient(90deg, var(--amber), var(--ruby))";
+        }
+    }
+    if (dom.confText) dom.confText.textContent = pct + "%";
+    if (dom.hudConfidence) dom.hudConfidence.textContent = `${pct}% CONF`;
+
+    // Segmented stability buffer
+    renderStability(data.buffer_fill || 0, data.buffer_max || 8, !!data.agreeing);
+
+    // Recording state
+    if (dom.recDot && dom.recLabel) {
+        if (active) {
+            dom.recDot.className = "rec-dot on";
+            dom.recLabel.textContent = "Recording — sign STOP to pause";
+        } else {
+            dom.recDot.className = "rec-dot";
+            dom.recLabel.textContent = "Paused — sign START to record";
+        }
+    }
+    updateGestureRecUI(active);
+
+    // ── Dynamic Gesture Watchdog Countdown Timer ──────────────────
+    const dynName = data.dynamic_gesture;
+    const dynTimeLeft = typeof data.dynamic_time_left === "number" ? data.dynamic_time_left : 0;
+    const maxDyn = data.max_dynamic_duration || 2.8;
+
+    const dynBanner = document.getElementById("dynamic-timer-banner");
+    const dynTimerName = document.getElementById("dyn-timer-name");
+    const dynTimerVal = document.getElementById("dyn-timer-val");
+    const dynBarFill = document.getElementById("dyn-timer-bar-fill");
+
+    const dynTelemetryRow = document.getElementById("dynamic-timer-telemetry");
+    const dynTelemetryTime = document.getElementById("dyn-telemetry-time");
+    const dynTelemetryBar = document.getElementById("dyn-telemetry-bar");
+
+    if (dynName && dynTimeLeft > 0) {
+        const ratio = Math.max(0, Math.min(100, (dynTimeLeft / maxDyn) * 100));
+        const cleanDynTitle = stripInternalSuffix(dynName);
+
+        if (dynBanner) {
+            dynBanner.style.display = "flex";
+            if (dynTimerName) dynTimerName.textContent = cleanDynTitle;
+            if (dynTimerVal) dynTimerVal.textContent = dynTimeLeft.toFixed(1) + "s";
+            if (dynBarFill) dynBarFill.style.width = ratio + "%";
+        }
+        if (dynTelemetryRow) {
+            dynTelemetryRow.style.display = "block";
+            if (dynTelemetryTime) dynTelemetryTime.textContent = `${dynTimeLeft.toFixed(1)}s (${cleanDynTitle})`;
+            if (dynTelemetryBar) dynTelemetryBar.style.width = ratio + "%";
+        }
+        const statePill = document.getElementById("state-pill");
+        if (statePill) {
+            statePill.textContent = `DYNAMIC: ${cleanDynTitle} (${dynTimeLeft.toFixed(1)}s)`;
+            statePill.className = "state-pill dynamic-active";
+        }
+    } else {
+        if (dynBanner) dynBanner.style.display = "none";
+        if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+        const statePill = document.getElementById("state-pill");
+        if (statePill && statePill.classList.contains("dynamic-active")) {
+            statePill.textContent = active ? "RECORDING" : "STANDBY";
+            statePill.className = "state-pill " + (active ? "active" : "standby");
+        }
+    }
+
+    // Sentence builder
+    const word = data.word || "";
+    if (dom.sentenceBox) {
+        if (word.trim() === "") {
+            dom.sentenceBox.textContent = "(empty)";
+            dom.sentenceBox.className = "empty";
+        } else {
+            dom.sentenceBox.textContent = word;
+            dom.sentenceBox.className = "";
+        }
+    }
+    updateSentenceCounters(word);
+
+    // Update Recent Signs Trail on confirmed stability
+    if (data.agreeing && gesture && gesture !== "—" && gesture !== "NEUTRAL") {
+        addRecentSign(gesture);
+    }
+
+    // Voice feedback for system alerts
+    if (data.speak_alert) {
+        if (data.speak_alert === "Recording stop") {
+            speakCompletedSentence(word);
+        } else {
+            speakText(data.speak_alert);
+            showToast(data.speak_alert, "info", 2000);
+        }
+    }
+
+    // Audio feedback when recording transitions from paused to active
+    if (!lastActiveState && active) {
+        if (data.speak_alert !== "Recording start") {
+            speakText("Recording start");
+        }
+    }
+
+    // TTS Real-Time Triggers for translated words
+    if (active && word !== lastSentenceText) {
+        if (word.length > lastSentenceText.length) {
+            const newPart = word.slice(lastSentenceText.length).trim();
+            if (newPart && newPart !== "(empty)") {
+                speakText(newPart);
+                addRecentSign(newPart);
+            }
+        }
+        lastSentenceText = word;
+    } else if (!active) {
+        lastSentenceText = word;
+    }
+
+    // Speak completed sentence when paused from active
+    if (lastActiveState && !active) {
+        speakCompletedSentence(word);
+        if (isRecordingVoice) {
+            stopVoiceRecording();
+        }
+    }
+    lastActiveState = active;
+}
+
+// ── Fallback Polling Loop (Only when webcam not active) ─────────────────────
 function poll() {
+    if (isWebcamActive) return;
     fetch("/gesture")
         .then(r => r.json())
         .then(data => {
-            consecutivePollFailures = 0;
-            const active = !!data.active;
-
-            if (dom.cameraFeed && (dom.cameraFeed.style.display === "none" || (dom.camFallback && dom.camFallback.style.display === "flex"))) {
-                dom.cameraFeed.style.display = "block";
-                if (dom.camFallback) dom.camFallback.style.display = "none";
-                reconnectCamera(true);
-            }
-
-            if (data.status === "error") {
-                setStatusBadge("error");
-            } else {
-                setStatusBadge(data.status || "running", active ? "Recording" : "Standby");
-            }
-
-            // Sync dominant hand UI
-            if (data.dominant_hand) {
-                updateDominantHandUI(data.dominant_hand);
-            }
-
-            // Hand detection separation indicators
-            const detectedHand = data.detected_hand || "none";
-            const handMap = {
-                right: { label: "✋ Right Hand", cls: "hand-right", hud: "✋ RIGHT HAND" },
-                left:  { label: "🤚 Left Hand",  cls: "hand-left",  hud: "🤚 LEFT HAND" },
-                both:  { label: "🙌 Both Hands", cls: "hand-both",  hud: "🙌 BOTH HANDS" },
-                none:  { label: "Standby",       cls: "hand-none",  hud: "STANDBY" }
-            };
-            const hCfg = handMap[detectedHand] || handMap.none;
-            const handBadge = document.getElementById("hand-badge");
-            if (handBadge) {
-                handBadge.textContent = hCfg.label;
-                handBadge.className = "hand-badge " + hCfg.cls;
-            }
-            const gesture = stripInternalSuffix(data.live_gesture || "—");
-            const rSign = stripInternalSuffix(data.right_gesture || "—");
-            const rConf = Math.round((data.right_conf || 0) * 100);
-            const lSign = stripInternalSuffix(data.left_gesture || "—");
-            const lConf = Math.round((data.left_conf || 0) * 100);
-
-            const hudHandText = document.getElementById("hud-hand-text");
-            if (hudHandText) {
-                if (detectedHand === "both") {
-                    hudHandText.textContent = `🙌 BOTH: ${gesture}`;
-                } else if (detectedHand === "right") {
-                    hudHandText.textContent = `✋ RIGHT: ${rSign} (${rConf}%)`;
-                } else if (detectedHand === "left") {
-                    hudHandText.textContent = `🤚 LEFT: ${lSign} (${lConf}%)`;
-                } else {
-                    hudHandText.textContent = "STANDBY";
-                }
-            }
-
-            // Camera index sync
-            if (data.camera_index !== undefined && data.camera_index !== currentCameraIndex) {
-                currentCameraIndex = data.camera_index;
-                if (dom.hudCamName) {
-                    dom.hudCamName.textContent = `CAM ${data.camera_index} · LIVE FEED`;
-                }
-                if (dom.btnSwitchCam) {
-                    dom.btnSwitchCam.title = `Switch Camera (Current: CAM ${data.camera_index}, Shortcut: X)`;
-                }
-            }
-
-            // Dual-Hand Independent Monitor Update
-            const valR = document.getElementById("val-right");
-            const meterR = document.getElementById("meter-right");
-            const pctR = document.getElementById("pct-right");
-            const badgeR = document.getElementById("badge-right");
-            const cardR = document.getElementById("track-right");
-
-            const valL = document.getElementById("val-left");
-            const meterL = document.getElementById("meter-left");
-            const pctL = document.getElementById("pct-left");
-            const badgeL = document.getElementById("badge-left");
-            const cardL = document.getElementById("track-left");
-
-            if (valR) valR.textContent = rSign;
-            if (meterR) meterR.style.width = rConf + "%";
-            if (pctR) pctR.textContent = rConf + "%";
-
-            if (valL) valL.textContent = lSign;
-            if (meterL) meterL.style.width = lConf + "%";
-            if (pctL) pctL.textContent = lConf + "%";
-
-            const isRightActive = (detectedHand === "right" || detectedHand === "both");
-            const isLeftActive = (detectedHand === "left" || detectedHand === "both");
-
-            if (badgeR) {
-                badgeR.textContent = isRightActive ? (detectedHand === "both" ? "DUAL" : "ACTIVE") : (rSign !== "—" ? "READY" : "IDLE");
-                badgeR.className = "hand-track-badge " + (isRightActive ? "badge-active" : (rSign !== "—" ? "badge-ready" : "badge-idle"));
-            }
-            if (cardR) cardR.classList.toggle("active-driver", isRightActive);
-
-            if (badgeL) {
-                badgeL.textContent = isLeftActive ? (detectedHand === "both" ? "DUAL" : "ACTIVE") : (lSign !== "—" ? "READY" : "IDLE");
-                badgeL.className = "hand-track-badge " + (isLeftActive ? "badge-active" : (lSign !== "—" ? "badge-ready" : "badge-idle"));
-            }
-            if (cardL) cardL.classList.toggle("active-driver", isLeftActive);
-
-            // Live gesture label
-            if (dom.gestureLabel) {
-                dom.gestureLabel.textContent = gesture;
-            }
-
-            // Live confidence
-            const confVal = data.live_conf || 0;
-            const pct = Math.round(confVal * 100);
-            if (dom.confBar) {
-                dom.confBar.style.width = pct + "%";
-                if (pct >= 70) {
-                    dom.confBar.style.background = "linear-gradient(90deg, var(--cyan), var(--emerald))";
-                } else if (pct >= 40) {
-                    dom.confBar.style.background = "linear-gradient(90deg, var(--cyan), var(--amber))";
-                } else {
-                    dom.confBar.style.background = "linear-gradient(90deg, var(--amber), var(--ruby))";
-                }
-            }
-            if (dom.confText) dom.confText.textContent = pct + "%";
-            if (dom.hudConfidence) dom.hudConfidence.textContent = `${pct}% CONF`;
-
-            // Segmented stability buffer
-            renderStability(data.buffer_fill || 0, data.buffer_max || 15, !!data.agreeing);
-
-            // Recording state
-            if (dom.recDot && dom.recLabel) {
-                if (active) {
-                    dom.recDot.className = "rec-dot on";
-                    dom.recLabel.textContent = "Recording — sign STOP to pause";
-                } else {
-                    dom.recDot.className = "rec-dot";
-                    dom.recLabel.textContent = "Paused — sign START to record";
-                }
-            }
-            updateGestureRecUI(active);
-
-            // ── Dynamic Gesture Watchdog Countdown Timer ──────────────────
-            const dynName = data.dynamic_gesture;
-            const dynTimeLeft = typeof data.dynamic_time_left === "number" ? data.dynamic_time_left : 0;
-            const maxDyn = data.max_dynamic_duration || 2.8;
-
-            const dynBanner = document.getElementById("dynamic-timer-banner");
-            const dynTimerName = document.getElementById("dyn-timer-name");
-            const dynTimerVal = document.getElementById("dyn-timer-val");
-            const dynBarFill = document.getElementById("dyn-timer-bar-fill");
-
-            const dynTelemetryRow = document.getElementById("dynamic-timer-telemetry");
-            const dynTelemetryTime = document.getElementById("dyn-telemetry-time");
-            const dynTelemetryBar = document.getElementById("dyn-telemetry-bar");
-
-            if (dynName && dynTimeLeft > 0) {
-                const ratio = Math.max(0, Math.min(100, (dynTimeLeft / maxDyn) * 100));
-                const cleanDynTitle = stripInternalSuffix(dynName);
-
-                if (dynBanner) {
-                    dynBanner.style.display = "flex";
-                    if (dynTimerName) dynTimerName.textContent = cleanDynTitle;
-                    if (dynTimerVal) dynTimerVal.textContent = dynTimeLeft.toFixed(1) + "s";
-                    if (dynBarFill) dynBarFill.style.width = ratio + "%";
-                }
-                if (dynTelemetryRow) {
-                    dynTelemetryRow.style.display = "block";
-                    if (dynTelemetryTime) dynTelemetryTime.textContent = `${dynTimeLeft.toFixed(1)}s (${cleanDynTitle})`;
-                    if (dynTelemetryBar) dynTelemetryBar.style.width = ratio + "%";
-                }
-                const statePill = document.getElementById("state-pill");
-                if (statePill) {
-                    statePill.textContent = `DYNAMIC: ${cleanDynTitle} (${dynTimeLeft.toFixed(1)}s)`;
-                    statePill.className = "state-pill dynamic-active";
-                }
-            } else {
-                if (dynBanner) dynBanner.style.display = "none";
-                if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
-                const statePill = document.getElementById("state-pill");
-                if (statePill && statePill.classList.contains("dynamic-active")) {
-                    statePill.textContent = active ? "RECORDING" : "STANDBY";
-                    statePill.className = "state-pill " + (active ? "active" : "standby");
-                }
-            }
-
-            // Sentence builder
-            const word = data.word || "";
-            if (dom.sentenceBox) {
-                if (word.trim() === "") {
-                    dom.sentenceBox.textContent = "(empty)";
-                    dom.sentenceBox.className = "empty";
-                } else {
-                    dom.sentenceBox.textContent = word;
-                    dom.sentenceBox.className = "";
-                }
-            }
-            updateSentenceCounters(word);
-
-            // Update Recent Signs Trail on confirmed stability
-            if (data.agreeing && gesture && gesture !== "—" && gesture !== "NEUTRAL") {
-                addRecentSign(gesture);
-            }
-
-            // Voice feedback for system alerts (e.g. "Recording start", "Recording stop")
-            if (data.speak_alert) {
-                if (data.speak_alert === "Recording stop") {
-                    speakCompletedSentence(word);
-                } else {
-                    speakText(data.speak_alert);
-                    showToast(data.speak_alert, "info", 2000);
-                }
-            }
-
-            // Audio feedback when recording transitions from paused to active
-            if (!lastActiveState && active) {
-                if (data.speak_alert !== "Recording start") {
-                    speakText("Recording start");
-                }
-            }
-
-            // TTS Real-Time Triggers for translated words (only while recording is active)
-            if (active && word !== lastSentenceText) {
-                if (word.length > lastSentenceText.length) {
-                    const newPart = word.slice(lastSentenceText.length).trim();
-                    if (newPart && newPart !== "(empty)") {
-                        speakText(newPart);
-                        addRecentSign(newPart);
-                    }
-                }
-                lastSentenceText = word;
-            } else if (!active) {
-                lastSentenceText = word;
-            }
-
-            // Speak completed sentence when paused from active
-            if (lastActiveState && !active) {
-                speakCompletedSentence(word);
-                if (isRecordingVoice) {
-                    stopVoiceRecording();
-                }
-            }
-            lastActiveState = active;
+            applyTelemetry(data);
         })
         .catch(err => {
             consecutivePollFailures++;
             if (consecutivePollFailures >= 5) {
                 setStatusBadge("error");
-                if (dom.cameraFeed) dom.cameraFeed.style.display = "none";
-                if (dom.camFallback) dom.camFallback.style.display = "flex";
             }
         });
 }
@@ -1392,6 +1575,6 @@ window.addEventListener("keydown", (e) => {
     }
 });
 
-// ── Initialize Polling ──────────────────────────────────────────────────────
-pollTimer = setInterval(poll, 120);
-poll();
+// ── Initialize Client Webcam & Polling ──────────────────────────────────────
+startClientWebcam();
+pollTimer = setInterval(poll, 2000);

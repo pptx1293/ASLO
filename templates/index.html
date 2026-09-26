@@ -13,7 +13,7 @@
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
     <!-- Stylesheet -->
-    <link rel="stylesheet" href="/style.css?v=cam_fit_cover">
+    <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
@@ -91,8 +91,9 @@
                 </div>
             </div>
 
-            <!-- Video MJPEG Stream -->
-            <img id="camera-feed" src="/video_feed" alt="Camera Feed">
+            <!-- HTML5 Client Webcam & Landmark Overlay Canvas -->
+            <video id="webcam" autoplay playsinline muted></video>
+            <canvas id="landmark-canvas"></canvas>
 
             <!-- Fallback Display if video drops -->
             <div class="cam-fallback" id="cam-fallback">
@@ -469,7 +470,7 @@
     <div id="toast-container" class="toast-container"></div>
 
     <!-- ── Application Script ──────────────────────────────────────────── -->
-    <script src="/app.js?v=telemetry_cam"></script>
+    <script src="app.js"></script>
 
 </body>
 
