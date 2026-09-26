@@ -335,49 +335,65 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
     d_thb_mid_pip = float(np.linalg.norm(pts_norm[4][:2] - pts_norm[10][:2]))
     dy_thb_idx_pip = float(pts_norm[4][1] - pts_norm[6][1])  # y is positive downward
 
-    # ── 1. X HOOK DETECTION vs P, Q, Z ─────────────────────────────────────────
-    # In 'X', the hand is UPRIGHT (knuckle is above wrist).
-    # Index finger is BENT into a crook/hook (PIP-to-tip folded).
-    # Middle, ring, and pinky are curled tightly in a fist.
+    # ── 1. ANATOMICAL DISAMBIGUATION: X vs P vs Q vs Z / D ───────────────────
+    # Distinguishing metrics:
+    # 1. idx_dy = pts_norm[8][1] - pts_norm[5][1]:
+    #    In X: index tip is UPWARD relative to knuckle (idx_dy <= 0.05, typically negative).
+    #    In P: index points DOWNWARD/forward (idx_dy > 0.08, typically 0.12 - 0.25).
+    #    In Q: index points SHARPLY DOWNWARD (idx_dy > 0.35, typically 0.50 - 0.70).
+    # 2. d_idx_thb = distance(index_tip, thumb_tip):
+    #    In X: thumb folded over fist, FAR from index tip (d_idx_thb >= 0.35).
+    #    In P: thumb touches or is very close to index/middle (d_idx_thb < 0.35).
+    # 3. idx_tip_pip:
+    #    In X: index finger is bent into a pirate hook (idx_tip_pip <= 0.24).
+    #    In D/Z: index finger is extended straight up (idx_tip_pip > 0.25 and idx_ext >= 1.20).
+
     is_upright = (pts[5][1] < pts[0][1] - 0.02)
-    is_fist_others = (mid_ext < 1.28 and ring_ext < 1.28 and pky_ext < 1.28)
+    is_fist_others = (mid_ext < 1.25 and ring_ext < 1.25 and pky_ext < 1.25)
     idx_tip_pip = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[6][:2]))
     idx_dy = float(pts_norm[8][1] - pts_norm[5][1])
-    is_hooked_idx = (idx_tip_pip <= 0.33 and idx_ext < 1.45)
+    d_idx_thb = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[4][:2]))
+    is_hooked = (idx_tip_pip <= 0.24 and idx_dy <= 0.05 and d_idx_thb >= 0.35)
 
-    if label in ["x", "p", "q", "z", "z_start", "z_end", "d"] and is_upright and is_fist_others and is_hooked_idx:
-        # Hand is upright with hooked index and other fingers in fist: DEFINITIVELY 'X'
-        return "X"
-
-    if route_mode == "STATIC" and label in ["z_start", "z_end", "z"]:
-        if is_upright and is_fist_others and is_hooked_idx:
+    lbl_clean = label.lower()
+    if lbl_clean in ["x", "p", "q", "z", "z_start", "z_end", "d"]:
+        # Hooked index upright in a fist -> DEFINITIVELY X
+        if is_upright and is_fist_others and is_hooked:
             return "X"
-        elif is_upright and idx_ext >= 1.30:
-            return "D"
-        elif not is_upright and idx_dy > 0.30:
-            return "Q" if mid_ext < 1.20 else "P"
-        return "X"
 
-    if label in ["x", "d", "z"]:
-        if is_upright and is_fist_others:
-            if is_hooked_idx:
-                return "X"
-            elif idx_ext >= 1.30 and idx_tip_pip > 0.32:
-                return "D" if route_mode == "STATIC" else "Z"
-
-    # ── 2. P vs Q vs X (P and Q strictly point DOWNWARD) ────────────────────────
-    is_downward = (pts[8][1] > pts[0][1] - 0.02 or pts[5][1] > pts[0][1] - 0.04)
-
-    if label in ["p", "q"]:
-        if is_upright and is_fist_others and is_hooked_idx:
-            return "X"
-        if is_downward:
-            if mid_ext >= 1.20:
-                return "P"
-            elif idx_dy > 0.30 or mid_ext < 1.15:
+        # Downward pointing index -> P or Q
+        if idx_dy > 0.08:
+            if idx_dy > 0.35:
                 return "Q"
             else:
                 return "P"
+
+        # Straight upright index finger -> D (static) or Z (dynamic)
+        if idx_ext >= 1.20 and idx_tip_pip > 0.25 and is_fist_others:
+            return "D" if route_mode == "STATIC" else "Z"
+
+        # If raw prediction was X and hand is upright with other fingers in fist
+        if lbl_clean == "x" and is_upright and is_fist_others:
+            return "X"
+
+        # Preserve authentic P / Q / Z predictions
+        if lbl_clean == "p":
+            return "P"
+        if lbl_clean == "q":
+            return "Q"
+        if lbl_clean in ["z", "z_start", "z_end"]:
+            return "D" if route_mode == "STATIC" else "Z"
+
+    # ── 2. ANATOMICAL DISAMBIGUATION: ME vs YOU ──────────────────────────────
+    # Both ME and YOU feature single-hand extended index with other fingers in fist.
+    # IN YOU: Index points OUTWARD/FORWARD towards camera/interlocutor (dx >= 0.015).
+    # IN ME: Index points INWARD towards signer's own chest (dx < 0.012).
+    if lbl_clean in ["me", "you", "how are you_start", "how are you", "d"] and is_fist_others and idx_ext >= 1.15:
+        dx_idx = pts[8][0] - pts[5][0]
+        if dx_idx < 0.012:
+            return "ME"
+        elif dx_idx >= 0.015:
+            return "YOU"
 
     # ── 3. U vs R vs V vs W DISAMBIGUATION ─────────────────────────────────────
     # ASL anatomy:

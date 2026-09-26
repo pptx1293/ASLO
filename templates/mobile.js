@@ -49,19 +49,28 @@ const dom = {
     dictSearch: document.getElementById("m-dict-search")
 };
 
-let pollTimer = null;
-let lastSentenceText = "";
-let lastActiveState = false;
-let isSoundMuted = localStorage.getItem("aslo_mobile_sound_muted") === "true";
+// Client-Side Session State & Camera Tracking
+let currentFacingMode = "user"; // 'user' (front) or 'environment' (rear)
 let isMirrored = true;
+let isGestureRecordingActive = true;
+let clientSentence = "";
+let clientLastWord = "";
+let clientStabilityBuffer = [];
+let clientLastTriggerTime = 0;
+let clientDynamicGesture = null;
+let clientDynamicStartTime = 0;
+const CLIENT_DYNAMIC_MAX_SEC = 2.8;
+let clientSuppressYouUntil = 0;
+let lastLeftHandToastTime = 0;
+const REPEAT_DELAY_MS = 1300;
+const STABILITY_REQUIRED_COUNT = 3;
+const BUFFER_MAX_LEN = 5;
+
+let isSoundMuted = localStorage.getItem("aslo_mobile_sound_muted") === "true";
 let stabilitySegmentsCount = 8;
 let webcamStream = null;
-let captureCanvas = null;
-let captureCtx = null;
 let isPredicting = false;
 let isWebcamActive = false;
-let lastFrameTime = 0;
-let currentFacingMode = "user";
 
 // Initialize Stability Dots
 function initStabilityDots() {
@@ -339,15 +348,151 @@ function initMobileMediaPipe() {
     }
 }
 
+// ── Camera Mirror & Display Synchronizer ──────────────────────────────────
+function updateCameraMirrorDisplay() {
+    if (dom.webcam) {
+        dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "scaleX(1)";
+    }
+    if (dom.landmarkCanvas) {
+        dom.landmarkCanvas.style.transform = isMirrored ? "scaleX(-1)" : "scaleX(1)";
+    }
+}
+
+/**
+ * Resolves the physical hand considering camera mirroring.
+ * On front selfie camera (isMirrored === true), MediaPipe's non-mirrored model
+ * classifies the user's physical Right hand as "Left".
+ */
+function getActualPhysicalHand(handednessObj) {
+    if (!handednessObj) return "Right";
+    const raw = (handednessObj.label || (handednessObj.classification && handednessObj.classification[0] && handednessObj.classification[0].label) || "").trim();
+    if (isMirrored) {
+        if (raw === "Left") return "Right";
+        if (raw === "Right") return "Left";
+    }
+    return raw || "Right";
+}
+
+// ── Transcript & Sentence State Management (Stateless Isolation) ───────────
+function updateTranscriptDOM() {
+    if (dom.transcriptBox) {
+        const textElem = dom.transcriptBox.querySelector(".m-text-content");
+        const trimmed = clientSentence.trim();
+        if (!trimmed) {
+            if (textElem) textElem.textContent = "(Waiting for signs… sign START to begin)";
+            dom.transcriptBox.classList.add("empty");
+        } else {
+            if (textElem) textElem.textContent = clientSentence;
+            dom.transcriptBox.classList.remove("empty");
+        }
+    }
+
+    if (dom.charStats) {
+        const trimmed = clientSentence.trim();
+        const wordArr = trimmed ? trimmed.split(/\s+/) : [];
+        dom.charStats.textContent = `${wordArr.length} words · ${clientSentence.length} chars`;
+    }
+}
+
+function appendSignToTranscript(sign) {
+    if (!sign || sign === "—") return;
+    const clean = stripInternalSuffix(sign).trim();
+    if (!clean) return;
+
+    if (clean === "SPACE") {
+        if (clientSentence.length > 0 && !clientSentence.endsWith(" ")) {
+            clientSentence += " ";
+        }
+    } else {
+        if (clean.length > 1) {
+            if (clientSentence.length > 0 && !clientSentence.endsWith(" ")) {
+                clientSentence += " ";
+            }
+            clientSentence += clean + " ";
+        } else {
+            clientSentence += clean;
+        }
+    }
+    updateTranscriptDOM();
+    speakText(clean);
+}
+
+function backspaceTranscriptLocal() {
+    if (!clientSentence) return;
+    const trimmed = clientSentence.trimEnd();
+    if (trimmed.length === 0) {
+        clientSentence = "";
+        updateTranscriptDOM();
+        return;
+    }
+    const lastSpace = trimmed.lastIndexOf(" ");
+    if (lastSpace !== -1) {
+        clientSentence = trimmed.substring(0, lastSpace + 1);
+    } else {
+        clientSentence = "";
+    }
+    updateTranscriptDOM();
+    showToast("Removed last sign");
+}
+
+function updateStabilityDots(activeCount) {
+    if (!dom.stabDotsContainer) return;
+    const dots = dom.stabDotsContainer.children;
+    const scaledCount = Math.min(stabilitySegmentsCount, Math.round((activeCount / STABILITY_REQUIRED_COUNT) * stabilitySegmentsCount));
+    for (let i = 0; i < dots.length; i++) {
+        dots[i].classList.toggle("filled", i < scaledCount);
+    }
+}
+
+function updateRecordingUI() {
+    if (dom.camBox) dom.camBox.classList.toggle("recording", isGestureRecordingActive);
+    if (dom.recTagText) dom.recTagText.textContent = isGestureRecordingActive ? "REC" : "STANDBY";
+    if (dom.recToggleBtn) dom.recToggleBtn.classList.toggle("recording", isGestureRecordingActive);
+    if (dom.recBtnIcon && dom.recBtnText) {
+        dom.recBtnIcon.textContent = isGestureRecordingActive ? "⏸" : "⏺";
+        dom.recBtnText.textContent = isGestureRecordingActive ? "Stop Recording" : "Start Recording";
+    }
+    if (dom.signSub) dom.signSub.textContent = isGestureRecordingActive ? "Live tracking" : "Paused";
+}
+
 async function sendMobileLandmarks(results) {
     if (isPredicting) return;
-    isPredicting = true;
 
-    try {
-        const hasHands = results && results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
-        let payload = null;
+    const numHands = (results && results.multiHandLandmarks) ? results.multiHandLandmarks.length : 0;
+    if (numHands === 0) {
+        applyMobileTelemetry({
+            ok: true,
+            prediction: "—",
+            live_gesture: "—",
+            live_conf: 0.0,
+            detected_hand: "none"
+        });
+        return;
+    }
 
-        if (hasHands) {
+    if (numHands === 1) {
+        const rawH = results.multiHandedness && results.multiHandedness[0];
+        const physicalHand = getActualPhysicalHand(rawH);
+
+        if (physicalHand === "Left") {
+            applyMobileTelemetry({
+                ok: true,
+                prediction: null,
+                message: "Please use your Right Hand for single-hand signs",
+                detected_hand: "left_ignored",
+                live_gesture: "—",
+                live_conf: 0.0
+            });
+            const now = performance.now();
+            if (now - lastLeftHandToastTime > 3500) {
+                lastLeftHandToastTime = now;
+                showToast("Please use your Right Hand for single-hand signs", 3500);
+            }
+            return;
+        }
+
+        isPredicting = true;
+        try {
             const primaryHand = results.multiHandLandmarks[0];
             const landmarks = primaryHand.map(pt => [
                 Number(pt.x.toFixed(5)),
@@ -355,53 +500,84 @@ async function sendMobileLandmarks(results) {
                 Number((pt.z || 0).toFixed(5))
             ]);
 
-            let handedness = "Right";
-            if (results.multiHandedness && results.multiHandedness.length > 0) {
-                handedness = results.multiHandedness[0].label || "Right";
-            }
+            const payload = {
+                landmarks: landmarks,
+                handedness: "Right",
+                hand_type: "right",
+                is_mirrored: isMirrored
+            };
 
-            const allHands = results.multiHandLandmarks.map((hand, idx) => {
-                const label = (results.multiHandedness && results.multiHandedness[idx])
-                    ? results.multiHandedness[idx].label
-                    : (idx === 0 ? handedness : "Left");
-                return {
-                    label: label,
-                    points: hand.map(pt => [
-                        Number(pt.x.toFixed(5)),
-                        Number(pt.y.toFixed(5)),
-                        Number((pt.z || 0).toFixed(5))
-                    ])
-                };
+            const response = await fetch("/predict_landmarks", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
             });
 
-            payload = {
-                landmarks: landmarks,
-                handedness: handedness,
+            if (response.ok) {
+                const data = await response.json();
+                applyMobileTelemetry(data);
+            }
+        } catch (err) {
+            // Tolerated frame drop
+        } finally {
+            isPredicting = false;
+        }
+        return;
+    }
+
+    if (numHands >= 2) {
+        isPredicting = true;
+        try {
+            const hand0 = results.multiHandLandmarks[0];
+            const hand1 = results.multiHandLandmarks[1];
+            let h0Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[0]);
+            let h1Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[1]);
+
+            const h0Pts = hand0.map(pt => [Number(pt.x.toFixed(5)), Number(pt.y.toFixed(5)), Number((pt.z || 0).toFixed(5))]);
+            const h1Pts = hand1.map(pt => [Number(pt.x.toFixed(5)), Number(pt.y.toFixed(5)), Number((pt.z || 0).toFixed(5))]);
+
+            if (h0Hand === h1Hand) {
+                const avgX0 = h0Pts.reduce((acc, p) => acc + p[0], 0) / h0Pts.length;
+                const avgX1 = h1Pts.reduce((acc, p) => acc + p[0], 0) / h1Pts.length;
+                if (avgX0 <= avgX1) {
+                    h0Hand = "Right";
+                    h1Hand = "Left";
+                } else {
+                    h0Hand = "Left";
+                    h1Hand = "Right";
+                }
+            }
+
+            const allHands = [
+                { label: h0Hand, points: h0Pts },
+                { label: h1Hand, points: h1Pts }
+            ];
+
+            const payload = {
+                landmarks: (h0Hand === "Right" ? h0Pts : h1Pts),
                 all_hands: allHands,
+                hands: allHands,
+                handedness: "Both",
+                hand_type: "both",
                 is_mirrored: isMirrored
             };
-        } else {
-            payload = {
-                landmarks: [],
-                all_hands: [],
-                is_mirrored: isMirrored
-            };
-        }
 
-        const response = await fetch("/predict_landmarks", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-        });
+            const response = await fetch("/predict_landmarks", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
 
-        if (response.ok) {
-            const data = await response.json();
-            applyMobileTelemetry(data);
+            if (response.ok) {
+                const data = await response.json();
+                applyMobileTelemetry(data);
+            }
+        } catch (err) {
+            // Tolerated frame drop
+        } finally {
+            isPredicting = false;
         }
-    } catch (err) {
-        // Tolerated transient frame drops
-    } finally {
-        isPredicting = false;
+        return;
     }
 }
 
@@ -421,12 +597,20 @@ async function startMobileWebcam() {
 
         const constraints = {
             video: {
-                facingMode: currentFacingMode,
+                facingMode: { ideal: currentFacingMode },
                 width: { ideal: 480 },
                 height: { ideal: 360 }
             },
             audio: false
         };
+
+        webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
+        if (dom.webcam) {
+            dom.webcam.srcObject = webcamStream;
+            updateCameraMirrorDisplay();
+            await dom.webcam.play();
+            dom.webcam.style.display = "block";
+        }
 
         if (typeof Camera !== "undefined" && mobileHands) {
             mobileCamera = new Camera(dom.webcam, {
@@ -440,13 +624,6 @@ async function startMobileWebcam() {
             });
             await mobileCamera.start();
         } else {
-            webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
-            if (dom.webcam) {
-                dom.webcam.srcObject = webcamStream;
-                dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "none";
-                await dom.webcam.play();
-                dom.webcam.style.display = "block";
-            }
             const frameLoop = async () => {
                 if (isWebcamActive && mobileHands) {
                     await mobileHands.send({ image: dom.webcam });
@@ -457,8 +634,9 @@ async function startMobileWebcam() {
         }
 
         isWebcamActive = true;
+        updateCameraMirrorDisplay();
         if (dom.camFallback) dom.camFallback.style.display = "none";
-        showToast("Mobile camera active");
+        showToast(`Camera active: ${currentFacingMode === "user" ? "Front" : "Rear"}`);
     } catch (err) {
         console.error("[Mobile] Camera error:", err);
         isWebcamActive = false;
@@ -472,269 +650,224 @@ async function startMobileWebcam() {
     }
 }
 
-// ── Real-Time Telemetry State Processor ────────────────────────────────────
+// ── Real-Time Telemetry & Client-Isolated Gesture Processing ───────────────
 function applyMobileTelemetry(data) {
     if (!data) return;
-    const active = !!data.active;
+
     const liveSign = stripInternalSuffix(data.live_gesture || "—");
-    const confVal = data.live_conf || 0;
+    const confVal = data.live_conf || data.confidence || 0;
     const confPct = Math.round(confVal * 100);
+    const detHand = data.detected_hand || "none";
 
-            // 1. Camera Box & Recording HUD Status
-            if (dom.camBox) {
-                dom.camBox.classList.toggle("recording", active);
-            }
-            if (dom.recTagText) {
-                dom.recTagText.textContent = active ? "REC" : "STANDBY";
-            }
-            if (dom.recToggleBtn) {
-                dom.recToggleBtn.classList.toggle("recording", active);
-            }
-            if (dom.recBtnIcon && dom.recBtnText) {
-                dom.recBtnIcon.textContent = active ? "⏸" : "⏺";
-                dom.recBtnText.textContent = active ? "Stop Recording" : "Start Recording";
-            }
+    // 1. Current Sign Hero Card
+    if (dom.signVal) dom.signVal.textContent = liveSign;
+    if (dom.signSub) dom.signSub.textContent = isGestureRecordingActive ? "Live tracking" : "Paused";
 
-            // 2. Dominant Hand Sync
-            if (data.dominant_hand) {
-                updateDominantHandUI(data.dominant_hand);
+    if (dom.confPill) {
+        dom.confPill.textContent = confPct + "%";
+        dom.confPill.classList.remove("high", "mid", "low");
+        if (confPct >= 70) dom.confPill.classList.add("high");
+        else if (confPct >= 40) dom.confPill.classList.add("mid");
+        else dom.confPill.classList.add("low");
+    }
+
+    if (dom.handPill) {
+        const handMap = {
+            right: "✋ Right Hand",
+            left: "🤚 Left Hand",
+            left_ignored: "🤚 Left (Ignored)",
+            both: "🙌 Dual Hands",
+            none: "💤 Standby"
+        };
+        dom.handPill.textContent = handMap[detHand] || "💤 Standby";
+    }
+
+    if (detHand === "left_ignored") {
+        clientStabilityBuffer = [];
+        updateStabilityDots(0);
+        return;
+    }
+
+    if (!data.prediction || data.prediction === "—") {
+        if (clientStabilityBuffer.length > 0) {
+            clientStabilityBuffer.push("—");
+            if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
+        }
+        updateStabilityDots(0);
+        return;
+    }
+
+    const now = Date.now();
+    const rawPred = (data.raw_pred || data.prediction || "").toUpperCase();
+    const cleanPred = stripInternalSuffix(data.prediction).trim();
+
+    // 2. Dynamic Gesture Sequence Countdown Handling
+    if (clientDynamicGesture) {
+        const elapsedSec = (now - clientDynamicStartTime) / 1000.0;
+        const remainingSec = Math.max(0, CLIENT_DYNAMIC_MAX_SEC - elapsedSec);
+        const ratio = Math.max(0, Math.min(100, (remainingSec / CLIENT_DYNAMIC_MAX_SEC) * 100));
+
+        if (dom.dynBanner) dom.dynBanner.style.display = "flex";
+        if (dom.dynTitle) dom.dynTitle.textContent = clientDynamicGesture;
+        if (dom.dynTimer) dom.dynTimer.textContent = remainingSec.toFixed(1) + "s";
+        if (dom.dynBarFill) dom.dynBarFill.style.width = ratio + "%";
+
+        const isEndSignal = rawPred.endsWith("_END") || rawPred === "YOU" || (rawPred === clientDynamicGesture && elapsedSec >= 0.8);
+        if (isEndSignal || remainingSec <= 0) {
+            const completedGesture = clientDynamicGesture;
+            clientDynamicGesture = null;
+            if (dom.dynBanner) dom.dynBanner.style.display = "none";
+            if (isGestureRecordingActive) {
+                appendSignToTranscript(completedGesture);
+                clientSuppressYouUntil = now + 2500;
+                showToast(`Dynamic Sign: ${completedGesture}`);
             }
+            clientStabilityBuffer = [];
+            clientLastTriggerTime = now;
+            updateStabilityDots(0);
+            return;
+        }
+        return;
+    } else {
+        if (dom.dynBanner) dom.dynBanner.style.display = "none";
+    }
 
-            // 3. Motion Mode & Stability Gauge
-            if (dom.motionPill && dom.motionLabel) {
-                const isDyn = data.route_mode === "DYNAMIC";
-                dom.motionPill.classList.toggle("dynamic", isDyn);
-                const spd = typeof data.motion_speed === "number" ? ` (${data.motion_speed.toFixed(2)})` : "";
-                dom.motionLabel.textContent = isDyn ? `⚡ DYNAMIC${spd}` : "STATIC";
+    // 3. Initiate dynamic gesture countdown if _START gesture detected
+    if (rawPred.endsWith("_START")) {
+        const candidate = cleanPred.toUpperCase();
+        clientDynamicGesture = candidate;
+        clientDynamicStartTime = now;
+        if (dom.dynBanner) dom.dynBanner.style.display = "flex";
+        if (dom.dynTitle) dom.dynTitle.textContent = candidate;
+        if (dom.dynTimer) dom.dynTimer.textContent = CLIENT_DYNAMIC_MAX_SEC.toFixed(1) + "s";
+        if (dom.dynBarFill) dom.dynBarFill.style.width = "100%";
+        clientStabilityBuffer = [];
+        return;
+    }
+
+    // 4. Stability Buffer Smoothing (5 frames window, >=3 agreement)
+    clientStabilityBuffer.push(cleanPred);
+    if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
+
+    const matchCount = clientStabilityBuffer.filter(p => p === cleanPred).length;
+    updateStabilityDots(matchCount);
+
+    if (matchCount >= STABILITY_REQUIRED_COUNT && confVal >= 0.35) {
+        const upper = cleanPred.toUpperCase();
+        if (upper === "START") {
+            if (!isGestureRecordingActive) {
+                isGestureRecordingActive = true;
+                updateRecordingUI();
+                speakText("Recording start");
+                showToast("Recording started");
             }
-
-            if (dom.stabDotsContainer) {
-                const bufferFill = typeof data.buffer_fill === "number" ? data.buffer_fill : 0;
-                const bufferMax = typeof data.buffer_max === "number" ? data.buffer_max : 8;
-                const activeDots = Math.min(stabilitySegmentsCount, Math.round((bufferFill / bufferMax) * stabilitySegmentsCount));
-                
-                const dots = dom.stabDotsContainer.children;
-                for (let i = 0; i < dots.length; i++) {
-                    dots[i].classList.toggle("filled", i < activeDots);
-                }
+            clientStabilityBuffer = [];
+            return;
+        }
+        if (upper === "STOP") {
+            if (isGestureRecordingActive) {
+                isGestureRecordingActive = false;
+                updateRecordingUI();
+                speakCompletedSentence(clientSentence);
+                showToast("Recording paused");
             }
-
-            // 4. Dynamic Gesture Watchdog Countdown Timer
-            const dynName = data.dynamic_gesture;
-            const dynTimeLeft = typeof data.dynamic_time_left === "number" ? data.dynamic_time_left : 0;
-            const maxDyn = data.max_dynamic_duration || 2.8;
-
-            if (dynName && dynTimeLeft > 0) {
-                const ratio = Math.max(0, Math.min(100, (dynTimeLeft / maxDyn) * 100));
-                const cleanDyn = stripInternalSuffix(dynName);
-
-                if (dom.dynBanner) dom.dynBanner.style.display = "flex";
-                if (dom.dynTitle) dom.dynTitle.textContent = cleanDyn;
-                if (dom.dynTimer) dom.dynTimer.textContent = dynTimeLeft.toFixed(1) + "s";
-                if (dom.dynBarFill) dom.dynBarFill.style.width = ratio + "%";
-            } else {
-                if (dom.dynBanner) dom.dynBanner.style.display = "none";
+            clientStabilityBuffer = [];
+            return;
+        }
+        if (upper === "SPACE") {
+            if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
+                if (isGestureRecordingActive) appendSignToTranscript("SPACE");
+                clientLastTriggerTime = now;
             }
-
-            // 5. Current Sign Hero Card
-            if (dom.signVal) {
-                dom.signVal.textContent = liveSign;
+            clientStabilityBuffer = [];
+            return;
+        }
+        if (upper === "BACKSPACE" || upper === "BACK SPACE") {
+            if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
+                backspaceTranscriptLocal();
+                clientLastTriggerTime = now;
             }
-            if (dom.signSub) {
-                dom.signSub.textContent = active ? "Live tracking" : "Paused";
+            clientStabilityBuffer = [];
+            return;
+        }
+
+        // Suppress trailing 'YOU' after dynamic phrase
+        if (upper === "YOU" && now < clientSuppressYouUntil) {
+            clientStabilityBuffer = [];
+            return;
+        }
+
+        // Regular vocabulary sign
+        if (cleanPred !== clientLastWord || (now - clientLastTriggerTime > REPEAT_DELAY_MS)) {
+            if (isGestureRecordingActive) {
+                appendSignToTranscript(cleanPred);
+                showToast(`Sign: ${cleanPred}`);
             }
-
-            if (dom.confPill) {
-                dom.confPill.textContent = confPct + "%";
-                dom.confPill.classList.remove("high", "mid", "low");
-                if (confPct >= 70) {
-                    dom.confPill.classList.add("high");
-                } else if (confPct >= 40) {
-                    dom.confPill.classList.add("mid");
-                } else {
-                    dom.confPill.classList.add("low");
-                }
-            }
-
-            if (dom.handPill) {
-                const handMap = {
-                    right: "✋ Right Hand",
-                    left: "🤚 Left Hand",
-                    both: "🙌 Dual Hands",
-                    none: "💤 Standby"
-                };
-                dom.handPill.textContent = handMap[data.detected_hand] || "💤 Standby";
-            }
-
-            // 6. Live Translated Sentence & Char Statistics
-            const word = data.word || "";
-            if (dom.transcriptBox) {
-                const textElem = dom.transcriptBox.querySelector(".m-text-content");
-                if (word.trim() === "") {
-                    if (textElem) textElem.textContent = "(Waiting for signs… sign START to begin)";
-                    dom.transcriptBox.classList.add("empty");
-                } else {
-                    if (textElem) textElem.textContent = word;
-                    dom.transcriptBox.classList.remove("empty");
-                }
-            }
-
-            if (dom.charStats) {
-                const rawTrim = word.trim();
-                const wordArr = rawTrim ? rawTrim.split(/\s+/) : [];
-                const wordCount = wordArr.length;
-                const charCount = word.length;
-                dom.charStats.textContent = `${wordCount} words · ${charCount} chars`;
-            }
-
-            // 7. Backend Spoken Alerts (e.g. "Recording start", "Recording stop")
-            if (data.speak_alert) {
-                if (data.speak_alert === "Recording stop") {
-                    speakCompletedSentence(word);
-                } else {
-                    speakText(data.speak_alert);
-                }
-                showToast(data.speak_alert);
-            }
-
-            // Audio feedback on recording start
-            if (!lastActiveState && active) {
-                if (data.speak_alert !== "Recording start") {
-                    speakText("Recording start");
-                }
-            }
-
-            // Speech triggers for new translated signs
-            if (active && word !== lastSentenceText) {
-                if (word.length > lastSentenceText.length) {
-                    const newPart = word.slice(lastSentenceText.length).trim();
-                    if (newPart && newPart !== "(empty)") {
-                        speakText(newPart);
-                    }
-                }
-                lastSentenceText = word;
-            } else if (!active) {
-                lastSentenceText = word;
-            }
-
-            // Speak completed sentence when recording stops
-            if (lastActiveState && !active) {
-                speakCompletedSentence(word);
-            }
-
-            lastActiveState = active;
-}
-
-// ── Fallback Polling (When webcam stream is idle) ───────────────────────────
-function poll() {
-    if (isWebcamActive) return;
-    fetch("/gesture")
-        .then(res => res.json())
-        .then(data => {
-            applyMobileTelemetry(data);
-        })
-        .catch(() => {});
+            clientLastWord = cleanPred;
+            clientLastTriggerTime = now;
+            clientStabilityBuffer = [];
+        }
+    }
 }
 
 // ── Control Actions ─────────────────────────────────────────────────────────
 
-// Toggle Recording
 function toggleRecording() {
     triggerHaptic(40);
-    fetch("/toggle_active", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" }
-    })
-        .then(res => res.json())
-        .then(data => {
-            const isRec = !!data.active;
-            showToast(isRec ? "Recording Started" : "Recording Paused");
-            if (isRec) {
-                speakText("Recording start");
-            } else {
-                const textElem = dom.transcriptBox ? dom.transcriptBox.querySelector(".m-text-content") : null;
-                const currentText = textElem ? textElem.textContent : "";
-                speakCompletedSentence(currentText);
-            }
-        })
-        .catch(err => console.error(err));
+    isGestureRecordingActive = !isGestureRecordingActive;
+    updateRecordingUI();
+    showToast(isGestureRecordingActive ? "Recording Started" : "Recording Paused");
+    if (isGestureRecordingActive) {
+        speakText("Recording start");
+    } else {
+        speakCompletedSentence(clientSentence);
+    }
 }
 
-// Clear Transcript
 function clearTranscript() {
     triggerHaptic(30);
-    fetch("/clear", { method: "POST" })
-        .then(() => {
-            showToast("Transcript cleared");
-            if (dom.transcriptBox) {
-                const textElem = dom.transcriptBox.querySelector(".m-text-content");
-                if (textElem) textElem.textContent = "(Waiting for signs… sign START to begin)";
-                dom.transcriptBox.classList.add("empty");
-            }
-            if (dom.charStats) {
-                dom.charStats.textContent = "0 words · 0 chars";
-            }
-            lastSentenceText = "";
-        })
-        .catch(err => console.error(err));
+    clientSentence = "";
+    clientLastWord = "";
+    clientStabilityBuffer = [];
+    updateTranscriptDOM();
+    showToast("Transcript cleared");
 }
 
-// Backspace / Undo
 function backspaceTranscript() {
     triggerHaptic(25);
-    fetch("/backspace", { method: "POST" })
-        .then(r => r.json())
-        .then(data => {
-            showToast("Removed last sign");
-            const newWord = data.word || "";
-            if (dom.transcriptBox) {
-                const textElem = dom.transcriptBox.querySelector(".m-text-content");
-                if (!newWord.trim()) {
-                    if (textElem) textElem.textContent = "(Waiting for signs… sign START to begin)";
-                    dom.transcriptBox.classList.add("empty");
-                } else {
-                    if (textElem) textElem.textContent = newWord;
-                    dom.transcriptBox.classList.remove("empty");
-                }
-            }
-            lastSentenceText = newWord;
-        })
-        .catch(err => console.error(err));
+    backspaceTranscriptLocal();
 }
 
-// Speak Transcript
 function speakTranscript() {
     triggerHaptic(20);
-    const textElem = dom.transcriptBox ? dom.transcriptBox.querySelector(".m-text-content") : null;
-    const text = textElem ? textElem.textContent : "";
-    if (!text || text.startsWith("(")) {
+    const trimmed = clientSentence.trim();
+    if (!trimmed) {
         showToast("No sentence to speak yet");
         return;
     }
-    speakText(text);
+    speakText(trimmed);
     showToast("Speaking sentence…");
 }
 
-// Copy Transcript
 function copyTranscript() {
     triggerHaptic(20);
-    const textElem = dom.transcriptBox ? dom.transcriptBox.querySelector(".m-text-content") : null;
-    const text = textElem ? textElem.textContent : "";
-    if (!text || text.startsWith("(")) {
+    const trimmed = clientSentence.trim();
+    if (!trimmed) {
         showToast("Nothing to copy");
         return;
     }
-    navigator.clipboard.writeText(text)
+    navigator.clipboard.writeText(trimmed)
         .then(() => showToast("Copied to clipboard!"))
         .catch(() => showToast("Failed to copy"));
 }
 
-// Switch Front / Back Camera
+// Switch Front / Back Camera using facingMode
 async function switchCamera() {
     triggerHaptic(35);
     currentFacingMode = (currentFacingMode === "user") ? "environment" : "user";
     isMirrored = (currentFacingMode === "user");
-    showToast(`Switched to ${currentFacingMode === "user" ? "Front" : "Rear"} camera`);
+    updateCameraMirrorDisplay();
+    showToast(`Switched to ${currentFacingMode === "user" ? "Front (Selfie)" : "Rear (Environment)"} camera`);
     await startMobileWebcam();
 }
 
@@ -742,9 +875,7 @@ async function switchCamera() {
 function toggleCameraMirror() {
     triggerHaptic(20);
     isMirrored = !isMirrored;
-    if (dom.webcam) {
-        dom.webcam.style.transform = isMirrored ? "scaleX(-1)" : "none";
-    }
+    updateCameraMirrorDisplay();
     showToast(isMirrored ? "Feed mirrored" : "Feed normal");
 }
 
@@ -824,6 +955,8 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 });
 
-// Initialize Client Webcam & Fallback Polling
+// Initialize Client Webcam & Isolated UI
+updateCameraMirrorDisplay();
+updateRecordingUI();
+updateTranscriptDOM();
 startMobileWebcam();
-pollTimer = setInterval(poll, 2000);

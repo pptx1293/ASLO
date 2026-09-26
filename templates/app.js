@@ -84,6 +84,19 @@ let isRecordingVoice = false;
 let isGestureRecordingActive = true;
 let lastActiveState = true;
 let lastSentenceText = "";
+
+// Client-Side Session State & Prediction Smoothing
+let clientSentence = "";
+let clientLastWord = "";
+let clientStabilityBuffer = [];
+let clientLastTriggerTime = 0;
+let clientDynamicGesture = null;
+let clientDynamicStartTime = 0;
+const CLIENT_DYNAMIC_MAX_SEC = 2.8;
+let clientSuppressYouUntil = 0;
+const REPEAT_DELAY_MS = 1300;
+const STABILITY_REQUIRED_COUNT = 3;
+const BUFFER_MAX_LEN = 5;
 let selectedSTTLanguage = "en-US";
 let audioCtx = null;
 let micStream = null;
@@ -1073,8 +1086,7 @@ async function stopVoiceRecording() {
             showToast(`Voice transcribed: "${transcript}"`, "success");
 
             if (isAppend) {
-                // Trigger live canvas counters refresh
-                setTimeout(poll, 100);
+                appendSignToClientSentence(transcript);
             }
         } else {
             const err = data.error || "Could not transcribe audio.";
@@ -1340,43 +1352,83 @@ function downloadTranscript() {
     showToast("Downloaded transcript file", "success");
 }
 
-function clearSentence() {
-    fetch("/clear", { method: "POST" })
-        .then(() => {
-            if (dom.sentenceBox) {
-                dom.sentenceBox.textContent = "(empty)";
-                dom.sentenceBox.className = "empty";
+function updateSentenceDOM() {
+    if (dom.sentenceBox) {
+        const trimmed = clientSentence.trim();
+        if (!trimmed) {
+            dom.sentenceBox.textContent = "(empty)";
+            dom.sentenceBox.className = "empty";
+        } else {
+            dom.sentenceBox.textContent = clientSentence;
+            dom.sentenceBox.className = "";
+        }
+    }
+    updateSentenceCounters(clientSentence);
+}
+
+function appendSignToClientSentence(sign) {
+    if (!sign || sign === "—") return;
+    const clean = stripInternalSuffix(sign).trim();
+    if (!clean) return;
+
+    if (clean === "SPACE") {
+        if (clientSentence.length > 0 && !clientSentence.endsWith(" ")) {
+            clientSentence += " ";
+        }
+    } else {
+        if (clean.length > 1) {
+            if (clientSentence.length > 0 && !clientSentence.endsWith(" ")) {
+                clientSentence += " ";
             }
-            updateSentenceCounters("");
-            recentSigns = [];
-            renderRecentSigns();
-            showToast("Sentence cleared", "info", 2000);
-        })
-        .catch(e => console.error("Error clearing sentence:", e));
+            clientSentence += clean + " ";
+        } else {
+            clientSentence += clean;
+        }
+    }
+    updateSentenceDOM();
+    addRecentSign(clean);
+    speakText(clean);
+}
+
+function backspaceSentenceLocal() {
+    if (!clientSentence) return;
+    const trimmed = clientSentence.trimEnd();
+    if (trimmed.length === 0) {
+        clientSentence = "";
+        updateSentenceDOM();
+        return;
+    }
+    const lastSpace = trimmed.lastIndexOf(" ");
+    if (lastSpace !== -1) {
+        clientSentence = trimmed.substring(0, lastSpace + 1);
+    } else {
+        clientSentence = "";
+    }
+    updateSentenceDOM();
+    showToast("Removed last sign", "info", 1500);
+}
+
+function clearSentence() {
+    clientSentence = "";
+    clientLastWord = "";
+    clientStabilityBuffer = [];
+    updateSentenceDOM();
+    recentSigns = [];
+    renderRecentSigns();
+    showToast("Sentence cleared", "info", 2000);
 }
 
 // ── Gesture Recording Toggle ────────────────────────────────────────────────
 function toggleGestureRecording() {
-    const nextState = !isGestureRecordingActive;
-    fetch("/toggle_active", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ active: nextState })
-    })
-    .then(r => r.json())
-    .then(data => {
-        if (data.ok) {
-            updateGestureRecUI(nextState);
-            if (nextState) {
-                speakText("Recording start");
-                showToast("Recording started — System translating signs", "success");
-            } else {
-                const currentText = dom.sentenceBox ? dom.sentenceBox.textContent : "";
-                speakCompletedSentence(currentText);
-            }
-        }
-    })
-    .catch(e => console.error("Error toggling active state:", e));
+    isGestureRecordingActive = !isGestureRecordingActive;
+    updateGestureRecUI(isGestureRecordingActive);
+    if (isGestureRecordingActive) {
+        speakText("Recording start");
+        showToast("Recording started — System translating signs", "success");
+    } else {
+        speakCompletedSentence(clientSentence);
+        showToast("Recording paused", "info");
+    }
 }
 
 function updateGestureRecUI(active) {
@@ -1664,123 +1716,157 @@ function applyTelemetry(data) {
     }
     if (dom.confText) dom.confText.textContent = pct + "%";
     if (dom.hudConfidence) dom.hudConfidence.textContent = `${pct}% CONF`;
-
-    // Segmented stability buffer
-    renderStability(data.buffer_fill || 0, data.buffer_max || 8, !!data.agreeing);
-
-    // Recording state
-    if (dom.recDot && dom.recLabel) {
-        if (active) {
-            dom.recDot.className = "rec-dot on";
-            dom.recLabel.textContent = "Recording — sign STOP to pause";
-        } else {
-            dom.recDot.className = "rec-dot";
-            dom.recLabel.textContent = "Paused — sign START to record";
-        }
-    }
-    updateGestureRecUI(active);
-
-    // ── Dynamic Gesture Watchdog Countdown Timer ──────────────────
-    const dynName = data.dynamic_gesture;
-    const dynTimeLeft = typeof data.dynamic_time_left === "number" ? data.dynamic_time_left : 0;
-    const maxDyn = data.max_dynamic_duration || 2.8;
+    const now = Date.now();
+    const rawPred = (data.raw_pred || data.prediction || "").toUpperCase();
+    const cleanPred = stripInternalSuffix(data.prediction).trim();
 
     const dynBanner = document.getElementById("dynamic-timer-banner");
     const dynTimerName = document.getElementById("dyn-timer-name");
     const dynTimerVal = document.getElementById("dyn-timer-val");
     const dynBarFill = document.getElementById("dyn-timer-bar-fill");
-
     const dynTelemetryRow = document.getElementById("dynamic-timer-telemetry");
     const dynTelemetryTime = document.getElementById("dyn-telemetry-time");
     const dynTelemetryBar = document.getElementById("dyn-telemetry-bar");
+    const statePill = document.getElementById("state-pill");
 
-    if (dynName && dynTimeLeft > 0) {
-        const ratio = Math.max(0, Math.min(100, (dynTimeLeft / maxDyn) * 100));
-        const cleanDynTitle = stripInternalSuffix(dynName);
+    // Dynamic gesture in progress countdown
+    if (clientDynamicGesture) {
+        const elapsedSec = (now - clientDynamicStartTime) / 1000.0;
+        const remainingSec = Math.max(0, CLIENT_DYNAMIC_MAX_SEC - elapsedSec);
+        const ratio = Math.max(0, Math.min(100, (remainingSec / CLIENT_DYNAMIC_MAX_SEC) * 100));
 
         if (dynBanner) {
             dynBanner.style.display = "flex";
-            if (dynTimerName) dynTimerName.textContent = cleanDynTitle;
-            if (dynTimerVal) dynTimerVal.textContent = dynTimeLeft.toFixed(1) + "s";
+            if (dynTimerName) dynTimerName.textContent = clientDynamicGesture;
+            if (dynTimerVal) dynTimerVal.textContent = remainingSec.toFixed(1) + "s";
             if (dynBarFill) dynBarFill.style.width = ratio + "%";
         }
         if (dynTelemetryRow) {
             dynTelemetryRow.style.display = "block";
-            if (dynTelemetryTime) dynTelemetryTime.textContent = `${dynTimeLeft.toFixed(1)}s (${cleanDynTitle})`;
+            if (dynTelemetryTime) dynTelemetryTime.textContent = `${remainingSec.toFixed(1)}s (${clientDynamicGesture})`;
             if (dynTelemetryBar) dynTelemetryBar.style.width = ratio + "%";
         }
-        const statePill = document.getElementById("state-pill");
         if (statePill) {
-            statePill.textContent = `DYNAMIC: ${cleanDynTitle} (${dynTimeLeft.toFixed(1)}s)`;
+            statePill.textContent = `DYNAMIC: ${clientDynamicGesture} (${remainingSec.toFixed(1)}s)`;
             statePill.className = "state-pill dynamic-active";
         }
+
+        const isEndSignal = rawPred.endsWith("_END") || rawPred === "YOU" || (rawPred === clientDynamicGesture && elapsedSec >= 0.8);
+        if (isEndSignal || remainingSec <= 0) {
+            const completedGesture = clientDynamicGesture;
+            clientDynamicGesture = null;
+            if (dynBanner) dynBanner.style.display = "none";
+            if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+            if (statePill) {
+                statePill.textContent = isGestureRecordingActive ? "RECORDING" : "STANDBY";
+                statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
+            }
+            if (isGestureRecordingActive) {
+                appendSignToClientSentence(completedGesture);
+                clientSuppressYouUntil = now + 2500;
+                showToast(`Dynamic Sign: ${completedGesture}`, "success");
+            }
+            clientStabilityBuffer = [];
+            clientLastTriggerTime = now;
+            renderStability(0, STABILITY_REQUIRED_COUNT, false);
+            return;
+        }
+        return;
     } else {
         if (dynBanner) dynBanner.style.display = "none";
         if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
-        const statePill = document.getElementById("state-pill");
         if (statePill && statePill.classList.contains("dynamic-active")) {
-            statePill.textContent = active ? "RECORDING" : "STANDBY";
-            statePill.className = "state-pill " + (active ? "active" : "standby");
+            statePill.textContent = isGestureRecordingActive ? "RECORDING" : "STANDBY";
+            statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
         }
     }
 
-    // Sentence builder
-    const word = data.word || "";
-    if (dom.sentenceBox) {
-        if (word.trim() === "") {
-            dom.sentenceBox.textContent = "(empty)";
-            dom.sentenceBox.className = "empty";
-        } else {
-            dom.sentenceBox.textContent = word;
-            dom.sentenceBox.className = "";
+    // Initiate dynamic gesture on _START signal
+    if (rawPred.endsWith("_START")) {
+        const candidate = cleanPred.toUpperCase();
+        clientDynamicGesture = candidate;
+        clientDynamicStartTime = now;
+        if (dynBanner) {
+            dynBanner.style.display = "flex";
+            if (dynTimerName) dynTimerName.textContent = candidate;
+            if (dynTimerVal) dynTimerVal.textContent = CLIENT_DYNAMIC_MAX_SEC.toFixed(1) + "s";
+            if (dynBarFill) dynBarFill.style.width = "100%";
         }
-    }
-    updateSentenceCounters(word);
-
-    // Update Recent Signs Trail on confirmed stability
-    if (data.agreeing && gesture && gesture !== "—" && gesture !== "NEUTRAL") {
-        addRecentSign(gesture);
+        clientStabilityBuffer = [];
+        return;
     }
 
-    // Voice feedback for system alerts
-    if (data.speak_alert) {
-        if (data.speak_alert === "Recording stop") {
-            speakCompletedSentence(word);
-        } else {
-            speakText(data.speak_alert);
-            showToast(data.speak_alert, "info", 2000);
+    // Stability Buffer Smoothing
+    if (!data.prediction || data.prediction === "—") {
+        if (clientStabilityBuffer.length > 0) {
+            clientStabilityBuffer.push("—");
+            if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
         }
+        renderStability(0, STABILITY_REQUIRED_COUNT, false);
+        return;
     }
 
-    // Audio feedback when recording transitions from paused to active
-    if (!lastActiveState && active) {
-        if (data.speak_alert !== "Recording start") {
-            speakText("Recording start");
-        }
-    }
+    clientStabilityBuffer.push(cleanPred);
+    if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
 
-    // TTS Real-Time Triggers for translated words
-    if (active && word !== lastSentenceText) {
-        if (word.length > lastSentenceText.length) {
-            const newPart = word.slice(lastSentenceText.length).trim();
-            if (newPart && newPart !== "(empty)") {
-                speakText(newPart);
-                addRecentSign(newPart);
+    const matchCount = clientStabilityBuffer.filter(p => p === cleanPred).length;
+    const isStable = matchCount >= STABILITY_REQUIRED_COUNT;
+    renderStability(matchCount, STABILITY_REQUIRED_COUNT, isStable);
+
+    if (isStable && confVal >= 0.35) {
+        const upper = cleanPred.toUpperCase();
+        if (upper === "START") {
+            if (!isGestureRecordingActive) {
+                isGestureRecordingActive = true;
+                updateGestureRecUI(true);
+                speakText("Recording start");
+                showToast("Recording started", "success");
             }
+            clientStabilityBuffer = [];
+            return;
         }
-        lastSentenceText = word;
-    } else if (!active) {
-        lastSentenceText = word;
-    }
+        if (upper === "STOP") {
+            if (isGestureRecordingActive) {
+                isGestureRecordingActive = false;
+                updateGestureRecUI(false);
+                speakCompletedSentence(clientSentence);
+                showToast("Recording paused", "info");
+            }
+            clientStabilityBuffer = [];
+            return;
+        }
+        if (upper === "SPACE") {
+            if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
+                if (isGestureRecordingActive) appendSignToClientSentence("SPACE");
+                clientLastTriggerTime = now;
+            }
+            clientStabilityBuffer = [];
+            return;
+        }
+        if (upper === "BACKSPACE" || upper === "BACK SPACE") {
+            if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
+                backspaceSentenceLocal();
+                clientLastTriggerTime = now;
+            }
+            clientStabilityBuffer = [];
+            return;
+        }
 
-    // Speak completed sentence when paused from active
-    if (lastActiveState && !active) {
-        speakCompletedSentence(word);
-        if (isRecordingVoice) {
-            stopVoiceRecording();
+        if (upper === "YOU" && now < clientSuppressYouUntil) {
+            clientStabilityBuffer = [];
+            return;
+        }
+
+        if (cleanPred !== clientLastWord || (now - clientLastTriggerTime > REPEAT_DELAY_MS)) {
+            if (isGestureRecordingActive) {
+                appendSignToClientSentence(cleanPred);
+                showToast(`Sign: ${cleanPred}`, "info", 1500);
+            }
+            clientLastWord = cleanPred;
+            clientLastTriggerTime = now;
+            clientStabilityBuffer = [];
         }
     }
-    lastActiveState = active;
 }
 
 // ── Fallback Polling Loop (Only when webcam not active) ─────────────────────
@@ -1849,6 +1935,6 @@ window.addEventListener("keydown", (e) => {
     }
 });
 
-// ── Initialize Client Webcam & Polling ──────────────────────────────────────
+// ── Initialize Client Webcam & Isolated UI ──────────────────────────────────
+updateSentenceDOM();
 startClientWebcam();
-pollTimer = setInterval(poll, 2000);
