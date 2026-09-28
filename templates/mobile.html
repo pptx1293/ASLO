@@ -175,11 +175,13 @@
             </div>
         </section>
 
-        <!-- ── Live Translated Sentence Box ─────────────────────────────── -->
-        <section class="m-card m-transcript-card">
+        <!-- ── 1. Sign Language Translation Canvas ──────────────── -->
+        <section class="m-card m-transcript-card m-sign-card-box">
             <div class="m-transcript-header">
                 <div class="m-transcript-title-group">
-                    <span class="m-label-tag">TRANSLATED SENTENCE</span>
+                    <span class="m-label-tag" style="color:var(--cyan); display:flex; align-items:center; gap:5px;">
+                        <span>✋</span> SIGN TRANSLATION CANVAS
+                    </span>
                     <span class="m-char-stats" id="m-char-stats">0 words · 0 chars</span>
                 </div>
             </div>
@@ -189,23 +191,23 @@
                 <span class="m-cursor" id="m-cursor">|</span>
             </div>
 
-            <!-- Quick Tactile Action Controls -->
+            <!-- Quick Tactile Action Controls for Sign Translation -->
             <div class="m-quick-actions">
-                <button class="btn-m-action speak" onclick="speakTranscript()" title="Read aloud">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <button class="btn-m-action speak" onclick="speakTranscript()" title="Read aloud sign sentence">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
                         <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
                     </svg>
                     <span>Speak</span>
                 </button>
-                <button class="btn-m-action" onclick="copyTranscript()" title="Copy sentence">
+                <button class="btn-m-action" onclick="copyTranscript()" title="Copy sign sentence">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                         <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
                     <span>Copy</span>
                 </button>
-                <button class="btn-m-action" onclick="backspaceTranscript()" title="Undo last word">
+                <button class="btn-m-action" onclick="backspaceTranscript()" title="Undo last sign">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"></path>
                         <line x1="18" y1="9" x2="12" y2="15"></line>
@@ -213,7 +215,63 @@
                     </svg>
                     <span>Undo</span>
                 </button>
-                <button class="btn-m-action danger" onclick="clearTranscript()" title="Clear sentence">
+                <button class="btn-m-action danger" onclick="clearTranscript()" title="Clear sign sentence">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="3 6 5 6 21 6"></polyline>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    </svg>
+                    <span>Clear</span>
+                </button>
+            </div>
+        </section>
+
+        <!-- ── 2. Voice Speech Transcription Canvas ──────────────── -->
+        <section class="m-card m-transcript-card m-voice-card">
+            <div class="m-transcript-header">
+                <div class="m-transcript-title-group">
+                    <span class="m-label-tag" style="color:#c084fc; display:flex; align-items:center; gap:5px;">
+                        <span>🎙️</span> VOICE SPEECH CANVAS
+                    </span>
+                    <span class="m-char-stats" id="m-voice-char-stats">0 words · 0 chars</span>
+                </div>
+            </div>
+            
+            <div class="m-transcript-box m-voice-transcript-box empty" id="m-voice-transcript-box">
+                <span class="m-voice-text-content">(Waiting for voice… tap Voice to speak)</span>
+            </div>
+
+            <!-- Speech-to-Text Live Mobile Preview Pill -->
+            <div class="m-stt-preview" id="m-stt-preview" style="display:none;">
+                <span class="m-stt-dot"></span>
+                <span id="m-stt-preview-text">🎙️ Listening... speak now</span>
+            </div>
+
+            <!-- Quick Tactile Action Controls for Voice Transcription -->
+            <div class="m-quick-actions">
+                <button class="btn-m-action mic" id="btn-m-voice" onclick="toggleVoiceSTT()" title="Voice to Text (Mic)">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="23"></line>
+                        <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                    <span id="btn-m-voice-text">Voice</span>
+                </button>
+                <button class="btn-m-action speak" onclick="speakVoiceTranscript()" title="Read aloud voice text">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                        <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                    </svg>
+                    <span>Speak</span>
+                </button>
+                <button class="btn-m-action" onclick="copyVoiceTranscript()" title="Copy voice text">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                    </svg>
+                    <span>Copy</span>
+                </button>
+                <button class="btn-m-action danger" onclick="clearVoiceTranscript()" title="Clear voice text">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <polyline points="3 6 5 6 21 6"></polyline>
                         <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
@@ -232,6 +290,16 @@
             <span class="m-rec-btn-glow"></span>
             <span class="m-rec-icon" id="m-rec-btn-icon">⏺</span>
             <span id="m-rec-btn-text">Start Recording</span>
+        </button>
+
+        <!-- Quick Speech-to-Text Microphone -->
+        <button class="btn-dock-icon" id="btn-dock-voice" onclick="toggleVoiceSTT()" title="Speech to Text (Mic)">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                <line x1="12" y1="19" x2="12" y2="23"></line>
+                <line x1="8" y1="23" x2="16" y2="23"></line>
+            </svg>
         </button>
 
         <!-- Quick Switch Camera Hardware -->

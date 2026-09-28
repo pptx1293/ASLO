@@ -75,27 +75,37 @@ const dom = {
     welcomeModal: document.getElementById("welcome-modal"),
     gestureModal: document.getElementById("gesture-modal"),
     toastContainer: document.getElementById("toast-container"),
-    gestureSearch: document.getElementById("gesture-search")
+    gestureSearch: document.getElementById("gesture-search"),
+
+    // Voice Speech Canvas
+    voiceSentenceBox: document.getElementById("voice-sentence-box"),
+    voiceCharCount: document.getElementById("voice-char-count"),
+    voiceWordCount: document.getElementById("voice-word-count")
 };
 
 // ── State Management ────────────────────────────────────────────────────────
 let isTTSEnabled = true;
 let isRecordingVoice = false;
-let isGestureRecordingActive = true;
-let lastActiveState = true;
+let isGestureRecordingActive = false;
+let lastActiveState = false;
 let lastSentenceText = "";
 
 // Client-Side Session State & Prediction Smoothing
 let clientSentence = "";
+let voiceSentence = "";
 let clientLastWord = "";
 let clientStabilityBuffer = [];
 let clientLastTriggerTime = 0;
 let clientDynamicGesture = null;
 let clientDynamicStartTime = 0;
+let clientDynamicNeutralStart = 0;
 const CLIENT_DYNAMIC_MAX_SEC = 2.8;
 let clientSuppressYouUntil = 0;
-const REPEAT_DELAY_MS = 1300;
-const STABILITY_REQUIRED_COUNT = 3;
+let clientDynamicCooldownUntil = 0;
+let dynamicReadyForStart = true;
+let clientLastDynamicCommitted = { gesture: "", time: 0 };
+const REPEAT_DELAY_MS = 1200;
+const STABILITY_REQUIRED_COUNT = 3; // N_Frame = 3 (fast, snappy recognition)
 const BUFFER_MAX_LEN = 5;
 let selectedSTTLanguage = "en-US";
 let audioCtx = null;
@@ -228,114 +238,316 @@ const HAND_CONNECTIONS = [
     [0, 17]                                  // Palm base
 ];
 
-// Temporal smoothing cache for jitter-free tracking
-let smoothedHands = {};
-
-function drawHandLandmarks(landmarksList) {
-    if (!dom.landmarkCanvas) return;
-    const canvas = dom.landmarkCanvas;
-    const rect = canvas.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
-
-    if (canvas.width !== rect.width || canvas.height !== rect.height) {
-        canvas.width = rect.width;
-        canvas.height = rect.height;
+/**
+ * 1-Euro Filter Implementation (Casiez et al., CHI 2012)
+ * Calibrated for rock-solid hand landmark tracking:
+ * - minCutoff = 1.2 Hz dampens high-frequency jitter during stationary hand poses.
+ * - beta = 1.2 dynamically scales cutoff with motion velocity to eliminate lag during gesture movement.
+ * - Sudden position teleports (> 0.45 normalized units) snap cleanly to prevent rubber-band stretching.
+ */
+class OneEuroFilter {
+    constructor(minCutoff = 1.2, beta = 1.2, dCutoff = 1.0) {
+        this.minCutoff = minCutoff; // Minimum cutoff frequency (Hz)
+        this.beta = beta;           // Speed coefficient for dynamic responsiveness
+        this.dCutoff = dCutoff;     // Derivative cutoff frequency (Hz)
+        this.xPrev = null;
+        this.dxPrev = 0;
+        this.tPrev = null;
     }
 
-    const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    if (!landmarksList || landmarksList.length === 0) {
-        smoothedHands = {};
-        return;
+    alpha(cutoff, dt) {
+        const tau = 1.0 / (2.0 * Math.PI * cutoff);
+        return 1.0 / (1.0 + tau / dt);
     }
 
-    const currentHandKeys = new Set();
-
-    landmarksList.forEach((hand, handIdx) => {
-        const handKey = hand.label || `hand_${handIdx}`;
-        currentHandKeys.add(handKey);
-        const rawPts = hand.points;
-        if (!rawPts || rawPts.length < 21) return;
-
-        // Exponential moving average (EMA) smoothing for rock-solid stability
-        if (!smoothedHands[handKey]) {
-            smoothedHands[handKey] = rawPts.map(p => ({ x: p.x, y: p.y }));
-        } else {
-            const prev = smoothedHands[handKey];
-            smoothedHands[handKey] = rawPts.map((p, i) => {
-                const prevP = prev[i] || p;
-                const dx = p.x - prevP.x;
-                const dy = p.y - prevP.y;
-                const distSq = dx * dx + dy * dy;
-                // Ultra-responsive: follows hand movement instantly (0.92), smooths micro-tremors when resting (0.65)
-                const alpha = distSq > 0.002 ? 0.92 : 0.65;
-                return {
-                    x: prevP.x + dx * alpha,
-                    y: prevP.y + dy * alpha
-                };
-            });
+    filter(x, timestamp = performance.now()) {
+        if (this.tPrev === null || this.xPrev === null || !Number.isFinite(this.xPrev)) {
+            this.xPrev = x;
+            this.dxPrev = 0;
+            this.tPrev = timestamp;
+            return x;
         }
 
-        const pts = smoothedHands[handKey];
+        const dt = Math.max((timestamp - this.tPrev) / 1000.0, 0.001);
+        this.tPrev = timestamp;
 
-        // 1. Draw Classic White Skeleton Connection Lines
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+        const rawDiff = x - this.xPrev;
+        // Tracking re-acquisition snap: if point jumped over 45% of screen width/height, re-anchor cleanly
+        if (Math.abs(rawDiff) > 0.45) {
+            this.xPrev = x;
+            this.dxPrev = 0;
+            return x;
+        }
+
+        // Derivative (velocity) estimation
+        const dx = rawDiff / dt;
+        const alphaD = this.alpha(this.dCutoff, dt);
+        const edx = alphaD * dx + (1.0 - alphaD) * this.dxPrev;
+        this.dxPrev = edx;
+
+        // Adaptive cutoff based on motion speed (high responsiveness when moving, heavy smoothing when still)
+        const cutoff = this.minCutoff + this.beta * Math.abs(edx);
+        const alpha = Math.min(1.0, Math.max(0.04, this.alpha(cutoff, dt)));
+
+        const xHat = alpha * x + (1.0 - alpha) * this.xPrev;
+        this.xPrev = xHat;
+        return xHat;
+    }
+
+    reset() {
+        this.xPrev = null;
+        this.dxPrev = 0;
+        this.tPrev = null;
+    }
+}
+
+/**
+ * Persistent Spatial Hand Tracker
+ * Resolves hands by spatial continuity (wrist Euclidean proximity) rather than noisy handedness classification.
+ * Prevents hand identity flipping, filter thrashing, and rubber-band crossover artifacts.
+ */
+class SpatialHandTracker {
+    constructor(minCutoff = 1.2, beta = 1.2, dCutoff = 1.0) {
+        this.minCutoff = minCutoff;
+        this.beta = beta;
+        this.dCutoff = dCutoff;
+        this.tracks = [
+            { id: "track_0", prevWrist: null, lastTime: 0, filters: this.createFilters() },
+            { id: "track_1", prevWrist: null, lastTime: 0, filters: this.createFilters() }
+        ];
+    }
+
+    createFilters() {
+        const filters = [];
+        for (let i = 0; i < 21; i++) {
+            filters.push({
+                x: new OneEuroFilter(this.minCutoff, this.beta, this.dCutoff),
+                y: new OneEuroFilter(this.minCutoff, this.beta, this.dCutoff),
+                z: new OneEuroFilter(this.minCutoff, this.beta, this.dCutoff)
+            });
+        }
+        return filters;
+    }
+
+    resetTrack(t) {
+        t.prevWrist = null;
+        t.lastTime = 0;
+        for (let i = 0; i < 21; i++) {
+            t.filters[i].x.reset();
+            t.filters[i].y.reset();
+            t.filters[i].z.reset();
+        }
+    }
+
+    resetAll() {
+        this.resetTrack(this.tracks[0]);
+        this.resetTrack(this.tracks[1]);
+    }
+
+    resetHand(handKey) {
+        // Discard unneeded track without thrashing active tracking
+        if (handKey === "Left") {
+            this.resetTrack(this.tracks[1]);
+        } else if (handKey === "Right") {
+            this.resetTrack(this.tracks[0]);
+        }
+    }
+
+    filterLandmarks(track, rawLandmarks, timestamp) {
+        return rawLandmarks.map((p, i) => {
+            const rx = Number(p.x !== undefined ? p.x : p[0]);
+            const ry = Number(p.y !== undefined ? p.y : p[1]);
+            const rz = Number((p.z !== undefined ? p.z : p[2]) || 0);
+
+            const fx = track.filters[i].x.filter(rx, timestamp);
+            const fy = track.filters[i].y.filter(ry, timestamp);
+            const fz = track.filters[i].z.filter(rz, timestamp);
+
+            return { x: fx, y: fy, z: fz };
+        });
+    }
+
+    filterHand(handKey, rawLandmarks, timestamp = performance.now()) {
+        const track = (handKey === "Left") ? this.tracks[1] : this.tracks[0];
+        return this.filterLandmarks(track, rawLandmarks, timestamp);
+    }
+
+    process(multiHandLandmarks, multiHandedness, timestamp = performance.now()) {
+        if (!multiHandLandmarks || multiHandLandmarks.length === 0) {
+            for (const t of this.tracks) {
+                if (timestamp - t.lastTime > 300) {
+                    this.resetTrack(t);
+                }
+            }
+            return [];
+        }
+
+        const numHands = multiHandLandmarks.length;
+        const incoming = multiHandLandmarks.map((lms, idx) => {
+            const w = lms[0];
+            return {
+                index: idx,
+                rawLandmarks: lms,
+                wrist: { x: Number(w.x !== undefined ? w.x : w[0]), y: Number(w.y !== undefined ? w.y : w[1]) },
+                handedness: multiHandedness && multiHandedness[idx]
+            };
+        });
+
+        const results = [];
+
+        if (numHands === 1) {
+            const hand = incoming[0];
+            const d0 = this.tracks[0].prevWrist ? Math.hypot(hand.wrist.x - this.tracks[0].prevWrist.x, hand.wrist.y - this.tracks[0].prevWrist.y) : 999;
+            const d1 = this.tracks[1].prevWrist ? Math.hypot(hand.wrist.x - this.tracks[1].prevWrist.x, hand.wrist.y - this.tracks[1].prevWrist.y) : 999;
+
+            let chosenTrack = this.tracks[0];
+            let otherTrack = this.tracks[1];
+            if (d1 < d0) {
+                chosenTrack = this.tracks[1];
+                otherTrack = this.tracks[0];
+            }
+
+            // Only reset inactive track after 350ms grace period to survive momentary 1-frame drops
+            if (timestamp - otherTrack.lastTime > 350) {
+                this.resetTrack(otherTrack);
+            }
+
+            const smoothed = this.filterLandmarks(chosenTrack, hand.rawLandmarks, timestamp);
+            chosenTrack.prevWrist = { x: smoothed[0].x, y: smoothed[0].y };
+            chosenTrack.lastTime = timestamp;
+
+            const handLabel = getActualPhysicalHand(hand.handedness);
+            results.push({
+                trackId: chosenTrack.id,
+                label: handLabel,
+                landmarks: smoothed
+            });
+        } else if (numHands >= 2) {
+            const h0 = incoming[0];
+            const h1 = incoming[1];
+
+            let pair0 = h0;
+            let pair1 = h1;
+
+            const t0HasPrev = !!this.tracks[0].prevWrist;
+            const t1HasPrev = !!this.tracks[1].prevWrist;
+
+            if (t0HasPrev && t1HasPrev) {
+                // Optimal 2x2 bipartite matching
+                const costNormal = Math.hypot(h0.wrist.x - this.tracks[0].prevWrist.x, h0.wrist.y - this.tracks[0].prevWrist.y) +
+                                   Math.hypot(h1.wrist.x - this.tracks[1].prevWrist.x, h1.wrist.y - this.tracks[1].prevWrist.y);
+                const costSwap = Math.hypot(h1.wrist.x - this.tracks[0].prevWrist.x, h1.wrist.y - this.tracks[0].prevWrist.y) +
+                                 Math.hypot(h0.wrist.x - this.tracks[1].prevWrist.x, h0.wrist.y - this.tracks[1].prevWrist.y);
+                if (costSwap < costNormal) {
+                    pair0 = h1;
+                    pair1 = h0;
+                }
+            } else if (t0HasPrev && !t1HasPrev) {
+                // Associate closer incoming hand to existing track 0; new hand anchors to track 1
+                const d0 = Math.hypot(h0.wrist.x - this.tracks[0].prevWrist.x, h0.wrist.y - this.tracks[0].prevWrist.y);
+                const d1 = Math.hypot(h1.wrist.x - this.tracks[0].prevWrist.x, h1.wrist.y - this.tracks[0].prevWrist.y);
+                if (d1 < d0) {
+                    pair0 = h1;
+                    pair1 = h0;
+                }
+            } else if (!t0HasPrev && t1HasPrev) {
+                // Associate closer incoming hand to existing track 1; new hand anchors to track 0
+                const d0 = Math.hypot(h0.wrist.x - this.tracks[1].prevWrist.x, h0.wrist.y - this.tracks[1].prevWrist.y);
+                const d1 = Math.hypot(h1.wrist.x - this.tracks[1].prevWrist.x, h1.wrist.y - this.tracks[1].prevWrist.y);
+                if (d0 < d1) {
+                    pair0 = h1;
+                    pair1 = h0;
+                }
+            }
+
+            const smoothed0 = this.filterLandmarks(this.tracks[0], pair0.rawLandmarks, timestamp);
+            this.tracks[0].prevWrist = { x: smoothed0[0].x, y: smoothed0[0].y };
+            this.tracks[0].lastTime = timestamp;
+
+            const smoothed1 = this.filterLandmarks(this.tracks[1], pair1.rawLandmarks, timestamp);
+            this.tracks[1].prevWrist = { x: smoothed1[0].x, y: smoothed1[0].y };
+            this.tracks[1].lastTime = timestamp;
+
+            let label0 = getActualPhysicalHand(pair0.handedness);
+            let label1 = getActualPhysicalHand(pair1.handedness);
+            if (label0 === label1) {
+                // Disambiguate by spatial position: in unmirrored view, Right hand has smaller x
+                label0 = (smoothed0[0].x <= smoothed1[0].x) ? "Right" : "Left";
+                label1 = (label0 === "Right") ? "Left" : "Right";
+            }
+
+            results.push({ trackId: this.tracks[0].id, label: label0, landmarks: smoothed0 });
+            results.push({ trackId: this.tracks[1].id, label: label1, landmarks: smoothed1 });
+        }
+
+        return results;
+    }
+}
+
+const landmarkStabilizer = new SpatialHandTracker(1.2, 1.2, 1.0);
+let currentStabilizedHands = [];
+
+function getTemporalSmoothedLandmarks(handKey, rawPts, timestamp = performance.now()) {
+    return landmarkStabilizer.filterHand(handKey, rawPts, timestamp);
+}
+
+function toLandmarkArray(landmarks) {
+    if (!landmarks) return [];
+    return landmarks.map(p => {
+        if (Array.isArray(p)) return p;
+        return [Number(p.x || 0), Number(p.y || 0), Number(p.z || 0)];
+    });
+}
+
+function drawStabilizedSkeleton(ctx, landmarks) {
+    if (!ctx || !landmarks || landmarks.length < 21) return;
+    const w = ctx.canvas.width;
+    const h = ctx.canvas.height;
+
+    // 1. Draw Stabilized White Skeleton Connection Lines
+    if (typeof drawConnectors === "function" && typeof HAND_CONNECTIONS !== "undefined") {
+        drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {
+            color: "#FFFFFF",
+            lineWidth: 2.8
+        });
+    } else if (typeof HAND_CONNECTIONS !== "undefined") {
+        ctx.save();
+        ctx.strokeStyle = "#FFFFFF";
         ctx.lineWidth = 2.8;
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
-        ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
-        ctx.shadowBlur = 4;
-
         for (const [i, j] of HAND_CONNECTIONS) {
-            const p1 = pts[i];
-            const p2 = pts[j];
-            if (!p1 || !p2) continue;
-            ctx.beginPath();
-            ctx.moveTo(p1.x * canvas.width, p1.y * canvas.height);
-            ctx.lineTo(p2.x * canvas.width, p2.y * canvas.height);
-            ctx.stroke();
+            const p1 = landmarks[i];
+            const p2 = landmarks[j];
+            if (p1 && p2) {
+                ctx.beginPath();
+                ctx.moveTo(p1.x * w, p1.y * h);
+                ctx.lineTo(p2.x * w, p2.y * h);
+                ctx.stroke();
+            }
         }
+        ctx.restore();
+    }
 
-        // 2. Draw Classic Red Landmark Points
-        ctx.shadowBlur = 0;
-        for (let i = 0; i < pts.length; i++) {
-            const p = pts[i];
-            const px = p.x * canvas.width;
-            const py = p.y * canvas.height;
-            const isFingertip = (i === 4 || i === 8 || i === 12 || i === 16 || i === 20);
-            const radius = isFingertip ? 4.5 : 3.5;
-
-            // Red circle fill
-            ctx.beginPath();
-            ctx.arc(px, py, radius, 0, Math.PI * 2);
-            ctx.fillStyle = "#FF0000";
-            ctx.fill();
-
-            // Crisp white outer ring border
-            ctx.strokeStyle = "#FFFFFF";
-            ctx.lineWidth = 1.0;
-            ctx.stroke();
+    // 2. Draw Stabilized Red Landmark Points with Crisp Edges
+    if (typeof drawLandmarks === "function") {
+        drawLandmarks(ctx, landmarks, {
+            color: "#FF0000",
+            fillColor: "#FF0000",
+            lineWidth: 1.0,
+            radius: 3.5
+        });
+    } else {
+        ctx.save();
+        ctx.fillStyle = "#FF0000";
+        for (const pt of landmarks) {
+            if (pt) {
+                ctx.beginPath();
+                ctx.arc(pt.x * w, pt.y * h, 3.5, 0, 2 * Math.PI);
+                ctx.fill();
+            }
         }
-
-        // 3. Wrist Hand Label Tag
-        const wrist = pts[0];
-        if (wrist) {
-            const isRight = (hand.label === "Right");
-            const wx = Math.min(Math.max(wrist.x * canvas.width, 30), canvas.width - 30);
-            const wy = Math.min(Math.max(wrist.y * canvas.height + 22, 20), canvas.height - 10);
-            ctx.font = "700 11px 'JetBrains Mono', monospace";
-            ctx.fillStyle = "#FFFFFF";
-            ctx.textAlign = "center";
-            ctx.fillText(isRight ? "RIGHT" : "LEFT", wx, wy);
-        }
-    });
-
-    // Cleanup stale hands
-    for (const k in smoothedHands) {
-        if (!currentHandKeys.has(k)) {
-            delete smoothedHands[k];
-        }
+        ctx.restore();
     }
 }
 
@@ -369,12 +581,13 @@ function initClientMediaPipe() {
         });
 
         // Configure client-side Hands detector:
-        // maxNumHands: 2 supports both single-hand alphabet and two-handed phrase signs
+        // Match collect_data.py confidence parameters (0.5 detection / 0.5 tracking)
+        // for continuous, uninterrupted tracking without frame-to-frame dropouts
         mpHands.setOptions({
             maxNumHands: 2,
             modelComplexity: 1,
-            minDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
         });
 
         const outputCanvas = dom.outputCanvas || dom.landmarkCanvas;
@@ -383,10 +596,10 @@ function initClientMediaPipe() {
         mpHands.onResults((results) => {
             if (!outputCanvas || !canvasCtx) return;
 
-            // 1. Maintain canvas internal pixel dimensions to match incoming video frame
+            // 1. Maintain canvas internal pixel dimensions to match incoming video frame (native stream resolution)
             if (results.image) {
-                const w = results.image.width || 640;
-                const h = results.image.height || 480;
+                const w = results.image.width || 1280;
+                const h = results.image.height || 720;
                 if (outputCanvas.width !== w || outputCanvas.height !== h) {
                     outputCanvas.width = w;
                     outputCanvas.height = h;
@@ -396,35 +609,27 @@ function initClientMediaPipe() {
                 canvasCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
                 canvasCtx.drawImage(results.image, 0, 0, outputCanvas.width, outputCanvas.height);
 
-                // 2. Real-time, zero-lag hand skeleton rendering on client (30-60 FPS)
-                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-                    for (const landmarks of results.multiHandLandmarks) {
-                        // Classic white skeleton lines
-                        if (typeof drawConnectors === "function" && typeof HAND_CONNECTIONS !== "undefined") {
-                            drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {
-                                color: "#FFFFFF",
-                                lineWidth: 2.8
-                            });
-                        }
-                        // Classic red keypoint dots
-                        if (typeof drawLandmarks === "function") {
-                            drawLandmarks(canvasCtx, landmarks, {
-                                color: "#FF0000",
-                                fillColor: "#FF0000",
-                                lineWidth: 1.0,
-                                radius: 3.5
-                            });
-                        }
-                    }
+                // 2. Real-time stabilized 60 FPS skeleton rendering via persistent spatial tracking
+                const now = performance.now();
+                const stabilizedList = landmarkStabilizer.process(
+                    results.multiHandLandmarks,
+                    results.multiHandedness,
+                    now
+                );
+
+                for (let i = 0; i < stabilizedList.length; i++) {
+                    drawStabilizedSkeleton(canvasCtx, stabilizedList[i].landmarks);
                 }
+
                 canvasCtx.restore();
+                currentStabilizedHands = stabilizedList;
             }
 
             // 3. Throttled backend inference (~8-10 requests/sec, 100ms debounce)
             const now = performance.now();
             if (now - lastPredictTime >= PREDICT_INTERVAL_MS && !isPredicting) {
                 lastPredictTime = now;
-                sendLandmarksInference(results);
+                sendLandmarksInference(results, currentStabilizedHands);
             }
         });
 
@@ -493,13 +698,14 @@ function updateHandStatusUI(status) {
 }
 
 // ── Lightweight Landmark JSON Transmission ──────────────────────────────────
-async function sendLandmarksInference(results) {
+async function sendLandmarksInference(results, stabilizedHands = []) {
     if (isPredicting) return;
 
     const numHands = (results && results.multiHandLandmarks) ? results.multiHandLandmarks.length : 0;
 
-    // Case 0: 0 hands detected -> idle / standby
+    // Case 0: 0 hands detected -> idle / standby (cleanly reset filter state)
     if (numHands === 0) {
+        landmarkStabilizer.resetAll();
         updateHandStatusUI("none");
         return;
     }
@@ -511,6 +717,7 @@ async function sendLandmarksInference(results) {
 
         // If user is showing only their Left Hand: DO NOT send prediction requests!
         if (physicalHand === "Left") {
+            landmarkStabilizer.resetHand("Left");
             updateHandStatusUI("left_ignored");
             const now = performance.now();
             if (now - lastLeftHandToastTime > 3500) {
@@ -524,12 +731,11 @@ async function sendLandmarksInference(results) {
         updateHandStatusUI("right");
         isPredicting = true;
         try {
-            const primaryHand = results.multiHandLandmarks[0];
-            const landmarks = primaryHand.map(pt => [
-                Number(pt.x.toFixed(5)),
-                Number(pt.y.toFixed(5)),
-                Number((pt.z || 0).toFixed(5))
-            ]);
+            const rawLandmarks = results.multiHandLandmarks[0];
+            const smoothed = (stabilizedHands && stabilizedHands[0])
+                ? stabilizedHands[0].landmarks
+                : landmarkStabilizer.filterHand("Right", rawLandmarks);
+            const landmarks = toLandmarkArray(smoothed);
 
             const payload = {
                 hand_type: "right",
@@ -549,21 +755,62 @@ async function sendLandmarksInference(results) {
 
     // Case 2: 2 hands detected -> verify one is Left and one is Right (or both present), send tagged with hand_type: "both"
     if (numHands >= 2) {
-        updateHandStatusUI("both");
         isPredicting = true;
         try {
-            const hand0 = results.multiHandLandmarks[0];
-            const hand1 = results.multiHandLandmarks[1];
-            let h0Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[0]);
-            let h1Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[1]);
+            let h0Smoothed, h1Smoothed, h0Hand, h1Hand;
 
-            const h0Pts = hand0.map(pt => [Number(pt.x.toFixed(5)), Number(pt.y.toFixed(5)), Number((pt.z || 0).toFixed(5))]);
-            const h1Pts = hand1.map(pt => [Number(pt.x.toFixed(5)), Number(pt.y.toFixed(5)), Number((pt.z || 0).toFixed(5))]);
+            if (stabilizedHands && stabilizedHands.length >= 2) {
+                h0Smoothed = stabilizedHands[0].landmarks;
+                h1Smoothed = stabilizedHands[1].landmarks;
+                h0Hand = stabilizedHands[0].label || "Right";
+                h1Hand = stabilizedHands[1].label || "Left";
+            } else {
+                const hand0 = results.multiHandLandmarks[0];
+                const hand1 = results.multiHandLandmarks[1];
+                h0Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[0]);
+                h1Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[1]);
+                h0Smoothed = landmarkStabilizer.filterHand(h0Hand, hand0);
+                h1Smoothed = landmarkStabilizer.filterHand(h1Hand, hand1);
+            }
 
-            // Ensure one is Right and one is Left
+            // Phantom Duplicate Hand Guard:
+            // Check Euclidean distance between detected wrists
+            const w0 = h0Smoothed[0];
+            const w1 = h1Smoothed[0];
+            const x0 = w0.x !== undefined ? w0.x : w0[0];
+            const y0 = w0.y !== undefined ? w0.y : w0[1];
+            const x1 = w1.x !== undefined ? w1.x : w1[0];
+            const y1 = w1.y !== undefined ? w1.y : w1[1];
+            const wristDist = Math.hypot(x0 - x1, y0 - y1);
+
+            // If wrists are in the same location (< 0.15), or same hand detected twice with dist < 0.22,
+            // this is a single physical hand detected twice!
+            if (wristDist < 0.15 || (h0Hand === h1Hand && wristDist < 0.22)) {
+                const primaryHand = (h0Hand === "Right") ? h0Smoothed : ((h1Hand === "Right") ? h1Smoothed : h0Smoothed);
+                const primaryLabel = (h0Hand === "Right" || h1Hand === "Right") ? "Right" : h0Hand;
+                if (primaryLabel === "Left") {
+                    landmarkStabilizer.resetHand("Left");
+                    updateHandStatusUI("left_ignored");
+                    return;
+                }
+                updateHandStatusUI("right");
+                const landmarks = toLandmarkArray(primaryHand);
+                const payload = {
+                    hand_type: "right",
+                    handedness: "Right",
+                    landmarks: landmarks,
+                    is_mirrored: isMirrored
+                };
+                await sendInferenceRequest(payload);
+                return;
+            }
+
+            updateHandStatusUI("both");
+
+            // Ensure one is Right and one is Left based on spatial coordinate
             if (h0Hand === h1Hand) {
-                const avgX0 = h0Pts.reduce((acc, p) => acc + p[0], 0) / h0Pts.length;
-                const avgX1 = h1Pts.reduce((acc, p) => acc + p[0], 0) / h1Pts.length;
+                const avgX0 = h0Smoothed.reduce((acc, p) => acc + (p.x !== undefined ? p.x : p[0]), 0) / h0Smoothed.length;
+                const avgX1 = h1Smoothed.reduce((acc, p) => acc + (p.x !== undefined ? p.x : p[0]), 0) / h1Smoothed.length;
                 if (avgX0 <= avgX1) {
                     h0Hand = "Right";
                     h1Hand = "Left";
@@ -572,6 +819,9 @@ async function sendLandmarksInference(results) {
                     h1Hand = "Right";
                 }
             }
+
+            const h0Pts = toLandmarkArray(h0Smoothed);
+            const h1Pts = toLandmarkArray(h1Smoothed);
 
             const handsList = [
                 { label: h0Hand, points: h0Pts },
@@ -642,38 +892,55 @@ async function startClientWebcam(deviceId = null) {
             webcamStream = null;
         }
 
-        const constraints = {
+        // Direct high-definition camera stream request
+        // Preserves full native sensor resolution without lowering video dimensions
+        const highResConstraints = {
             video: deviceId ? { deviceId: { exact: deviceId } } : {
-                width: { ideal: 640 },
-                height: { ideal: 480 },
-                facingMode: "user"
+                facingMode: "user",
+                width: { ideal: 1920, min: 1280 },
+                height: { ideal: 1080, min: 720 },
+                frameRate: { ideal: 60, min: 30 }
             },
             audio: false
         };
 
-        // Use Camera from @mediapipe/camera_utils to stream frames directly into hands.send()
-        if (typeof Camera !== "undefined" && mpHands) {
-            mpCamera = new Camera(videoElement, {
-                onFrame: async () => {
-                    if (isWebcamActive && mpHands) {
-                        await mpHands.send({ image: videoElement });
-                    }
-                },
-                width: 640,
-                height: 480
+        try {
+            webcamStream = await navigator.mediaDevices.getUserMedia(highResConstraints);
+        } catch (hdErr) {
+            console.warn("HD constraints unavailable, falling back to standard userMedia constraints:", hdErr);
+            webcamStream = await navigator.mediaDevices.getUserMedia({
+                video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: "user" },
+                audio: false
             });
-            await mpCamera.start();
-        } else {
-            // Direct getUserMedia fallback
-            webcamStream = await navigator.mediaDevices.getUserMedia(constraints);
-            videoElement.srcObject = webcamStream;
-            await videoElement.play();
-            const frameLoop = async () => {
-                if (isWebcamActive && mpHands) {
+        }
+
+        videoElement.srcObject = webcamStream;
+        await videoElement.play();
+
+        // Mutex guard prevents concurrent mpHands.send calls from corrupting MediaPipe WASM memory
+        let isProcessingFrame = false;
+        const frameLoop = async () => {
+            if (!isWebcamActive) return;
+            if (mpHands && !isProcessingFrame && videoElement.readyState >= 2 && !videoElement.paused) {
+                isProcessingFrame = true;
+                try {
                     await mpHands.send({ image: videoElement });
-                    requestAnimationFrame(frameLoop);
+                } catch (e) {
+                    // Suppress transient frame drops
+                } finally {
+                    isProcessingFrame = false;
                 }
-            };
+            }
+            if ("requestVideoFrameCallback" in videoElement) {
+                videoElement.requestVideoFrameCallback(frameLoop);
+            } else {
+                requestAnimationFrame(frameLoop);
+            }
+        };
+
+        if ("requestVideoFrameCallback" in videoElement) {
+            videoElement.requestVideoFrameCallback(frameLoop);
+        } else {
             requestAnimationFrame(frameLoop);
         }
 
@@ -681,7 +948,7 @@ async function startClientWebcam(deviceId = null) {
         if (dom.camFallback) dom.camFallback.style.display = "none";
         setStatusBadge("running", isGestureRecordingActive ? "Recording" : "Standby");
         if (dom.hudCamName) dom.hudCamName.textContent = "CLIENT WEBCAM · 60 FPS";
-        showToast("Webcam connected — Client-side tracking active", "success", 2500);
+        showToast("Webcam connected — Stable tracking active", "success", 2500);
 
         await enumerateCameras();
     } catch (err) {
@@ -1085,9 +1352,7 @@ async function stopVoiceRecording() {
             addDialogueMessage("voice", transcript);
             showToast(`Voice transcribed: "${transcript}"`, "success");
 
-            if (isAppend) {
-                appendSignToClientSentence(transcript);
-            }
+            appendVoiceTranscript(transcript);
         } else {
             const err = data.error || "Could not transcribe audio.";
             if (dom.sttLivePreview) {
@@ -1371,6 +1636,29 @@ function appendSignToClientSentence(sign) {
     const clean = stripInternalSuffix(sign).trim();
     if (!clean || clean.toUpperCase() === "NEUTRAL" || clean.toUpperCase() === "IDLE") return;
 
+    const trimmedUpper = clientSentence.trim().toUpperCase();
+    const cleanUpper = clean.toUpperCase();
+    const now = Date.now();
+
+    // Prevent duplicate consecutive multi-word phrases (e.g. "HOW ARE YOU HOW ARE YOU")
+    const isDynamicPhrase = cleanUpper.includes(" ") || cleanUpper === "HOW ARE YOU" || cleanUpper === "NICE TO MEET YOU";
+    if (isDynamicPhrase) {
+        // Time-based lock: reject identical dynamic phrase if committed within last 4 seconds
+        if (cleanUpper === clientLastDynamicCommitted.gesture && (now - clientLastDynamicCommitted.time < 4000)) {
+            return;
+        }
+        // Sentence token check: reject if sentence already ends with this phrase
+        const tokens = trimmedUpper.split(/\s+/).filter(Boolean);
+        const cleanTokens = cleanUpper.split(/\s+/).filter(Boolean);
+        if (tokens.length >= cleanTokens.length) {
+            const lastNTokens = tokens.slice(-cleanTokens.length).join(" ");
+            if (lastNTokens === cleanTokens.join(" ")) {
+                return;
+            }
+        }
+        clientLastDynamicCommitted = { gesture: cleanUpper, time: now };
+    }
+
     if (clean === "SPACE") {
         if (clientSentence.length > 0 && !clientSentence.endsWith(" ")) {
             clientSentence += " ";
@@ -1416,6 +1704,80 @@ function clearSentence() {
     recentSigns = [];
     renderRecentSigns();
     showToast("Sentence cleared", "info", 2000);
+}
+
+// ── Voice Speech Canvas Helpers ─────────────────────────────────────────────
+function updateVoiceCounters(text) {
+    if (!text || text === '(Waiting for voice input… click "Voice Input" or press [V] to speak)') {
+        if (dom.voiceCharCount) dom.voiceCharCount.textContent = "0 chars";
+        if (dom.voiceWordCount) dom.voiceWordCount.textContent = "0 words";
+        return;
+    }
+    const cleanText = text.trim();
+    const chars = cleanText.length;
+    const words = cleanText ? cleanText.split(/\s+/).length : 0;
+
+    if (dom.voiceCharCount) dom.voiceCharCount.textContent = `${chars} char${chars === 1 ? '' : 's'}`;
+    if (dom.voiceWordCount) dom.voiceWordCount.textContent = `${words} word${words === 1 ? '' : 's'}`;
+}
+
+function updateVoiceDOM() {
+    if (dom.voiceSentenceBox) {
+        const trimmed = voiceSentence.trim();
+        if (!trimmed) {
+            dom.voiceSentenceBox.textContent = '(Waiting for voice input… click "Voice Input" or press [V] to speak)';
+            dom.voiceSentenceBox.className = "empty";
+        } else {
+            dom.voiceSentenceBox.textContent = voiceSentence;
+            dom.voiceSentenceBox.className = "";
+        }
+    }
+    updateVoiceCounters(voiceSentence);
+}
+
+function appendVoiceTranscript(transcript) {
+    if (!transcript) return;
+    const clean = transcript.trim();
+    if (!clean) return;
+
+    if (voiceSentence.length > 0 && !voiceSentence.endsWith(" ")) {
+        voiceSentence += " ";
+    }
+    voiceSentence += clean + " ";
+    updateVoiceDOM();
+}
+
+function clearVoiceSentence() {
+    voiceSentence = "";
+    updateVoiceDOM();
+    showToast("Voice canvas cleared", "info", 2000);
+}
+
+function copyVoiceSentence() {
+    const text = dom.voiceSentenceBox ? dom.voiceSentenceBox.textContent : "";
+    if (!text || text.startsWith("(") || text === "(empty)") {
+        showToast("Voice canvas is empty to copy", "warning");
+        return;
+    }
+
+    navigator.clipboard.writeText(text).then(() => {
+        showToast("Copied voice text to clipboard!", "success");
+    }).catch(() => {
+        showToast("Failed to copy voice text to clipboard", "error");
+    });
+}
+
+function speakVoiceSentence() {
+    const text = dom.voiceSentenceBox ? dom.voiceSentenceBox.textContent : "";
+    if (text && !text.startsWith("(") && text !== "(empty)") {
+        const wasEnabled = isTTSEnabled;
+        isTTSEnabled = true;
+        speakText(text);
+        isTTSEnabled = wasEnabled;
+        showToast("Speaking voice text...", "info", 2000);
+    } else {
+        showToast("Voice canvas is empty", "warning", 2000);
+    }
 }
 
 // ── Gesture Recording Toggle ────────────────────────────────────────────────
@@ -1692,13 +2054,35 @@ function applyTelemetry(data) {
     }
     if (cardL) cardL.classList.toggle("active-driver", isLeftActive);
 
-    // Live gesture label
+    // Live gesture label (Control gestures must show in current sign box with ALL CAPITAL letters)
+    const rawPredUpper = (data.raw_pred || data.prediction || "").toUpperCase().trim();
+    const cleanPredUpper = stripInternalSuffix(data.prediction || "").toUpperCase().trim();
+    const CONTROL_SET = new Set(["START", "STOP", "SPACE", "BACKSPACE", "BACK SPACE", "NEUTRAL", "IDLE"]);
+    const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "J", "Z"]);
+
+    const TWO_HAND_REQUIRED = new Set(["START", "STOP"]);
+
+    let displayGesture = gesture;
+    if (CONTROL_SET.has(rawPredUpper) || CONTROL_SET.has(cleanPredUpper)) {
+        const ctrl = CONTROL_SET.has(rawPredUpper) ? rawPredUpper : cleanPredUpper;
+        const normCtrl = (ctrl === "BACK SPACE") ? "BACKSPACE" : ctrl;
+        if (TWO_HAND_REQUIRED.has(normCtrl) && data.detected_hand !== "both") {
+            displayGesture = "—";
+        } else {
+            displayGesture = normCtrl;
+        }
+    } else if (clientDynamicGesture) {
+        displayGesture = `${clientDynamicGesture} (IN MOTION)`;
+    } else if (rawPredUpper.endsWith("_END") || rawPredUpper.endsWith("_START") || DYNAMIC_GESTURES.has(cleanPredUpper)) {
+        displayGesture = cleanPredUpper;
+    }
+
     if (dom.gestureLabel) {
-        dom.gestureLabel.textContent = gesture;
+        dom.gestureLabel.textContent = displayGesture;
     }
     const currentSignEl = document.getElementById("current-sign");
     if (currentSignEl && currentSignEl !== dom.gestureLabel) {
-        currentSignEl.textContent = gesture;
+        currentSignEl.textContent = displayGesture;
     }
 
     // Live confidence
@@ -1732,8 +2116,9 @@ function applyTelemetry(data) {
     // Dynamic gesture in progress countdown
     if (clientDynamicGesture) {
         const elapsedSec = (now - clientDynamicStartTime) / 1000.0;
-        const remainingSec = Math.max(0, CLIENT_DYNAMIC_MAX_SEC - elapsedSec);
-        const ratio = Math.max(0, Math.min(100, (remainingSec / CLIENT_DYNAMIC_MAX_SEC) * 100));
+        const dynamicMaxSec = (clientDynamicGesture === "NICE TO MEET YOU") ? 4.2 : 3.0;
+        const remainingSec = Math.max(0, dynamicMaxSec - elapsedSec);
+        const ratio = Math.max(0, Math.min(100, (remainingSec / dynamicMaxSec) * 100));
 
         if (dynBanner) {
             dynBanner.style.display = "flex";
@@ -1751,24 +2136,60 @@ function applyTelemetry(data) {
             statePill.className = "state-pill dynamic-active";
         }
 
-        // Abort dynamic gesture if user drops to neutral
-        if (rawPred === "NEUTRAL" || data.is_neutral) {
-            clientDynamicGesture = null;
-            if (dynBanner) dynBanner.style.display = "none";
-            if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
-            if (statePill) {
-                statePill.textContent = isGestureRecordingActive ? "RECORDING" : "STANDBY";
-                statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
+        // Only abort dynamic gesture if user drops to neutral for more than 1.2s continuously
+        const isMomentaryNeutral = (rawPred === "NEUTRAL" || data.is_neutral || !data.prediction || data.prediction === "—");
+        if (isMomentaryNeutral) {
+            if (!clientDynamicNeutralStart) {
+                clientDynamicNeutralStart = now;
+            } else if (now - clientDynamicNeutralStart > 1200) {
+                clientDynamicGesture = null;
+                clientDynamicNeutralStart = 0;
+                if (dynBanner) dynBanner.style.display = "none";
+                if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+                if (statePill) {
+                    statePill.textContent = isGestureRecordingActive ? "RECORDING" : "STANDBY";
+                    statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
+                }
+                clientStabilityBuffer = [];
+                renderStability(0, STABILITY_REQUIRED_COUNT, false);
+                return;
             }
-            clientStabilityBuffer = [];
-            renderStability(0, STABILITY_REQUIRED_COUNT, false);
-            return;
+        } else {
+            clientDynamicNeutralStart = 0;
         }
 
-        const isEndSignal = rawPred.endsWith("_END") || (rawPred === "YOU" && clientDynamicGesture.includes("YOU")) || (rawPred === clientDynamicGesture && elapsedSec >= 1.0);
+        // Check completion trigger: requires minimum elapsed movement time and true final pose
+        let isEndSignal = false;
+        if (clientDynamicGesture === "NICE TO MEET YOU") {
+            // "Nice to meet you" has 3 parts:
+            // 1. NICE (sliding palms, ~0.0s - 1.2s)
+            // 2. MEET (hands together in middle, ~1.2s - 1.5s) -> Must NOT complete early here!
+            // 3. True LAST FRAME (held at >= 1.5s): user performs end pose (Nice to meet you_END or YOU)
+            const isPointingYou = (rawPredUpper === "YOU" || cleanPredUpper === "YOU" || (data.right_gesture && String(data.right_gesture).toUpperCase() === "YOU"));
+            const isNiceEndPose = (rawPredUpper === "NICE TO MEET YOU_END" || rawPredUpper.endsWith("_END"));
+            if ((elapsedSec >= 1.5 && isNiceEndPose) || (elapsedSec >= 1.2 && isPointingYou)) {
+                isEndSignal = true;
+            }
+        } else if (clientDynamicGesture === "HOW ARE YOU") {
+            const isPointingYou = (rawPredUpper === "YOU" || cleanPredUpper === "YOU" || (data.right_gesture && String(data.right_gesture).toUpperCase() === "YOU"));
+            const isHowEndPose = (rawPredUpper === "HOW ARE YOU_END" || rawPredUpper.endsWith("_END"));
+            if (elapsedSec >= 0.65 && (isPointingYou || isHowEndPose)) {
+                isEndSignal = true;
+            }
+        } else {
+            // Other dynamic gestures (e.g. J, Z)
+            if (rawPredUpper.endsWith("_END") && elapsedSec >= 0.4) {
+                isEndSignal = true;
+            }
+        }
         if (isEndSignal) {
             const completedGesture = clientDynamicGesture;
             clientDynamicGesture = null;
+            clientDynamicNeutralStart = 0;
+            clientDynamicCooldownUntil = now + REPEAT_DELAY_MS;
+            clientSuppressYouUntil = now + REPEAT_DELAY_MS;
+            clientLastWord = completedGesture;
+            clientLastTriggerTime = now;
             if (dynBanner) dynBanner.style.display = "none";
             if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
             if (statePill) {
@@ -1777,11 +2198,9 @@ function applyTelemetry(data) {
             }
             if (isGestureRecordingActive) {
                 appendSignToClientSentence(completedGesture);
-                clientSuppressYouUntil = now + 2500;
                 showToast(`Dynamic Sign: ${completedGesture}`, "success");
             }
             clientStabilityBuffer = [];
-            clientLastTriggerTime = now;
             renderStability(0, STABILITY_REQUIRED_COUNT, false);
             return;
         }
@@ -1789,6 +2208,7 @@ function applyTelemetry(data) {
         // Cancel if timeout reached without achieving the completion pose
         if (remainingSec <= 0) {
             clientDynamicGesture = null;
+            clientDynamicNeutralStart = 0;
             if (dynBanner) dynBanner.style.display = "none";
             if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
             if (statePill) {
@@ -1809,18 +2229,32 @@ function applyTelemetry(data) {
         }
     }
 
-    // Initiate dynamic gesture on _START signal with high confidence
-    if (rawPred.endsWith("_START") && confVal >= 0.60) {
-        const candidate = cleanPred.toUpperCase();
+    // Initiate dynamic gesture ONLY on a genuine _START frame with solid confidence
+    // (Never on bare names or _END frames, preventing accidental initiation)
+    const isStartCandidate = (now >= clientDynamicCooldownUntil) && (
+        rawPredUpper.endsWith("_START")
+    );
+    if (isStartCandidate && confVal >= 0.40) {
+        const candidate = cleanPredUpper;
         clientDynamicGesture = candidate;
         clientDynamicStartTime = now;
+        clientDynamicNeutralStart = 0;
+        const candidateMaxSec = (candidate === "NICE TO MEET YOU") ? 4.5 : 3.0;
         if (dynBanner) {
             dynBanner.style.display = "flex";
             if (dynTimerName) dynTimerName.textContent = candidate;
-            if (dynTimerVal) dynTimerVal.textContent = CLIENT_DYNAMIC_MAX_SEC.toFixed(1) + "s";
+            if (dynTimerVal) dynTimerVal.textContent = candidateMaxSec.toFixed(1) + "s";
             if (dynBarFill) dynBarFill.style.width = "100%";
         }
         clientStabilityBuffer = [];
+        return;
+    }
+
+    // Dynamic Frame Guard:
+    // Any uninitiated _END or _START frame is an incomplete fragment that shouldn't be added as static
+    if (rawPredUpper.endsWith("_END") || rawPredUpper.endsWith("_START") || DYNAMIC_GESTURES.has(cleanPredUpper)) {
+        clientStabilityBuffer = [];
+        renderStability(0, STABILITY_REQUIRED_COUNT, false);
         return;
     }
 
@@ -1829,6 +2263,7 @@ function applyTelemetry(data) {
         !data.prediction ||
         data.prediction === "—" ||
         data.is_neutral ||
+        data.detected_hand === "none" ||
         (data.prediction && data.prediction.toUpperCase() === "NEUTRAL") ||
         (data.raw_pred && data.raw_pred.toUpperCase() === "NEUTRAL")
     );
@@ -1845,7 +2280,6 @@ function applyTelemetry(data) {
             if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
         }
         clientStabilityBuffer = [];
-        clientLastWord = "";
         renderStability(0, STABILITY_REQUIRED_COUNT, false);
         return;
     }
@@ -1858,31 +2292,41 @@ function applyTelemetry(data) {
     const isStable = matchCount >= STABILITY_REQUIRED_COUNT;
     renderStability(matchCount, STABILITY_REQUIRED_COUNT, isStable);
 
-    if (isStable && confVal >= 0.55) {
+    if (isStable && confVal >= 0.40) {
         const upper = cleanPred.toUpperCase();
         if (upper === "NEUTRAL" || upper === "IDLE" || upper === "—") {
             clientStabilityBuffer = [];
             return;
         }
-        if (upper === "START") {
-            if (!isGestureRecordingActive) {
-                isGestureRecordingActive = true;
-                updateGestureRecUI(true);
-                speakText("Recording start");
-                showToast("Recording started", "success");
-            }
+        if (DYNAMIC_GESTURES.has(upper)) {
             clientStabilityBuffer = [];
             return;
         }
-        if (upper === "STOP") {
-            if (isGestureRecordingActive) {
-                isGestureRecordingActive = false;
-                updateGestureRecUI(false);
-                speakCompletedSentence(clientSentence);
-                showToast("Recording paused", "info");
+        if (upper === "START" || upper === "STOP") {
+            if (data.detected_hand !== "both" || confVal < 0.55) {
+                clientStabilityBuffer = [];
+                return;
             }
-            clientStabilityBuffer = [];
-            return;
+            if (upper === "START") {
+                if (!isGestureRecordingActive) {
+                    isGestureRecordingActive = true;
+                    updateGestureRecUI(true);
+                    speakText("Recording start");
+                    showToast("Recording started — START gesture detected", "success");
+                }
+                clientStabilityBuffer = [];
+                return;
+            }
+            if (upper === "STOP") {
+                if (isGestureRecordingActive) {
+                    isGestureRecordingActive = false;
+                    updateGestureRecUI(false);
+                    speakCompletedSentence(clientSentence);
+                    showToast("Recording paused — STOP gesture detected", "info");
+                }
+                clientStabilityBuffer = [];
+                return;
+            }
         }
         if (upper === "SPACE") {
             if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
@@ -1898,6 +2342,25 @@ function applyTelemetry(data) {
                 clientLastTriggerTime = now;
             }
             clientStabilityBuffer = [];
+            return;
+        }
+
+        if (upper === "YOU" && clientDynamicGesture) {
+            const completedGesture = clientDynamicGesture;
+            clientDynamicGesture = null;
+            clientDynamicNeutralStart = 0;
+            clientDynamicCooldownUntil = now + REPEAT_DELAY_MS;
+            clientSuppressYouUntil = now + REPEAT_DELAY_MS;
+            clientLastWord = completedGesture;
+            clientLastTriggerTime = now;
+            if (dynBanner) dynBanner.style.display = "none";
+            if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+            if (isGestureRecordingActive) {
+                appendSignToClientSentence(completedGesture);
+                showToast(`Dynamic Sign: ${completedGesture}`, "success");
+            }
+            clientStabilityBuffer = [];
+            renderStability(0, STABILITY_REQUIRED_COUNT, false);
             return;
         }
 
@@ -1986,4 +2449,5 @@ window.addEventListener("keydown", (e) => {
 
 // ── Initialize Client Webcam & Isolated UI ──────────────────────────────────
 updateSentenceDOM();
+updateVoiceDOM();
 startClientWebcam();

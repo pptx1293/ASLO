@@ -206,35 +206,40 @@
         <aside class="console">
             <div class="console-scrollable">
 
-                <!-- Sentence Translation & Dialogue Canvas (Primary Focus: User's Recent Text & Conversation) -->
-                <section class="card sentence-card">
+                <!-- ── 1. Sign Language Translation Canvas ──────────────── -->
+                <section class="card sentence-card sign-canvas-card">
                     <div class="card-header">
-                        <div class="view-switch-tabs">
-                            <button id="tab-canvas" class="view-tab-btn active" onclick="switchCanvasTab('canvas')">
-                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                                    <polyline points="4 7 4 4 20 4 20 7"></polyline>
-                                    <line x1="9" y1="20" x2="15" y2="20"></line>
-                                    <line x1="12" y1="4" x2="12" y2="20"></line>
-                                </svg>
-                                <span>Translation Canvas</span>
-                            </button>
-                            <button id="tab-dialogue" class="view-tab-btn" onclick="switchCanvasTab('dialogue')">
-                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                                </svg>
-                                <span>Dialogue Log</span>
-                            </button>
-                        </div>
+                        <span class="card-title" style="margin:0; font-size:0.85rem; font-weight:700; color:var(--text-white); display:flex; align-items:center; gap:6px;">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="color:var(--cyan);">
+                                <path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"></path>
+                                <path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"></path>
+                                <path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"></path>
+                                <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"></path>
+                            </svg>
+                            <span>Sign Language Canvas</span>
+                        </span>
 
                         <div class="sentence-header-tools">
+                            <button class="tool-icon-btn" onclick="clearSentence()" title="Clear Sign Canvas">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="3 6 5 6 21 6"></polyline>
+                                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                                </svg>
+                            </button>
+                            <button class="tool-icon-btn" onclick="speakWholeSentence()" title="Speak Sign Sentence">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                                </svg>
+                            </button>
                             <button class="tool-icon-btn" onclick="copySentence()" title="Copy to clipboard">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                                     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                                 </svg>
                             </button>
                             <button class="tool-icon-btn" onclick="downloadTranscript()" title="Download text">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                                     <polyline points="7 10 12 15 17 10"></polyline>
                                     <line x1="12" y1="15" x2="12" y2="3"></line>
@@ -244,18 +249,61 @@
                     </div>
 
                     <div class="sentence-viewport" id="viewport-canvas">
-                        <div id="sentence-box" class="empty">(empty)</div>
-                    </div>
-
-                    <div class="sentence-viewport dialogue-viewport" id="viewport-dialogue" style="display:none;">
-                        <div id="dialogue-feed" class="dialogue-feed">
-                            <div class="dialogue-placeholder">Two-way conversation log will appear here as signs and voice are captured.</div>
-                        </div>
+                        <div id="sentence-box" class="empty">(Waiting for signs… sign START to begin)</div>
                     </div>
 
                     <div class="sentence-footer">
-                        <span id="char-count">0 chars</span>
-                        <span id="word-count">0 words</span>
+                        <span class="source-tag sign-tag">✋ Hand Gestures</span>
+                        <div>
+                            <span id="char-count">0 chars</span> · <span id="word-count">0 words</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ── 2. Voice Speech Transcription Canvas ──────────────── -->
+                <section class="card voice-card voice-canvas-card">
+                    <div class="card-header">
+                        <span class="card-title" style="margin:0; font-size:0.85rem; font-weight:700; color:var(--text-white); display:flex; align-items:center; gap:6px;">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="color:var(--purple);">
+                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                                <line x1="12" y1="19" x2="12" y2="23"></line>
+                                <line x1="8" y1="23" x2="16" y2="23"></line>
+                            </svg>
+                            <span>Voice Speech Canvas</span>
+                        </span>
+
+                        <div class="sentence-header-tools">
+                            <button class="tool-icon-btn" onclick="clearVoiceSentence()" title="Clear Voice Canvas">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="3 6 5 6 21 6"></polyline>
+                                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                                </svg>
+                            </button>
+                            <button class="tool-icon-btn" onclick="speakVoiceSentence()" title="Speak Voice Text">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                                </svg>
+                            </button>
+                            <button class="tool-icon-btn" onclick="copyVoiceSentence()" title="Copy Voice Text">
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="sentence-viewport voice-viewport" id="viewport-voice">
+                        <div id="voice-sentence-box" class="empty">(Waiting for voice input… click "Voice Input" or press [V] to speak)</div>
+                    </div>
+
+                    <div class="sentence-footer">
+                        <span class="source-tag voice-tag">🎙️ Speech-to-Text</span>
+                        <div>
+                            <span id="voice-char-count">0 chars</span> · <span id="voice-word-count">0 words</span>
+                        </div>
                     </div>
                 </section>
 
@@ -321,12 +369,11 @@
                         </button>
                     </div>
 
-                    <!-- Target Destination Selector & Status Indicator -->
+                    <!-- Status Indicator -->
                     <div class="stt-footer-bar">
-                        <label class="stt-toggle-label" title="When active, voice transcription appends directly to the Translation Canvas">
-                            <input type="checkbox" id="stt-append-checkbox" checked>
-                            <span>Append to Canvas</span>
-                        </label>
+                        <span class="stt-dest-badge" title="Voice audio automatically transcribes into the dedicated Voice Speech Canvas">
+                            <span class="stt-dest-dot"></span> Output: Voice Canvas
+                        </span>
                         <div id="stt-indicator" class="stt-indicator">
                             <span class="stt-dot"></span>
                             <span id="stt-indicator-text">Voice input standby</span>
@@ -381,13 +428,6 @@
                         <polygon points="10 8 16 12 10 16 10 8"></polygon>
                     </svg>
                     Start Recording
-                </button>
-
-                <button class="btn-action btn-stop-server" id="stop-btn" onclick="stopServer()" title="Stop Python Server">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
-                        <line x1="12" y1="2" x2="12" y2="12"></line>
-                    </svg>
                 </button>
             </footer>
         </aside>

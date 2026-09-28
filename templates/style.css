@@ -1450,6 +1450,78 @@ button:focus-visible {
     font-family: var(--font-mono);
 }
 
+.source-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 7px;
+    border-radius: var(--radius-pill);
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.source-tag.sign-tag {
+    background: rgba(0, 240, 255, 0.1);
+    color: var(--cyan);
+    border: 1px solid rgba(0, 240, 255, 0.3);
+}
+
+.source-tag.voice-tag {
+    background: rgba(168, 85, 247, 0.12);
+    color: #c084fc;
+    border: 1px solid rgba(168, 85, 247, 0.35);
+}
+
+.voice-card {
+    border-color: rgba(168, 85, 247, 0.22);
+    box-shadow: 0 4px 20px rgba(168, 85, 247, 0.08);
+}
+
+.voice-card:hover {
+    border-color: rgba(168, 85, 247, 0.4);
+}
+
+.voice-viewport {
+    background: rgba(14, 10, 24, 0.65);
+    border: 1px solid rgba(168, 85, 247, 0.18);
+}
+
+#voice-sentence-box {
+    font-family: var(--font-mono);
+    font-weight: 500;
+    font-size: 1.12rem;
+    color: #f3e8ff;
+    line-height: 1.5;
+    word-break: break-word;
+    letter-spacing: 0.5px;
+}
+
+#voice-sentence-box.empty {
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.88rem;
+    font-family: var(--font-sans);
+}
+
+.stt-dest-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.7rem;
+    color: #c084fc;
+    font-weight: 600;
+}
+
+.stt-dest-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #c084fc;
+    box-shadow: 0 0 6px #c084fc;
+}
+
 /* ── Active Learning / Model Correction Hub ──────────────────────────── */
 .teaching-input-group {
     display: flex;

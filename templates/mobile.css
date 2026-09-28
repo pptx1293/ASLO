@@ -775,6 +775,25 @@ body {
     50%, 100% { opacity: 0; }
 }
 
+.m-voice-card {
+    border-color: rgba(168, 85, 247, 0.25);
+    background: rgba(16, 12, 28, 0.82);
+    box-shadow: 0 6px 22px rgba(168, 85, 247, 0.08);
+}
+
+.m-voice-transcript-box {
+    background: rgba(12, 8, 22, 0.85);
+    border: 1px solid rgba(168, 85, 247, 0.2);
+    color: #f3e8ff;
+}
+
+.m-voice-transcript-box.empty .m-voice-text-content {
+    color: var(--text-muted);
+    font-style: italic;
+    font-weight: 500;
+    font-size: 0.95rem;
+}
+
 /* Quick Touch Action Controls */
 .m-quick-actions {
     display: flex;
@@ -821,6 +840,55 @@ body {
 .btn-m-action.danger:active {
     background: rgba(244, 63, 94, 0.2);
     border-color: var(--ruby);
+}
+
+.btn-m-action.mic {
+    background: rgba(168, 85, 247, 0.12);
+    border-color: rgba(168, 85, 247, 0.35);
+    color: #c084fc;
+}
+
+.btn-m-action.mic:active {
+    background: rgba(168, 85, 247, 0.25);
+}
+
+.btn-m-action.mic.recording {
+    background: rgba(244, 63, 94, 0.25);
+    border-color: var(--ruby);
+    color: #fff;
+    box-shadow: 0 0 15px rgba(244, 63, 94, 0.5);
+    animation: mRecPulse 1s infinite alternate;
+}
+
+.btn-dock-icon.mic-active {
+    background: rgba(244, 63, 94, 0.25) !important;
+    border-color: var(--ruby) !important;
+    color: #fff !important;
+    box-shadow: 0 0 16px rgba(244, 63, 94, 0.6);
+    animation: mRecPulse 1s infinite alternate;
+}
+
+.m-stt-preview {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    background: rgba(168, 85, 247, 0.15);
+    border: 1px solid rgba(168, 85, 247, 0.4);
+    color: #e9d5ff;
+    font-size: 0.82rem;
+    font-weight: 600;
+    margin-top: 4px;
+}
+
+.m-stt-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #f43f5e;
+    box-shadow: 0 0 8px #f43f5e;
+    animation: mDotPulse 0.7s infinite alternate;
 }
 
 /* ── Mobile Bottom Floating Touch Dock ─────────────────────────────────── */

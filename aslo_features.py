@@ -19,7 +19,7 @@ class HandLandmarks:
 
     def __init__(self, raw_points):
         self.landmark = []
-        if raw_points:
+        if raw_points is not None and len(raw_points) > 0:
             for p in raw_points:
                 if isinstance(p, dict):
                     self.landmark.append(LandmarkPoint(p.get("x", 0.0), p.get("y", 0.0), p.get("z", 0.0)))
@@ -337,39 +337,49 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
 
     # ── 1. ANATOMICAL DISAMBIGUATION: X vs P vs Q vs Z / D ───────────────────
     # Distinguishing metrics:
-    # 1. idx_dy = pts_norm[8][1] - pts_norm[5][1]:
-    #    In X: index tip is UPWARD relative to knuckle (idx_dy <= 0.05, typically negative).
-    #    In P: index points DOWNWARD/forward (idx_dy > 0.08, typically 0.12 - 0.25).
-    #    In Q: index points SHARPLY DOWNWARD (idx_dy > 0.35, typically 0.50 - 0.70).
-    # 2. d_idx_thb = distance(index_tip, thumb_tip):
-    #    In X: thumb folded over fist, FAR from index tip (d_idx_thb >= 0.35).
-    #    In P: thumb touches or is very close to index/middle (d_idx_thb < 0.35).
-    # 3. idx_tip_pip:
-    #    In X: index finger is bent into a pirate hook (idx_tip_pip <= 0.24).
-    #    In D/Z: index finger is extended straight up (idx_tip_pip > 0.25 and idx_ext >= 1.20).
+    # 1. pip_bend_deg: 2D angle between MCP->PIP and PIP->TIP vectors
+    #    In X: Index finger is crooked into a hook (pip_bend_deg >= 20.0°, mean ~52°).
+    #    In Z/D: Index finger is straight upright (pip_bend_deg < 18.0°, mean ~3°).
+    # 2. idx_dy = pts_norm[8][1] - pts_norm[5][1]:
+    #    In X: index tip is upward relative to knuckle (idx_dy <= 0.12).
+    #    In P: index points forward/downward and middle finger points downward.
+    #    In Q: index points sharply downward towards floor (idx_dy > 0.35).
+    # 3. Middle finger extension & direction:
+    #    In X: middle finger is tightly folded in a fist (mid_ext < 1.20, pts[12][1] < pts[0][1]).
+    #    In P: middle finger is extended downward (pts[12][1] > pts[9][1] + 0.03).
+
+    v_knuckle_pip = pts[6][:2] - pts[5][:2]
+    v_pip_tip = pts[8][:2] - pts[6][:2]
+    cos_pip = np.dot(v_knuckle_pip, v_pip_tip) / (np.linalg.norm(v_knuckle_pip) * np.linalg.norm(v_pip_tip) + 1e-6)
+    pip_bend_deg = float(np.arccos(np.clip(cos_pip, -1.0, 1.0)) * 180 / np.pi)
 
     is_upright = (pts[5][1] < pts[0][1] - 0.02)
     is_fist_others = (mid_ext < 1.25 and ring_ext < 1.25 and pky_ext < 1.25)
     idx_tip_pip = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[6][:2]))
     idx_dy = float(pts_norm[8][1] - pts_norm[5][1])
-    d_idx_thb = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[4][:2]))
-    is_hooked = (idx_tip_pip <= 0.24 and idx_dy <= 0.05 and d_idx_thb >= 0.35)
+
+    # In X: hand is upright, middle/ring/pinky in fist, index is crooked (pip_bend_deg >= 20.0 or idx_tip_pip <= 0.22)
+    # and not pointing to floor (idx_dy <= 0.12)
+    is_hooked = (pip_bend_deg >= 20.0 or (idx_tip_pip <= 0.22 and idx_ext < 1.70))
+    is_middle_curled = (pts[12][1] < pts[0][1] or mid_ext < 1.10)
+    is_x_anatomy = (is_upright and is_fist_others and is_hooked and idx_dy <= 0.12 and is_middle_curled)
 
     lbl_clean = label.lower()
     if lbl_clean in ["x", "p", "q", "z", "z_start", "z_end", "d"]:
-        # Hooked index upright in a fist -> DEFINITIVELY X
-        if is_upright and is_fist_others and is_hooked:
+        # Hooked index upright in a fist -> DEFINITIVELY X (protected from low-light P/Q/Z jitter)
+        if is_x_anatomy:
             return "X"
 
-        # Downward pointing index -> P or Q
-        if idx_dy > 0.08:
-            if idx_dy > 0.35:
-                return "Q"
-            else:
-                return "P"
+        # Sharp downward pointing index -> Q
+        if idx_dy > 0.35:
+            return "Q"
+
+        # Downward pointing index or extended downward middle finger -> P
+        if idx_dy > 0.08 or (not is_fist_others and mid_ext >= 1.05 and pts[12][1] > pts[9][1]):
+            return "P"
 
         # Straight upright index finger -> D (static) or Z (dynamic)
-        if idx_ext >= 1.20 and idx_tip_pip > 0.25 and is_fist_others:
+        if idx_ext >= 1.20 and pip_bend_deg < 20.0:
             return "D" if route_mode == "STATIC" else "Z"
 
         # If raw prediction was X and hand is upright with other fingers in fist
@@ -388,53 +398,131 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
     # Both ME and YOU feature single-hand extended index with other fingers in fist.
     # IN YOU: Index points OUTWARD/FORWARD towards camera/interlocutor (dx >= 0.015).
     # IN ME: Index points INWARD towards signer's own chest (dx < 0.012).
-    if lbl_clean in ["me", "you", "how are you_start", "how are you", "d"] and is_fist_others and idx_ext >= 1.15:
+    if lbl_clean in ["me", "you", "d"] and is_fist_others and idx_ext >= 1.15:
         dx_idx = pts[8][0] - pts[5][0]
         if dx_idx < 0.012:
             return "ME"
         elif dx_idx >= 0.015:
             return "YOU"
 
-    # ── 3. U vs R vs V vs W DISAMBIGUATION ─────────────────────────────────────
+    # ── 3. TWO-FINGER & THREE-FINGER FAMILY: H vs U vs V vs R vs W vs K ───
     # ASL anatomy:
-    # W: Exactly 3 fingers extended: Index + Middle + Ring straight up. Pinky curled.
-    # U: Index + Middle straight up, held together. Ring and Pinky curled.
-    # V: Index + Middle straight up, spread apart in 'V'. Ring and Pinky curled.
-    # R: Index + Middle straight up, crossed over each other. Ring and Pinky curled.
-    if label in ["u", "v", "r", "w"]:
-        is_ring_up = (ring_ext >= 1.25 and pts[16][1] < pts[14][1])
-        is_idx_mid_up = (idx_ext >= 1.20 and mid_ext >= 1.20)
+    # H: Index + Middle extended HORIZONTALLY (sideways across body/chest). Ring & Pinky curled.
+    # W: Exactly 3 fingers extended VERTICALLY UP: Index + Middle + Ring. Pinky curled.
+    # U: Index + Middle extended VERTICALLY UP, held together side-by-side. Ring & Pinky curled.
+    # V: Index + Middle extended VERTICALLY UP, spread apart in 'V' shape. Ring & Pinky curled.
+    # R: Index + Middle extended VERTICALLY UP, crossed over each other. Ring & Pinky curled.
+    # K: Index + Middle extended VERTICALLY UP with thumb upright between knuckles.
+    is_idx_mid_ext = (idx_ext >= 1.05 and mid_ext >= 1.05)
+    is_two_finger_family = is_idx_mid_ext and (
+        lbl_clean in ["u", "v", "r", "w", "k", "h", "d"]
+        or (ring_ext < 1.35 and pky_ext < 1.30)
+    )
 
-        # 3.1: W Detection (Ring finger is extended alongside index and middle)
-        if is_ring_up and is_idx_mid_up and pky_ext < 1.25:
+    if is_two_finger_family:
+        v_idx = pts_norm[8][:2] - pts_norm[5][:2]
+        v_mid = pts_norm[12][:2] - pts_norm[9][:2]
+        v_ring = pts_norm[16][:2] - pts_norm[13][:2]
+
+        # Horizontal orientation test (pointing sideways across body):
+        # In H, index/middle fingers point sideways: |dx| dominates or |dy| is small.
+        # In U/V/R/W, fingers point strictly upward: dy < -0.15 and |dy| > 1.1 * |dx|.
+        idx_dx, idx_dy = abs(float(v_idx[0])), float(v_idx[1])
+        mid_dx, mid_dy = abs(float(v_mid[0])), float(v_mid[1])
+
+        is_horizontal = (
+            (idx_dx >= abs(idx_dy) * 0.70 or mid_dx >= abs(mid_dy) * 0.70)
+            and (idx_dy > -0.22 or idx_dx > abs(idx_dy))
+        )
+        is_strictly_upright = (idx_dy < -0.20 and abs(idx_dy) > idx_dx * 1.15)
+
+        # 3.1: H Detection
+        # Hand is pointing horizontally/sideways, index and middle extended, pinky curled
+        if pky_ext < 1.30 and (is_horizontal or (lbl_clean == "h" and not is_strictly_upright)):
+            return "H"
+
+        # 3.2: W Detection (Ring finger extended alongside index and middle, pointing UP)
+        is_ring_upright = (
+            ring_ext >= 1.20
+            and pts[16][1] < pts[13][1] - 0.03
+            and v_ring[1] < -0.12
+            and not is_horizontal
+        )
+        if is_ring_upright and is_idx_mid_ext and pky_ext < 1.25:
             return "W"
 
-        # Ring finger is curled into palm: CANNOT be W, must be U, V, or R
-        # Horizontal direction vector along knuckle line
-        x_dir = pts_norm[9][:2] - pts_norm[5][:2]
-        n_dir = np.linalg.norm(x_dir)
-        if n_dir > 1e-6:
-            x_dir = x_dir / n_dir
-        else:
-            x_dir = np.array([1.0, 0.0], dtype=np.float32)
+        # Ring finger is curled into palm: Must be U, V, R, or K (Upright hand)
+        if ring_ext < 1.30 and pky_ext < 1.25:
+            # Knuckle vector 5->9
+            vk = pts_norm[9][:2] - pts_norm[5][:2]
+            d_k = float(np.linalg.norm(vk))
+            vk_u = vk / (d_k + 1e-6)
 
-        proj_idx = float(np.dot(pts_norm[8][:2], x_dir))
-        proj_mid = float(np.dot(pts_norm[12][:2], x_dir))
-        # In uncrossed right hand: proj_mid > proj_idx. In crossed hand (R): index crosses over
-        cross_diff = proj_idx - proj_mid
+            # Tip vector 8->12
+            vt = pts_norm[12][:2] - pts_norm[8][:2]
+            d_t = float(np.linalg.norm(vt))
 
-        # 3.2: Crossed fingers (R)
-        if cross_diff > 0.045:
-            return "R"
+            proj_ratio = float(np.dot(vt, vk_u)) / (d_k + 1e-6)
+            d_ratio = d_t / (d_k + 1e-6)
 
-        # 3.3: Spread apart (V) vs Together (U)
-        d_idx_mid = float(np.linalg.norm(pts_norm[8][:2] - pts_norm[12][:2]))
-        if d_idx_mid >= 0.11 or (label == "v" and d_idx_mid >= 0.08):
-            return "V"
-        elif label == "r" and cross_diff > 0.03:
-            return "R"
-        else:
+            u_idx = v_idx / (np.linalg.norm(v_idx) + 1e-6)
+            u_mid = v_mid / (np.linalg.norm(v_mid) + 1e-6)
+            cos_ang = np.clip(np.dot(u_idx, u_mid), -1.0, 1.0)
+            ang_deg = float(np.arccos(cos_ang) * 180.0 / np.pi)
+
+            # 3.3: R Detection (Fingers crossed over each other)
+            is_crossed = (
+                proj_ratio < 0.0
+                or (lbl_clean == "r" and proj_ratio <= 0.60)
+                or (proj_ratio <= 0.35 and d_ratio <= 1.0)
+                or (d_t <= 0.055 and proj_ratio <= 0.40)
+            )
+            if is_crossed:
+                return "R"
+
+            # 3.4: V Detection (Fingers spread wide apart in a distinct 'V')
+            if not is_crossed and proj_ratio > 0.60 and d_t >= 0.115 and (d_ratio >= 1.65 or proj_ratio >= 1.40 or ang_deg >= 6.5):
+                return "V"
+            if not is_crossed and lbl_clean == "v" and d_t >= 0.105 and d_ratio >= 1.50 and proj_ratio >= 1.30:
+                return "V"
+
+            # 3.5: K Detection (Thumb upright between index and middle knuckles)
+            if lbl_clean == "k" and pts[4][1] < pts[9][1]:
+                return "K"
+
+            # 3.6: Fallback for horizontal hand if not caught earlier
+            if is_horizontal or lbl_clean == "h":
+                return "H"
+
+            # 3.7: U Detection (Default for parallel, side-by-side uncrossed upright index+middle)
             return "U"
+
+    # ── HELLO vs B DISAMBIGUATION ─────────────────────────────────────────────
+    # Both have 4 fingers (index, middle, ring, pinky) extended vertically.
+    # In 'HELLO': Hand is raised higher near the temple/head (wrist_y <= 0.38)
+    #             and thumb is extended outward/open (thumb tip to pinky mcp distance >= 0.26).
+    # In 'B': Hand is held at chest/mid-level (wrist_y > 0.38)
+    #        and thumb is folded tightly across front of palm (thumb tip to pinky mcp < 0.26).
+    if label in ["b", "hello"]:
+        all_four_up = (idx_ext >= 1.15 and mid_ext >= 1.15 and ring_ext >= 1.15 and pky_ext >= 1.15)
+        if all_four_up:
+            d_thb_pky_norm = float(np.linalg.norm(pts_norm[4][:2] - pts_norm[17][:2]))
+            wrist_y = float(pts[0][1])
+            if wrist_y <= 0.38 or d_thb_pky_norm >= 0.26:
+                return "HELLO"
+            else:
+                return "B"
+
+    # ── ME vs START vs HOW ARE YOU Disambiguation ────────────────────────────
+    # In 'ME', the user points the index finger towards their chest/body (downward/inward, idx_dy > 0.15)
+    # while the other fingers (middle, ring, pinky) are folded or curled.
+    # In 'START' or 'HOW ARE YOU_START', both hands are open and moving horizontally.
+    if label in ["me", "start", "how are you_start"]:
+        idx_downward = float(pts[8][1] - pts[5][1]) # y positive downward
+        pky_folded = (pky_ext < 1.25)
+        mid_folded = (mid_ext < 1.30)
+        if idx_downward > 0.15 and pky_folded and mid_folded:
+            return "ME"
 
     # ── 4. E vs O DISAMBIGUATION ───────────────────────────────────────────────
     if label in ["e", "o"]:

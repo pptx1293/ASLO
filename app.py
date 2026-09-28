@@ -80,8 +80,31 @@ if os.path.exists(DATASET_DIR):
             FOLDER_NAMES_MAP[fname.lower().replace(" ", "_").strip()] = fname
 
 NEUTRAL_INDEX = None
-if label_classes is not None and "neutral" in list(label_classes):
-    NEUTRAL_INDEX = list(label_classes).index("neutral")
+ME_INDEX = None
+X_INDEX = None
+U_INDEX = None
+V_INDEX = None
+R_INDEX = None
+H_INDEX = None
+W_INDEX = None
+if label_classes is not None:
+    classes_list = list(label_classes)
+    if "neutral" in classes_list:
+        NEUTRAL_INDEX = classes_list.index("neutral")
+    if "ME" in classes_list:
+        ME_INDEX = classes_list.index("ME")
+    if "X" in classes_list:
+        X_INDEX = classes_list.index("X")
+    if "U" in classes_list:
+        U_INDEX = classes_list.index("U")
+    if "V" in classes_list:
+        V_INDEX = classes_list.index("V")
+    if "R" in classes_list:
+        R_INDEX = classes_list.index("R")
+    if "H" in classes_list:
+        H_INDEX = classes_list.index("H")
+    if "W" in classes_list:
+        W_INDEX = classes_list.index("W")
 
 
 def get_clean_folder_label(label: str):
@@ -105,17 +128,19 @@ def get_clean_folder_label(label: str):
 def clean_display_label(label: str) -> str:
     if not label or str(label).strip() in ("—", "none", "NONE", "IDLE"):
         return "—"
-    lbl_lower = str(label).strip().lower()
-    if lbl_lower in ("neutral", "idle"):
-        return "NEUTRAL"
+    lbl_strip = str(label).strip()
+    lbl_upper = lbl_strip.upper()
+    if lbl_upper in ("START", "STOP", "SPACE", "BACKSPACE", "BACK SPACE", "NEUTRAL", "IDLE"):
+        return "BACKSPACE" if "BACK" in lbl_upper else lbl_upper
     folder = get_clean_folder_label(label)
     if folder:
-        if folder.strip().lower() in ("neutral", "idle"):
-            return "NEUTRAL"
+        f_upper = folder.strip().upper()
+        if f_upper in ("START", "STOP", "SPACE", "BACKSPACE", "BACK SPACE", "NEUTRAL", "IDLE"):
+            return "BACKSPACE" if "BACK" in f_upper else f_upper
         return folder
-    cleaned = re.sub(r'_(START|END)$', '', str(label), flags=re.IGNORECASE).strip()
-    if cleaned.lower() in ("neutral", "idle"):
-        return "NEUTRAL"
+    cleaned = re.sub(r'_(START|END)$', '', lbl_strip, flags=re.IGNORECASE).strip()
+    if cleaned.upper() in ("START", "STOP", "SPACE", "BACKSPACE", "BACK SPACE", "NEUTRAL", "IDLE"):
+        return "BACKSPACE" if "BACK" in cleaned.upper() else cleaned.upper()
     return cleaned if cleaned else "—"
 
 
@@ -226,8 +251,26 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             "status": "running"
         }
 
-    # Case 1: Two hands detected
+    is_two_hand_inference = False
     if all_hands and len(all_hands) >= 2:
+        h0_pts = all_hands[0].get("points", [])
+        h1_pts = all_hands[1].get("points", [])
+
+        # Phantom Hand Filter: wrists must be physically separated in space
+        is_phantom_duplicate = False
+        if h0_pts and h1_pts and len(h0_pts) >= 1 and len(h1_pts) >= 1:
+            w0 = np.array([h0_pts[0][0], h0_pts[0][1]])
+            w1 = np.array([h1_pts[0][0], h1_pts[0][1]])
+            d_wrists = float(np.linalg.norm(w0 - w1))
+            if d_wrists < 0.14:
+                is_phantom_duplicate = True
+
+        if is_phantom_duplicate:
+            landmarks_data = h0_pts
+        else:
+            is_two_hand_inference = True
+
+    if is_two_hand_inference:
         h0_pts = all_hands[0].get("points", [])
         h1_pts = all_hands[1].get("points", [])
         h0_label = (all_hands[0].get("label") or "Right").capitalize().strip()
@@ -263,6 +306,12 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             both_live_gesture = "NEUTRAL"
             conf_both = max(prob_both_neutral, conf_both)
 
+        # Check if ME is indicated
+        prob_both_me = float(p_both[ME_INDEX]) if (ME_INDEX is not None and ME_INDEX < len(p_both)) else 0.0
+        if label_both.upper() == "ME" or (prob_both_me >= 0.25 and conf_both < 0.65):
+            label_both = "ME"
+            conf_both = max(prob_both_me, conf_both)
+
         # Right single-hand inference
         feats_r = aslo_features.extract_single_hand_features(r_lms, is_left_hand=False)
         p_r = np.array(model(np.array([feats_r], dtype=np.float32), training=False))[0]
@@ -284,22 +333,36 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
         y_r = r_lms.landmark[0].y
         y_l = l_lms.landmark[0].y
-        both_raised = (y_r < 0.85 and y_l < 0.85 and abs(y_r - y_l) < 0.40)
+        is_dynamic_two_handed = label_both.upper() in ("HOW ARE YOU_START", "HOW ARE YOU_END", "NICE TO MEET YOU_START", "NICE TO MEET YOU_END")
+        both_raised = (y_r < 0.90 and y_l < 0.92) if is_dynamic_two_handed else (y_r < 0.85 and y_l < 0.85 and abs(y_r - y_l) < 0.40)
         is_two_handed = both_raised and (
             label_both.upper() in TWO_HANDED_LABELS
-            or label_both.upper() in ("HOW ARE YOU_START", "HOW ARE YOU_END", "NICE TO MEET YOU_START", "NICE TO MEET YOU_END")
+            or is_dynamic_two_handed
         )
         is_control_sign = label_both.upper() in ("START", "STOP", "SPACE", "BACKSPACE", "BACK SPACE")
-        req_conf = 0.30 if is_control_sign else 0.40
+        if is_control_sign:
+            req_conf = 0.50
+        elif is_dynamic_two_handed:
+            req_conf = 0.30
+        else:
+            req_conf = 0.40
 
         if is_two_handed and conf_both >= req_conf:
             pred_label = label_both
             confidence = conf_both
             detected_hand = "both"
         else:
-            pred_label = heur_r
-            confidence = conf_r
-            detected_hand = "right"
+            if str(heur_r).upper() in ("START", "STOP"):
+                heur_r = "—"
+                conf_r = 0.0
+            if is_dynamic_two_handed and conf_both >= 0.25:
+                pred_label = label_both
+                confidence = conf_both
+                detected_hand = "both"
+            else:
+                pred_label = heur_r
+                confidence = conf_r
+                detected_hand = "right"
 
     # Case 2: Single Right hand detected
     else:
@@ -314,6 +377,11 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         # Check if neutral probability is elevated or hand is in resting position
         wrist_y = single_lms.landmark[0].y
         prob_neutral = float(probs[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(probs)) else 0.0
+        prob_me = float(probs[ME_INDEX]) if (ME_INDEX is not None and ME_INDEX < len(probs)) else 0.0
+        prob_x = float(probs[X_INDEX]) if (X_INDEX is not None and X_INDEX < len(probs)) else 0.0
+        prob_u = float(probs[U_INDEX]) if (U_INDEX is not None and U_INDEX < len(probs)) else 0.0
+        prob_h = float(probs[H_INDEX]) if (H_INDEX is not None and H_INDEX < len(probs)) else 0.0
+        prob_w = float(probs[W_INDEX]) if (W_INDEX is not None and W_INDEX < len(probs)) else 0.0
 
         is_neutral = (
             raw_pred.lower() == "neutral"
@@ -325,11 +393,36 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             heur = "NEUTRAL"
             conf = max(prob_neutral, conf if raw_pred.lower() == "neutral" else 0.60)
         else:
+            if prob_me >= 0.22 and conf < 0.65:
+                raw_pred = "ME"
+                conf = max(prob_me, conf)
+            elif prob_x >= 0.15 and raw_pred.upper() in ("P", "Q", "Z", "Z_START", "Z_END", "D") and conf < 0.75:
+                raw_pred = "X"
+                conf = max(prob_x, conf)
+            elif prob_h >= 0.15 and raw_pred.upper() in ("U", "W", "V", "R") and conf < 0.75:
+                raw_pred = "H"
+                conf = max(prob_h, conf)
             heur = aslo_features.apply_heuristics(single_lms, raw_pred, is_left_hand=False, confidence=conf)
             cand_clean = clean_display_label(heur).lower()
-            if cand_clean in ("how are you", "nice to meet you", "fine"):
+
+            # START and STOP strictly require both hands; never allow them from single-hand inference
+            if str(heur).upper() in ("START", "STOP") or raw_pred.upper() in ("START", "STOP") or cand_clean in ("start", "stop"):
                 heur = "—"
                 conf = 0.0
+
+            if cand_clean in ("how are you", "nice to meet you"):
+                # Both _START and _END frames of dynamic signs are valid in single-hand detection!
+                # In "Nice to meet you", the opening phase ("Nice") has palms touching/sliding,
+                # which MediaPipe frequently detects as 1 merged hand.
+                # In "How are you", initial hand elevation may register 1 hand before both are tracked.
+                if raw_pred.upper().endswith("_START") or raw_pred.upper().endswith("_END") or str(heur).upper().endswith("_START") or str(heur).upper().endswith("_END"):
+                    heur = raw_pred.upper()
+            elif cand_clean == "fine":
+                if raw_pred.upper().endswith("_END") or str(heur).upper().endswith("_END"):
+                    heur = raw_pred.upper()
+                else:
+                    heur = "—"
+                    conf = 0.0
 
         pred_label = heur
         confidence = conf
@@ -342,12 +435,32 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
     clean_l = clean_display_label(left_live_gesture) if left_live_gesture != "TRACKED" else "TRACKED"
     clean_both = clean_display_label(both_live_gesture)
 
+    # Final safeguard: START and STOP strictly require both hands!
+    if detected_hand != "both":
+        if str(pred_label).upper() in ("START", "STOP"):
+            pred_label = "—"
+            confidence = 0.0
+        if str(clean_pred).upper() in ("START", "STOP"):
+            clean_pred = "—"
+            confidence = 0.0
+        if str(right_live_gesture).upper() in ("START", "STOP"):
+            right_live_gesture = "—"
+            right_live_conf = 0.0
+
     is_neutral_signal = (clean_pred == "NEUTRAL" or pred_label == "NEUTRAL" or clean_pred == "—")
+    is_dynamic_signal = bool(
+        pred_label and (
+            str(pred_label).upper().endswith("_START") or
+            str(pred_label).upper().endswith("_END") or
+            str(pred_label).upper() in ("HOW ARE YOU", "NICE TO MEET YOU")
+        )
+    )
 
     return {
         "ok": True,
         "prediction": clean_pred,
         "raw_pred": pred_label,
+        "is_dynamic": is_dynamic_signal,
         "confidence": float(round(confidence, 2)),
         "detected_hand": detected_hand,
         "dominant_hand": "right",
@@ -564,11 +677,21 @@ def api_transcribe_audio():
 
 
 def _retrain_model_background():
-    global is_retraining, model, label_classes
+    global is_retraining, model, label_classes, NEUTRAL_INDEX, ME_INDEX, X_INDEX, U_INDEX, V_INDEX, R_INDEX, H_INDEX, W_INDEX
     try:
         subprocess.run([sys.executable, "train_model.py"], check=True)
         model = models.load_model(model_path)
         label_classes = np.load(labels_path, allow_pickle=True)
+        if label_classes is not None:
+            classes_list = list(label_classes)
+            NEUTRAL_INDEX = classes_list.index("neutral") if "neutral" in classes_list else None
+            ME_INDEX = classes_list.index("ME") if "ME" in classes_list else None
+            X_INDEX = classes_list.index("X") if "X" in classes_list else None
+            U_INDEX = classes_list.index("U") if "U" in classes_list else None
+            V_INDEX = classes_list.index("V") if "V" in classes_list else None
+            R_INDEX = classes_list.index("R") if "R" in classes_list else None
+            H_INDEX = classes_list.index("H") if "H" in classes_list else None
+            W_INDEX = classes_list.index("W") if "W" in classes_list else None
         print(f"Model successfully retrained and reloaded. Now has {len(label_classes)} classes.")
     except Exception as e:
         print(f"Error during retraining: {e}")
