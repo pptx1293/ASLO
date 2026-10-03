@@ -98,42 +98,49 @@ let clientStabilityBuffer = [];
 let clientLastTriggerTime = 0;
 let clientDisplayHistory = [];
 let clientSmoothedDisplayGesture = "—";
+let clientSmoothedConf = 0;
 
-function getSmoothedDisplayGesture(newDisplay) {
-    if (!newDisplay || newDisplay === "—") {
-        clientDisplayHistory.push("—");
-        if (clientDisplayHistory.length > 3) clientDisplayHistory.shift();
-        if (clientDisplayHistory.filter(x => x === "—").length >= 2) {
-            clientSmoothedDisplayGesture = "—";
-        }
-        return clientSmoothedDisplayGesture;
-    }
+// ── State Hysteresis & Latching Constants & State ──────────────────────────
+let activeSign = null;
+let candidateSign = null;
+let candidateCount = 0;
+const COMMIT_THRESHOLD = 3; // Must be detected consistently across 3 consecutive responses
+let lockUntil = 0; // Cooldown timestamp
 
-    if (newDisplay.includes("(IN MOTION)")) {
-        clientDisplayHistory = [newDisplay];
-        clientSmoothedDisplayGesture = newDisplay;
+const PREDICTION_WINDOW_MAX = 4;
+const MAJORITY_VOTE_RATIO = 0.75; // 3 out of 4 frames
+const GESTURE_LOCK_HOLD_MS = 120; // Sub-150ms hold lockout
+
+let predictionWindow = [];
+let lastConfirmedGesture = "—";
+let confirmedGestureTime = 0;
+let hasPassedThroughNeutral = false;
+let currentPipelineState = "Detecting...";
+
+function getSmoothedDisplayGesture(newDisplay, conf = 0) {
+    if (newDisplay && newDisplay.includes("(IN MOTION)")) {
         return newDisplay;
     }
 
-    clientDisplayHistory.push(newDisplay);
-    if (clientDisplayHistory.length > 3) clientDisplayHistory.shift();
+    const now = Date.now();
+    if (now < lockUntil && activeSign !== null) {
+        return activeSign;
+    }
 
-    const counts = {};
-    for (const g of clientDisplayHistory) {
-        counts[g] = (counts[g] || 0) + 1;
+    if (activeSign !== null) {
+        return activeSign;
     }
-    let topGesture = clientSmoothedDisplayGesture;
-    let maxCount = 0;
-    for (const [g, count] of Object.entries(counts)) {
-        if (count > maxCount) {
-            maxCount = count;
-            topGesture = g;
-        }
+
+    if (currentPipelineState === "Stable" && lastConfirmedGesture && lastConfirmedGesture !== "—") {
+        return lastConfirmedGesture;
     }
-    if (maxCount >= 2) {
-        clientSmoothedDisplayGesture = topGesture;
+
+    // Maintain the last stable translated word on screen during transitions instead of flickering or disappearing
+    if (lastConfirmedGesture && lastConfirmedGesture !== "—") {
+        return lastConfirmedGesture;
     }
-    return clientSmoothedDisplayGesture;
+
+    return (newDisplay && newDisplay !== "NEUTRAL") ? newDisplay : "—";
 }
 
 let clientDynamicGesture = null;
@@ -144,9 +151,9 @@ let clientSuppressYouUntil = 0;
 let clientDynamicCooldownUntil = 0;
 let dynamicReadyForStart = true;
 let clientLastDynamicCommitted = { gesture: "", time: 0 };
-const REPEAT_DELAY_MS = 1200;
-const STABILITY_REQUIRED_COUNT = 3; // N_Frame = 3 (fast, snappy recognition)
-const BUFFER_MAX_LEN = 5;
+const REPEAT_DELAY_MS = 140; // Sub-150ms repeat cooldown
+const STABILITY_REQUIRED_COUNT = 3; // 3 out of 4 frames
+const BUFFER_MAX_LEN = 4;
 let selectedSTTLanguage = "en-US";
 let audioCtx = null;
 let micStream = null;
@@ -166,11 +173,112 @@ let isSwitchingCamera = false;
 let webcamStream = null;
 let captureCanvas = null;
 let captureCtx = null;
+let isRequestPending = false;
 let isPredicting = false;
 let isWebcamActive = false;
 let lastFrameTime = 0;
 let videoDeviceIds = [];
 let currentDeviceIndex = 0;
+
+/**
+ * Single Closest-Hand Proximity Filter & Primary User Isolation
+ * 1. Calculate scale = dist(wrist_0, middle_mcp_9).
+ * 2. If multiple hands exist, discard all hands whose scale is < 70% of largest hand.
+ * 3. Only process the hand closest to the center (0.2 < x < 0.8).
+ * 4. Verify physical Right hand before dispatching single-hand signs.
+ */
+function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
+    if (!multiHandLandmarks || multiHandLandmarks.length === 0) {
+        return { hands: [], status: "none" };
+    }
+
+    const candidates = multiHandLandmarks.map((lms, idx) => {
+        const w0 = lms[0];
+        const m9 = lms[9];
+        const wx = Number(w0.x !== undefined ? w0.x : w0[0]);
+        const wy = Number(w0.y !== undefined ? w0.y : w0[1]);
+        const mx = Number(m9.x !== undefined ? m9.x : m9[0]);
+        const my = Number(m9.y !== undefined ? m9.y : m9[1]);
+
+        // scale = dist(wrist_0, middle_mcp_9)
+        const scale = Math.hypot(wx - mx, wy - my);
+        const rawH = multiHandedness && multiHandedness[idx];
+        const physicalHand = getActualPhysicalHand(rawH);
+        const distFromCenter = Math.abs(wx - 0.5);
+        const inCenterRegion = (wx >= 0.20 && wx <= 0.80);
+
+        return {
+            index: idx,
+            rawLandmarks: lms,
+            handedness: rawH,
+            physicalHand: physicalHand,
+            scale: scale,
+            wrist: { x: wx, y: wy },
+            distFromCenter: distFromCenter,
+            inCenterRegion: inCenterRegion
+        };
+    });
+
+    let maxScale = 0;
+    for (const c of candidates) {
+        if (c.scale > maxScale) maxScale = c.scale;
+    }
+
+    // Discard all hands whose scale is < 70% of the largest hand
+    const valid = candidates.filter(c => c.scale >= 0.70 * maxScale);
+    if (valid.length === 0) {
+        return { hands: [], status: "aligning" };
+    }
+
+    // Keep only hands in the central region (0.2 < x < 0.8) if available
+    const centerHands = valid.filter(c => c.inCenterRegion);
+    const pool = centerHands.length > 0 ? centerHands : valid;
+
+    // Pick hand closest to center
+    pool.sort((a, b) => a.distFromCenter - b.distFromCenter);
+
+    const primary = pool[0];
+
+    // Single hand passed filter:
+    if (pool.length === 1 || valid.length === 1) {
+        return {
+            hands: [primary],
+            status: primary.inCenterRegion ? "isolated" : "aligning"
+        };
+    }
+
+    // Two or more hands: search for a valid pair belonging to the SAME primary user
+    let pairedSecond = null;
+    for (let j = 1; j < pool.length; j++) {
+        const cand = pool[j];
+
+        // 1. Strict handedness pairing: exactly ONE Right and ONE Left
+        const isOpposite = (
+            (primary.physicalHand === "Right" && cand.physicalHand === "Left") ||
+            (primary.physicalHand === "Left" && cand.physicalHand === "Right")
+        );
+        if (!isOpposite) continue;
+
+        // 2. Spatial anthropometric consistency
+        const dy = Math.abs(primary.wrist.y - cand.wrist.y);
+        const dx = Math.abs(primary.wrist.x - cand.wrist.x);
+        const wristDist = Math.hypot(primary.wrist.x - cand.wrist.x, primary.wrist.y - cand.wrist.y);
+
+        if (dy >= 0.25 || dx >= 0.55) continue;
+        if ((primary.wrist.x < 0.20 && cand.wrist.x > 0.80) || (cand.wrist.x < 0.20 && primary.wrist.x > 0.80)) continue;
+        if (wristDist < 0.12) continue;
+
+        pairedSecond = cand;
+        break;
+    }
+
+    if (pairedSecond) {
+        const pair = primary.physicalHand === "Right" ? [primary, pairedSecond] : [pairedSecond, primary];
+        return { hands: pair, status: "isolated" };
+    }
+
+    return { hands: [primary], status: primary.inCenterRegion ? "isolated" : "aligning" };
+}
 
 // ── Camera Telemetry HUD & Recent Signs Trail ───────────────────────────────
 function toggleCamTelemetryHud() {
@@ -340,6 +448,69 @@ class OneEuroFilter {
         this.tPrev = null;
     }
 }
+
+
+
+/**
+ * Pre-Inference Landmark Exponential Moving Average (EMA: alpha ~ 0.65)
+ * Suppresses frame-level tracking jitter before landmark feature extraction.
+ */
+class LandmarkEMASmoother {
+    constructor(alpha = 0.65) {
+        this.alpha = alpha;
+        this.history = { Right: null, Left: null };
+        this.lastTime = { Right: 0, Left: 0 };
+    }
+
+    smooth(handKey, landmarks, timestamp = performance.now()) {
+        if (!landmarks || landmarks.length === 0) return landmarks;
+        const key = (handKey === "Left") ? "Left" : "Right";
+        const prev = this.history[key];
+        const dt = timestamp - (this.lastTime[key] || 0);
+
+        if (!prev || prev.length !== landmarks.length || dt > 350) {
+            this.history[key] = landmarks.map(p => ({
+                x: Number(p.x !== undefined ? p.x : p[0]),
+                y: Number(p.y !== undefined ? p.y : p[1]),
+                z: Number((p.z !== undefined ? p.z : p[2]) || 0)
+            }));
+            this.lastTime[key] = timestamp;
+            return this.history[key];
+        }
+
+        const a = this.alpha;
+        const smoothed = landmarks.map((p, i) => {
+            const rx = Number(p.x !== undefined ? p.x : p[0]);
+            const ry = Number(p.y !== undefined ? p.y : p[1]);
+            const rz = Number((p.z !== undefined ? p.z : p[2]) || 0);
+            return {
+                x: a * rx + (1.0 - a) * prev[i].x,
+                y: a * ry + (1.0 - a) * prev[i].y,
+                z: a * rz + (1.0 - a) * prev[i].z
+            };
+        });
+
+        this.history[key] = smoothed;
+        this.lastTime[key] = timestamp;
+        return smoothed;
+    }
+
+    reset(handKey) {
+        if (handKey) {
+            this.history[handKey] = null;
+            this.lastTime[handKey] = 0;
+        } else {
+            this.history.Right = null;
+            this.history.Left = null;
+            this.lastTime.Right = 0;
+            this.lastTime.Left = 0;
+        }
+    }
+}
+
+const landmarkEMASmoother = new LandmarkEMASmoother(0.65);
+let predictSequenceId = 0;
+let lastHandledSequenceId = 0;
 
 /**
  * Persistent Spatial Hand Tracker
@@ -606,7 +777,7 @@ async function enumerateCameras() {
 let mpHands = null;
 let mpCamera = null;
 let lastPredictTime = 0;
-const PREDICT_INTERVAL_MS = 100; // ~10 requests/sec debounce for backend inference
+const PREDICT_INTERVAL_MS = 70; // 12-15 Hz (every ~70 ms)
 
 function initClientMediaPipe() {
     if (mpHands) return mpHands;
@@ -636,7 +807,9 @@ function initClientMediaPipe() {
         mpHands.onResults((results) => {
             if (!outputCanvas || !canvasCtx) return;
 
-            // 1. Maintain canvas internal pixel dimensions to match incoming video frame (native stream resolution)
+            // 1. Single-person hand isolation before skeleton rendering and inference
+            const isolation = isolatePrimaryUserHands(results.multiHandLandmarks, results.multiHandedness);
+
             if (results.image) {
                 const w = results.image.width || 1280;
                 const h = results.image.height || 720;
@@ -649,11 +822,13 @@ function initClientMediaPipe() {
                 canvasCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
                 canvasCtx.drawImage(results.image, 0, 0, outputCanvas.width, outputCanvas.height);
 
-                // 2. Real-time stabilized 60 FPS skeleton rendering via persistent spatial tracking
+                // 2. Real-time stabilized 60 FPS skeleton rendering for isolated user hands only
                 const now = performance.now();
+                const isolatedLandmarks = isolation.hands.map(h => h.rawLandmarks);
+                const isolatedHandedness = isolation.hands.map(h => h.handedness);
                 const stabilizedList = landmarkStabilizer.process(
-                    results.multiHandLandmarks,
-                    results.multiHandedness,
+                    isolatedLandmarks,
+                    isolatedHandedness,
                     now
                 );
 
@@ -665,11 +840,12 @@ function initClientMediaPipe() {
                 currentStabilizedHands = stabilizedList;
             }
 
-            // 3. Throttled backend inference (~8-10 requests/sec, 100ms debounce)
+            // 3. Throttled backend inference (~14 Hz, non-blocking lock)
             const now = performance.now();
-            if (now - lastPredictTime >= PREDICT_INTERVAL_MS && !isPredicting) {
+            if (now - lastPredictTime >= PREDICT_INTERVAL_MS) {
+                if (isRequestPending || isPredicting) return;
                 lastPredictTime = now;
-                sendLandmarksInference(results, currentStabilizedHands);
+                sendLandmarksInference(results, currentStabilizedHands, isolation);
             }
         });
 
@@ -695,10 +871,32 @@ function getActualPhysicalHand(handednessObj) {
     return raw || "Right";
 }
 
+function updatePipelineStatusUI(status) {
+    currentPipelineState = status;
+    const statePill = document.getElementById("state-pill");
+    if (!statePill) return;
+
+    statePill.textContent = status;
+    statePill.className = "state-pill";
+
+    if (status === "Stable") {
+        statePill.classList.add("stable");
+    } else if (status === "Ambiguous") {
+        statePill.classList.add("ambiguous");
+    } else if (status === "Aligning User...") {
+        statePill.classList.add("aligning");
+    } else if (status === "Detecting...") {
+        statePill.classList.add("detecting");
+    } else if (status.startsWith("DYNAMIC")) {
+        statePill.classList.add("dynamic-active");
+    } else {
+        statePill.classList.add("standby");
+    }
+}
+
 function updateHandStatusUI(status) {
     const handBadge = document.getElementById("hand-badge");
     const hudHandText = document.getElementById("hud-hand-text");
-    const statePill = document.getElementById("state-pill");
 
     if (status === "left_ignored") {
         if (handBadge) {
@@ -706,13 +904,7 @@ function updateHandStatusUI(status) {
             handBadge.className = "hand-badge hand-warning";
         }
         if (hudHandText) hudHandText.textContent = "🤚 LEFT HAND (UNSUPPORTED)";
-        if (statePill) {
-            statePill.textContent = "LEFT HAND (UNSUPPORTED)";
-            statePill.className = "state-pill standby";
-        }
-        if (dom.gestureLabel) dom.gestureLabel.textContent = "—";
-        const curSign = document.getElementById("current-sign");
-        if (curSign) curSign.textContent = "—";
+        updatePipelineStatusUI("Aligning User...");
         if (dom.confBar) dom.confBar.style.width = "0%";
         if (dom.confText) dom.confText.textContent = "0%";
         if (dom.hudConfidence) dom.hudConfidence.textContent = "0% CONF";
@@ -738,27 +930,40 @@ function updateHandStatusUI(status) {
 }
 
 // ── Lightweight Landmark JSON Transmission ──────────────────────────────────
-async function sendLandmarksInference(results, stabilizedHands = []) {
-    if (isPredicting) return;
+async function sendLandmarksInference(results, stabilizedHands = [], precomputedIsolation = null) {
+    if (isRequestPending || isPredicting) return;
 
-    const numHands = (results && results.multiHandLandmarks) ? results.multiHandLandmarks.length : 0;
+    const isolation = precomputedIsolation || isolatePrimaryUserHands(
+        results && results.multiHandLandmarks,
+        results && results.multiHandedness
+    );
+
+    const numHands = isolation.hands.length;
 
     // Case 0: 0 hands detected -> idle / standby (cleanly reset filter state)
     if (numHands === 0) {
         landmarkStabilizer.resetAll();
+        landmarkEMASmoother.reset();
         updateHandStatusUI("none");
+        updatePipelineStatusUI("Detecting...");
         return;
     }
 
-    // Case 1: 1 hand detected -> check physical handedness
+    if (isolation.status === "aligning") {
+        updatePipelineStatusUI("Aligning User...");
+    }
+
+    // Case 1: 1 hand isolated -> check physical handedness
     if (numHands === 1) {
-        const rawH = results.multiHandedness && results.multiHandedness[0];
-        const physicalHand = getActualPhysicalHand(rawH);
+        const primary = isolation.hands[0];
+        const physicalHand = primary.physicalHand;
 
         // If user is showing only their Left Hand: DO NOT send prediction requests!
         if (physicalHand === "Left") {
             landmarkStabilizer.resetHand("Left");
+            landmarkEMASmoother.reset("Left");
             updateHandStatusUI("left_ignored");
+            updatePipelineStatusUI("Aligning User...");
             const now = performance.now();
             if (now - lastLeftHandToastTime > 3500) {
                 lastLeftHandToastTime = now;
@@ -767,126 +972,86 @@ async function sendLandmarksInference(results, stabilizedHands = []) {
             return;
         }
 
-        // Single physical Right hand: Proceed and send tagged with hand_type: "right"
+        // Single physical Right hand: Smooth with EMA (alpha ~ 0.65) and send
         updateHandStatusUI("right");
+        isRequestPending = true;
         isPredicting = true;
+        const currentSeq = ++predictSequenceId;
         try {
-            const rawLandmarks = results.multiHandLandmarks[0];
-            const smoothed = (stabilizedHands && stabilizedHands[0])
+            const rawLandmarks = primary.rawLandmarks;
+            const smoothedOneEuro = (stabilizedHands && stabilizedHands[0])
                 ? stabilizedHands[0].landmarks
                 : landmarkStabilizer.filterHand("Right", rawLandmarks);
-            const landmarks = toLandmarkArray(smoothed);
+            const emaSmoothed = landmarkEMASmoother.smooth("Right", smoothedOneEuro);
+            const landmarks = toLandmarkArray(emaSmoothed);
 
             const payload = {
                 hand_type: "right",
                 handedness: "Right",
                 landmarks: landmarks,
-                is_mirrored: isMirrored
+                is_mirrored: isMirrored,
+                seq_id: currentSeq
             };
 
-            await sendInferenceRequest(payload);
+            await sendInferenceRequest(payload, currentSeq);
         } catch (err) {
             // Suppress transient drops
         } finally {
+            isRequestPending = false;
             isPredicting = false;
         }
         return;
     }
 
-    // Case 2: 2 hands detected -> verify one is Left and one is Right (or both present), send tagged with hand_type: "both"
+    // Case 2: 2 hands isolated -> verify strict opposite handedness (Right & Left)
     if (numHands >= 2) {
+        const h0 = isolation.hands[0];
+        const h1 = isolation.hands[1];
+
+        updateHandStatusUI("both");
+        isRequestPending = true;
         isPredicting = true;
+        const currentSeq = ++predictSequenceId;
         try {
-            let h0Smoothed, h1Smoothed, h0Hand, h1Hand;
+            const rHandObj = (h0.physicalHand === "Right") ? h0 : h1;
+            const lHandObj = (h0.physicalHand === "Left") ? h0 : h1;
 
-            if (stabilizedHands && stabilizedHands.length >= 2) {
-                h0Smoothed = stabilizedHands[0].landmarks;
-                h1Smoothed = stabilizedHands[1].landmarks;
-                h0Hand = stabilizedHands[0].label || "Right";
-                h1Hand = stabilizedHands[1].label || "Left";
-            } else {
-                const hand0 = results.multiHandLandmarks[0];
-                const hand1 = results.multiHandLandmarks[1];
-                h0Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[0]);
-                h1Hand = getActualPhysicalHand(results.multiHandedness && results.multiHandedness[1]);
-                h0Smoothed = landmarkStabilizer.filterHand(h0Hand, hand0);
-                h1Smoothed = landmarkStabilizer.filterHand(h1Hand, hand1);
-            }
+            const rSmoothedOneEuro = landmarkStabilizer.filterHand("Right", rHandObj.rawLandmarks);
+            const lSmoothedOneEuro = landmarkStabilizer.filterHand("Left", lHandObj.rawLandmarks);
 
-            // Phantom Duplicate Hand Guard:
-            // Check Euclidean distance between detected wrists
-            const w0 = h0Smoothed[0];
-            const w1 = h1Smoothed[0];
-            const x0 = w0.x !== undefined ? w0.x : w0[0];
-            const y0 = w0.y !== undefined ? w0.y : w0[1];
-            const x1 = w1.x !== undefined ? w1.x : w1[0];
-            const y1 = w1.y !== undefined ? w1.y : w1[1];
-            const wristDist = Math.hypot(x0 - x1, y0 - y1);
+            const rEma = landmarkEMASmoother.smooth("Right", rSmoothedOneEuro);
+            const lEma = landmarkEMASmoother.smooth("Left", lSmoothedOneEuro);
 
-            // If wrists are in the exact same location (< 0.05), it is a single physical hand detected twice
-            if (wristDist < 0.05) {
-                const primaryHand = (h0Hand === "Right") ? h0Smoothed : ((h1Hand === "Right") ? h1Smoothed : h0Smoothed);
-                const primaryLabel = (h0Hand === "Right" || h1Hand === "Right") ? "Right" : h0Hand;
-                if (primaryLabel === "Left") {
-                    landmarkStabilizer.resetHand("Left");
-                    updateHandStatusUI("left_ignored");
-                    return;
-                }
-                updateHandStatusUI("right");
-                const landmarks = toLandmarkArray(primaryHand);
-                const payload = {
-                    hand_type: "right",
-                    handedness: "Right",
-                    landmarks: landmarks,
-                    is_mirrored: isMirrored
-                };
-                await sendInferenceRequest(payload);
-                return;
-            }
-
-            updateHandStatusUI("both");
-
-            // Ensure one is Right and one is Left based on spatial coordinate
-            if (h0Hand === h1Hand) {
-                const avgX0 = h0Smoothed.reduce((acc, p) => acc + (p.x !== undefined ? p.x : p[0]), 0) / h0Smoothed.length;
-                const avgX1 = h1Smoothed.reduce((acc, p) => acc + (p.x !== undefined ? p.x : p[0]), 0) / h1Smoothed.length;
-                if (avgX0 <= avgX1) {
-                    h0Hand = "Right";
-                    h1Hand = "Left";
-                } else {
-                    h0Hand = "Left";
-                    h1Hand = "Right";
-                }
-            }
-
-            const h0Pts = toLandmarkArray(h0Smoothed);
-            const h1Pts = toLandmarkArray(h1Smoothed);
+            const rPts = toLandmarkArray(rEma);
+            const lPts = toLandmarkArray(lEma);
 
             const handsList = [
-                { label: h0Hand, points: h0Pts },
-                { label: h1Hand, points: h1Pts }
+                { label: "Right", points: rPts },
+                { label: "Left", points: lPts }
             ];
 
             const payload = {
                 hand_type: "both",
                 handedness: "Both",
-                landmarks: (h0Hand === "Right" ? h0Pts : h1Pts),
+                landmarks: rPts,
                 hands: handsList,
                 all_hands: handsList,
-                is_mirrored: isMirrored
+                is_mirrored: isMirrored,
+                seq_id: currentSeq
             };
 
-            await sendInferenceRequest(payload);
+            await sendInferenceRequest(payload, currentSeq);
         } catch (err) {
             // Suppress transient drops
         } finally {
+            isRequestPending = false;
             isPredicting = false;
         }
         return;
     }
 }
 
-async function sendInferenceRequest(payload) {
+async function sendInferenceRequest(payload, seqId) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 2500);
 
@@ -911,7 +1076,11 @@ async function sendInferenceRequest(payload) {
 
     if (response && response.ok) {
         const data = await response.json();
-        applyTelemetry(data);
+        // Drop any responses that arrived out-of-order or are older than the last handled request
+        if (seqId > lastHandledSequenceId) {
+            lastHandledSequenceId = seqId;
+            applyTelemetry(data);
+        }
     }
 }
 
@@ -2116,7 +2285,11 @@ function applyTelemetry(data) {
         displayGesture = cleanPredUpper;
     }
 
-    const smoothedDisplay = getSmoothedDisplayGesture(displayGesture);
+    // Live confidence
+    const confVal = data.live_conf || 0;
+    const pct = Math.round(confVal * 100);
+
+    const smoothedDisplay = getSmoothedDisplayGesture(displayGesture, confVal);
     if (dom.gestureLabel) {
         dom.gestureLabel.textContent = smoothedDisplay;
     }
@@ -2124,10 +2297,6 @@ function applyTelemetry(data) {
     if (currentSignEl && currentSignEl !== dom.gestureLabel) {
         currentSignEl.textContent = smoothedDisplay;
     }
-
-    // Live confidence
-    const confVal = data.live_conf || 0;
-    const pct = Math.round(confVal * 100);
     if (dom.confBar) {
         dom.confBar.style.width = pct + "%";
         if (pct >= 70) {
@@ -2293,8 +2462,9 @@ function applyTelemetry(data) {
     // Dynamic Frame Guard:
     // Any uninitiated _END or _START frame is an incomplete fragment that shouldn't be added as static
     if (rawPredUpper.endsWith("_END") || rawPredUpper.endsWith("_START") || DYNAMIC_GESTURES.has(cleanPredUpper)) {
-        clientStabilityBuffer = [];
-        renderStability(0, STABILITY_REQUIRED_COUNT, false);
+        predictionWindow.push("FRAGMENT");
+        if (predictionWindow.length > PREDICTION_WINDOW_MAX) predictionWindow.shift();
+        renderStability(0, Math.ceil(predictionWindow.length * MAJORITY_VOTE_RATIO), false);
         return;
     }
 
@@ -2309,115 +2479,144 @@ function applyTelemetry(data) {
     );
 
     if (isNeutralOrIdle) {
-        if (dom.gestureLabel) dom.gestureLabel.textContent = "NEUTRAL";
-        if (dom.statePill) {
-            dom.statePill.textContent = isGestureRecordingActive ? "RECORDING (RESTING)" : "STANDBY (RESTING)";
-            dom.statePill.className = "state-pill standby";
+        hasPassedThroughNeutral = true;
+        if (now >= lockUntil) {
+            activeSign = null;
+            candidateSign = null;
+            candidateCount = 0;
+            renderStability(0, COMMIT_THRESHOLD, false);
         }
         if (clientDynamicGesture) {
             clientDynamicGesture = null;
             if (dynBanner) dynBanner.style.display = "none";
             if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
         }
-        clientStabilityBuffer = [];
-        renderStability(0, STABILITY_REQUIRED_COUNT, false);
+
+        const nowHold = performance.now();
+        const inHold = (nowHold - confirmedGestureTime < GESTURE_LOCK_HOLD_MS) || (now < lockUntil);
+        if (!inHold) {
+            updatePipelineStatusUI(isGestureRecordingActive ? "RECORDING (RESTING)" : "STANDBY (RESTING)");
+        }
         return;
     }
 
-    // Stability Buffer Smoothing
-    clientStabilityBuffer.push(cleanPred);
-    if (clientStabilityBuffer.length > BUFFER_MAX_LEN) clientStabilityBuffer.shift();
+    // ── State Hysteresis & Latching Prediction Handler ──
+    if (now < lockUntil && activeSign !== null) {
+        // Cooldown lockout: maintain current sign without volatile interim swapping
+        if (dom.gestureLabel) dom.gestureLabel.textContent = activeSign;
+        const currentSignEl = document.getElementById("current-sign");
+        if (currentSignEl && currentSignEl !== dom.gestureLabel) {
+            currentSignEl.textContent = activeSign;
+        }
+        updatePipelineStatusUI("Stable");
+    } else {
+        handlePrediction(cleanPred, confVal);
+        const displayWord = (activeSign !== null)
+            ? activeSign
+            : ((lastConfirmedGesture && lastConfirmedGesture !== "—") ? lastConfirmedGesture : (cleanPred || "—"));
+        if (dom.gestureLabel) dom.gestureLabel.textContent = displayWord;
+        const currentSignEl = document.getElementById("current-sign");
+        if (currentSignEl && currentSignEl !== dom.gestureLabel) {
+            currentSignEl.textContent = displayWord;
+        }
+    }
+}
 
-    const matchCount = clientStabilityBuffer.filter(p => p === cleanPred).length;
-    const isStable = matchCount >= STABILITY_REQUIRED_COUNT;
-    renderStability(matchCount, STABILITY_REQUIRED_COUNT, isStable);
+function commitSignToUI(sign) {
+    if (!sign || sign === "—") return;
+    const now = Date.now();
+    const upper = sign.toUpperCase().trim();
 
-    if (isStable && confVal >= 0.40) {
-        const upper = cleanPred.toUpperCase();
-        if (upper === "NEUTRAL" || upper === "IDLE" || upper === "—") {
-            clientStabilityBuffer = [];
-            return;
-        }
-        if (DYNAMIC_GESTURES.has(upper)) {
-            clientStabilityBuffer = [];
-            return;
-        }
-        if (upper === "START" || upper === "STOP") {
-            if (data.detected_hand !== "both" || confVal < 0.35) {
-                clientStabilityBuffer = [];
-                return;
-            }
-            if (upper === "START") {
-                if (!isGestureRecordingActive) {
-                    isGestureRecordingActive = true;
-                    updateGestureRecUI(true);
-                    speakText("Recording start");
-                    showToast("Recording started — START gesture detected", "success");
-                }
-                clientStabilityBuffer = [];
-                return;
-            }
-            if (upper === "STOP") {
-                if (isGestureRecordingActive) {
-                    isGestureRecordingActive = false;
-                    updateGestureRecUI(false);
-                    speakCompletedSentence(clientSentence);
-                    showToast("Recording paused — STOP gesture detected", "info");
-                }
-                clientStabilityBuffer = [];
-                return;
-            }
-        }
-        if (upper === "SPACE") {
-            if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
-                if (isGestureRecordingActive) appendSignToClientSentence("SPACE");
-                clientLastTriggerTime = now;
-            }
-            clientStabilityBuffer = [];
-            return;
-        }
-        if (upper === "BACKSPACE" || upper === "BACK SPACE") {
-            if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
-                backspaceSentenceLocal();
-                clientLastTriggerTime = now;
-            }
-            clientStabilityBuffer = [];
-            return;
-        }
+    if (dom.gestureLabel) dom.gestureLabel.textContent = sign;
+    const currentSignEl = document.getElementById("current-sign");
+    if (currentSignEl && currentSignEl !== dom.gestureLabel) {
+        currentSignEl.textContent = sign;
+    }
 
-        if (upper === "YOU" && clientDynamicGesture) {
-            const completedGesture = clientDynamicGesture;
-            clientDynamicGesture = null;
-            clientDynamicNeutralStart = 0;
-            clientDynamicCooldownUntil = now + REPEAT_DELAY_MS;
-            clientSuppressYouUntil = now + REPEAT_DELAY_MS;
-            clientLastWord = completedGesture;
+    lastConfirmedGesture = sign;
+    confirmedGestureTime = performance.now();
+    updatePipelineStatusUI("Stable");
+    renderStability(COMMIT_THRESHOLD, COMMIT_THRESHOLD, true);
+
+    const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "J", "Z"]);
+    if (upper === "NEUTRAL" || upper === "IDLE") {
+        hasPassedThroughNeutral = true;
+        return;
+    }
+    if (DYNAMIC_GESTURES.has(upper)) {
+        return;
+    }
+
+    // Execute dialogue/translation commit
+    if (upper === "START" || upper === "STOP") {
+        if (upper === "START" && !isGestureRecordingActive) {
+            isGestureRecordingActive = true;
+            updateGestureRecUI(true);
+            speakText("Recording start");
+            showToast("Recording started — START gesture detected", "success");
+        } else if (upper === "STOP" && isGestureRecordingActive) {
+            isGestureRecordingActive = false;
+            updateGestureRecUI(false);
+            speakCompletedSentence(clientSentence);
+            showToast("Recording paused — STOP gesture detected", "info");
+        }
+    } else if (upper === "SPACE") {
+        if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
+            if (isGestureRecordingActive) appendSignToClientSentence("SPACE");
             clientLastTriggerTime = now;
-            if (dynBanner) dynBanner.style.display = "none";
-            if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
-            if (isGestureRecordingActive) {
-                appendSignToClientSentence(completedGesture);
-                showToast(`Dynamic Sign: ${completedGesture}`, "success");
-            }
-            clientStabilityBuffer = [];
-            renderStability(0, STABILITY_REQUIRED_COUNT, false);
-            return;
         }
-
-        if (upper === "YOU" && now < clientSuppressYouUntil) {
-            clientStabilityBuffer = [];
-            return;
-        }
-
-        if (cleanPred !== clientLastWord || (now - clientLastTriggerTime > REPEAT_DELAY_MS)) {
-            if (isGestureRecordingActive) {
-                appendSignToClientSentence(cleanPred);
-                showToast(`Sign: ${cleanPred}`, "info", 1500);
-            }
-            clientLastWord = cleanPred;
+    } else if (upper === "BACKSPACE" || upper === "BACK SPACE") {
+        if (now - clientLastTriggerTime > REPEAT_DELAY_MS) {
+            backspaceSentenceLocal();
             clientLastTriggerTime = now;
-            clientStabilityBuffer = [];
         }
+    } else if (upper === "YOU" && clientDynamicGesture) {
+        const completedGesture = clientDynamicGesture;
+        clientDynamicGesture = null;
+        clientDynamicNeutralStart = 0;
+        clientDynamicCooldownUntil = now + REPEAT_DELAY_MS;
+        clientSuppressYouUntil = now + REPEAT_DELAY_MS;
+        clientLastWord = completedGesture;
+        clientLastTriggerTime = now;
+        const dynBanner = document.getElementById("dynamic-timer-banner");
+        const dynTelemetryRow = document.getElementById("dynamic-timer-telemetry");
+        if (dynBanner) dynBanner.style.display = "none";
+        if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+        if (isGestureRecordingActive) {
+            appendSignToClientSentence(completedGesture);
+            showToast(`Dynamic Sign: ${completedGesture}`, "success");
+        }
+    } else if (!(upper === "YOU" && now < clientSuppressYouUntil)) {
+        if (sign !== clientLastWord || (now - clientLastTriggerTime > REPEAT_DELAY_MS)) {
+            if (isGestureRecordingActive) {
+                appendSignToClientSentence(sign);
+                showToast(`Sign: ${sign}`, "info", 1500);
+            }
+            clientLastWord = sign;
+            clientLastTriggerTime = now;
+        }
+    }
+}
+
+function handlePrediction(predictedLabel, confidence) {
+    const now = Date.now();
+    if (!predictedLabel || confidence < 0.55) return;
+
+    // If locked, maintain current sign
+    if (now < lockUntil && activeSign !== null) return;
+
+    if (predictedLabel === candidateSign) {
+        candidateCount++;
+        renderStability(candidateCount, COMMIT_THRESHOLD, candidateCount >= COMMIT_THRESHOLD);
+        if (candidateCount >= COMMIT_THRESHOLD && activeSign !== candidateSign) {
+            activeSign = candidateSign;
+            commitSignToUI(activeSign);
+            lockUntil = now + 400; // Hold sign steadily for 400ms before allowing a swap
+        }
+    } else {
+        candidateSign = predictedLabel;
+        candidateCount = 1;
+        renderStability(1, COMMIT_THRESHOLD, false);
     }
 }
 

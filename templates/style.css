@@ -894,19 +894,66 @@ button:focus-visible {
     border: 1px solid var(--border-subtle);
 }
 
-.state-pill.active {
+.state-pill.active,
+.state-pill.stable {
     background: rgba(16, 185, 129, 0.15);
     color: var(--emerald);
     border-color: rgba(16, 185, 129, 0.35);
 }
 
-.state-pill.active::before {
+.state-pill.active::before,
+.state-pill.stable::before {
     content: "";
     width: 6px;
     height: 6px;
     border-radius: 50%;
     background: var(--emerald);
     box-shadow: 0 0 6px var(--emerald);
+}
+
+.state-pill.ambiguous {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--amber);
+    border-color: rgba(245, 158, 11, 0.35);
+}
+
+.state-pill.ambiguous::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--amber);
+    box-shadow: 0 0 6px var(--amber);
+}
+
+.state-pill.aligning {
+    background: rgba(139, 92, 246, 0.15);
+    color: #a78bfa;
+    border-color: rgba(139, 92, 246, 0.35);
+}
+
+.state-pill.aligning::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #a78bfa;
+    box-shadow: 0 0 6px #a78bfa;
+}
+
+.state-pill.detecting {
+    background: rgba(6, 182, 212, 0.15);
+    color: var(--cyan);
+    border-color: rgba(6, 182, 212, 0.35);
+}
+
+.state-pill.detecting::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 6px var(--cyan);
 }
 
 /* ── Dominant Hand Selector Switch ───────────────────────────────────── */

@@ -644,7 +644,25 @@ body {
     font-size: 0.75rem;
     font-weight: 700;
     color: var(--text-muted);
+    transition: color 0.2s ease;
 }
+
+.m-sign-sub.stable {
+    color: #10B981 !important;
+}
+
+.m-sign-sub.ambiguous {
+    color: #F59E0B !important;
+}
+
+.m-sign-sub.aligning {
+    color: #F97316 !important;
+}
+
+.m-sign-sub.detecting {
+    color: #00F0FF !important;
+}
+
 
 .m-sign-right {
     display: flex;

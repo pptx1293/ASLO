@@ -302,6 +302,77 @@ class MotionBasedRouter:
 
 
 # =====================================================================
+# SOFTMAX MARGIN & AMBIGUITY REJECTION VERIFIER
+# =====================================================================
+
+class SoftmaxMarginVerifier:
+    """
+    Evaluates raw Softmax probabilities against strict confidence and margin gates:
+    1. Confidence Gate: p_top >= min_confidence (default 0.70)
+    2. Margin Gate: (p_top - p_second) >= min_margin (default 0.25)
+
+    Eliminates boundary flicker and rapid swapping between overlapping gestures.
+    """
+    def __init__(self, min_confidence: float = 0.55, min_margin: float = 0.10, verbose: bool = False):
+        self.min_confidence = min_confidence
+        self.min_margin = min_margin
+        self.verbose = verbose
+
+    def verify(
+        self,
+        probs: np.ndarray,
+        label_classes: np.ndarray
+    ) -> Tuple[Optional[str], float, str, Dict]:
+        """
+        Verify class probabilities.
+
+        Returns:
+            predicted_label: Validated label string or None if rejected
+            confidence: float (p_top)
+            status: "valid", "low_confidence", or "ambiguous"
+            telemetry: Dict containing top_label, second_label, margin, p_top, p_second
+        """
+        flat_probs = np.asarray(probs, dtype=np.float32).flatten()
+        if len(flat_probs) == 0:
+            return None, 0.0, "low_confidence", {
+                "top_label": "—", "second_label": "—", "margin": 0.0,
+                "p_top": 0.0, "p_second": 0.0
+            }
+
+        sorted_indices = np.argsort(flat_probs)[::-1]
+        top_idx = int(sorted_indices[0])
+        second_idx = int(sorted_indices[1]) if len(sorted_indices) > 1 else top_idx
+
+        p_top = float(flat_probs[top_idx])
+        p_second = float(flat_probs[second_idx]) if len(sorted_indices) > 1 else 0.0
+        margin = float(p_top - p_second)
+
+        top_label = str(label_classes[top_idx]) if label_classes is not None and top_idx < len(label_classes) else "—"
+        second_label = str(label_classes[second_idx]) if label_classes is not None and second_idx < len(label_classes) and len(sorted_indices) > 1 else "—"
+
+        if self.verbose:
+            print(f"[INFERENCE] Top: {top_label} ({p_top:.2f}), Runner-up: {second_label} ({p_second:.2f}), Margin: {margin:.2f}")
+
+        telemetry = {
+            "top_label": top_label,
+            "second_label": second_label,
+            "margin": margin,
+            "p_top": p_top,
+            "p_second": p_second,
+        }
+
+        # Gate 1: Confidence
+        if p_top < self.min_confidence:
+            return None, p_top, "low_confidence", telemetry
+
+        # Gate 2: Margin
+        if margin < self.min_margin:
+            return None, p_top, "ambiguous", telemetry
+
+        return top_label, p_top, "valid", telemetry
+
+
+# =====================================================================
 # 4. TIMER-BASED DYNAMIC GESTURE CONTROLLER & BUFFER
 # =====================================================================
 

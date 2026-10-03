@@ -19,12 +19,14 @@ except ImportError:
 from keras import models
 import mediapipe as mp
 import numpy as np
+import tensorflow as tf
 
 import aslo_features
 from aslo_pipeline import (
     KeypointInterpolator,
     LowLightEnhancer,
     MotionBasedRouter,
+    SoftmaxMarginVerifier,
     TimerDynamicGestureManager,
 )
 from speech_to_text import SUPPORTED_LANGUAGES, engine as stt_engine
@@ -49,12 +51,24 @@ else:
     print("Warning: gesture_model.keras or label_classes.npy not found.")
     print("Please run collect_data.py and train_model.py first.")
 
+@tf.function(reduce_retracing=True)
+def fast_predict(x):
+    return model(x, training=False)
+
+if model is not None:
+    try:
+        fast_predict(tf.zeros((1, aslo_features.FEATURE_LEN), dtype=tf.float32))
+        fast_predict(tf.zeros((3, aslo_features.FEATURE_LEN), dtype=tf.float32))
+    except Exception as _e:
+        print(f"Inference graph warmup note: {_e}")
+
 # Server-side MediaPipe Hands is disabled: Hand tracking is now executed
 # zero-latency in the client browser, transmitting only 21 landmark coordinates.
 hands = None
 
 # ── ASLO Pipeline Configurations ───────────────────────────────────────────
 low_light_enhancer = LowLightEnhancer(base_clip_limit=2.5, tile_grid_size=(8, 8))
+margin_verifier = SoftmaxMarginVerifier(min_confidence=0.55, min_margin=0.10)
 
 TWO_HANDED_LABELS = {
     "START", "STOP", "SPACE", "BACK SPACE", "BACKSPACE", "NEUTRAL",
@@ -204,10 +218,18 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
     def _to_mirrored(raw_pts):
         if not raw_pts:
             return []
-        return [
-            [(1.0 - p[0]) if is_mirrored else p[0], p[1], p[2] if len(p) > 2 else 0.0]
-            for p in raw_pts
-        ]
+        pts = []
+        for p in raw_pts:
+            if isinstance(p, dict):
+                px = float(p.get("x", 0.0))
+                py = float(p.get("y", 0.0))
+                pz = float(p.get("z", 0.0))
+            else:
+                px = float(p[0])
+                py = float(p[1])
+                pz = float(p[2]) if len(p) > 2 else 0.0
+            pts.append([px, py, pz])
+        return pts
 
     pred_label = "—"
     confidence = 0.0
@@ -234,20 +256,27 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
     if all_hands and len(all_hands) >= 2:
         h0_pts = all_hands[0].get("points", [])
         h1_pts = all_hands[1].get("points", [])
+        h0_lbl = (all_hands[0].get("label") or "").capitalize().strip()
+        h1_lbl = (all_hands[1].get("label") or "").capitalize().strip()
 
-        # Phantom Hand Filter: wrists must be physically separated in space
-        is_phantom_duplicate = False
+        # Genuine two-handed gestures strictly require one Right and one Left hand
+        has_opposite_handedness = (h0_lbl == "Right" and h1_lbl == "Left") or (h0_lbl == "Left" and h1_lbl == "Right")
+        d_wrists = 1.0
         if h0_pts and h1_pts and len(h0_pts) >= 1 and len(h1_pts) >= 1:
             w0 = np.array([h0_pts[0][0], h0_pts[0][1]])
             w1 = np.array([h1_pts[0][0], h1_pts[0][1]])
             d_wrists = float(np.linalg.norm(w0 - w1))
-            if d_wrists < 0.05:
-                is_phantom_duplicate = True
 
-        if is_phantom_duplicate:
-            landmarks_data = h0_pts
-        else:
+        if has_opposite_handedness and d_wrists >= 0.20:
             is_two_hand_inference = True
+        else:
+            # Fall back to single hand: prioritize Right hand if detected
+            if h0_lbl == "Right":
+                landmarks_data = h0_pts
+            elif h1_lbl == "Right":
+                landmarks_data = h1_pts
+            else:
+                landmarks_data = h0_pts
 
     if is_two_hand_inference:
         h0_pts = all_hands[0].get("points", [])
@@ -270,24 +299,36 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         r_lms = aslo_features.HandLandmarks(_to_mirrored(r_pts))
         l_lms = aslo_features.HandLandmarks(_to_mirrored(l_pts))
 
-        # Two-hand inference
-        feats_both = aslo_features.extract_two_hand_features(r_lms, l_lms)
-        p_both = np.array(model(np.array([feats_both], dtype=np.float32), training=False))[0]
-        idx_both = int(np.argmax(p_both))
-        label_both = str(label_classes[idx_both])
-        conf_both = float(p_both[idx_both])
-        both_live_gesture = label_both.upper()
-        both_live_conf = conf_both
+        feats_both = aslo_features.validate_feature_vector(aslo_features.extract_two_hand_features(r_lms, l_lms))
+        feats_r = aslo_features.validate_feature_vector(aslo_features.extract_single_hand_features(r_lms, is_left_hand=False))
+        feats_l = aslo_features.validate_feature_vector(aslo_features.extract_single_hand_features(l_lms, is_left_hand=True))
+
+        feats_batch = np.concatenate([feats_both, feats_r, feats_l], axis=0)
+        p_batch = fast_predict(tf.constant(feats_batch, dtype=tf.float32)).numpy()
+        p_both, p_r, p_l = p_batch[0], p_batch[1], p_batch[2]
+
+        verified_both, conf_both, status_both, telem_both = margin_verifier.verify(p_both, label_classes)
+        pred_status = status_both
+        margin_value = telem_both["margin"]
+        top_class_name = telem_both["top_label"]
+        second_class_name = telem_both["second_label"]
+        p_top_both = telem_both["p_top"]
+        p_second_both = telem_both["p_second"]
+
+        print(f"[PREDICT] Detected: {top_class_name} ({p_top_both:.2f}), Runner-up: {second_class_name} ({p_second_both:.2f}), Diff: {margin_value:.2f}")
 
         # Check if two-hand inference is neutral
         prob_both_neutral = float(p_both[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(p_both)) else 0.0
-        if label_both.lower() == "neutral" or (prob_both_neutral >= 0.60 and conf_both < 0.30):
+        if (verified_both and verified_both.lower() == "neutral") or (prob_both_neutral >= 0.60 and conf_both < 0.30):
             both_live_gesture = "NEUTRAL"
             conf_both = max(prob_both_neutral, conf_both)
+            verified_both = "NEUTRAL"
+            pred_status = "valid"
+        else:
+            both_live_gesture = (verified_both.upper() if verified_both else "—")
+            both_live_conf = conf_both
 
         # Right single-hand inference
-        feats_r = aslo_features.extract_single_hand_features(r_lms, is_left_hand=False)
-        p_r = np.array(model(np.array([feats_r], dtype=np.float32), training=False))[0]
         idx_r = int(np.argmax(p_r))
         label_r = str(label_classes[idx_r])
         conf_r = float(p_r[idx_r])
@@ -296,15 +337,13 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         right_live_conf = conf_r
 
         # Left single-hand inference
-        feats_l = aslo_features.extract_single_hand_features(l_lms, is_left_hand=True)
-        p_l = np.array(model(np.array([feats_l], dtype=np.float32), training=False))[0]
         idx_l = int(np.argmax(p_l))
         label_l = str(label_classes[idx_l])
         conf_l = float(p_l[idx_l])
         left_live_gesture = label_l
         left_live_conf = conf_l
 
-        pred_label = label_both
+        pred_label = verified_both
         confidence = conf_both
         detected_hand = "both"
 
@@ -312,58 +351,76 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
     else:
         single_pts = _to_mirrored(landmarks_data)
         single_lms = aslo_features.HandLandmarks(single_pts)
-        feats_single = aslo_features.extract_single_hand_features(single_lms, is_left_hand=False)
-        probs = np.array(model(np.array([feats_single], dtype=np.float32), training=False))[0]
-        idx = int(np.argmax(probs))
-        raw_pred = str(label_classes[idx])
-        conf = float(probs[idx])
+        feats_single = aslo_features.validate_feature_vector(
+            aslo_features.extract_single_hand_features(single_lms, is_left_hand=False)
+        )
+        probs = fast_predict(tf.constant(feats_single, dtype=tf.float32)).numpy()[0]
 
-        # Check if neutral probability is elevated or hand is in resting position
         wrist_y = single_lms.landmark[0].y
         prob_neutral = float(probs[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(probs)) else 0.0
+        is_resting = wrist_y > 0.90
 
-        is_neutral = (
-            raw_pred.lower() == "neutral"
-            or (prob_neutral >= 0.60 and conf < 0.30)
-            or wrist_y > 0.90
-        )
+        verified_single, conf_single, status_single, telem_single = margin_verifier.verify(probs, label_classes)
+        pred_status = status_single
+        margin_value = telem_single["margin"]
+        top_class_name = telem_single["top_label"]
+        second_class_name = telem_single["second_label"]
+        p_top_single = telem_single["p_top"]
+        p_second_single = telem_single["p_second"]
 
-        if is_neutral:
+        print(f"[PREDICT] Detected: {top_class_name} ({p_top_single:.2f}), Runner-up: {second_class_name} ({p_second_single:.2f}), Diff: {margin_value:.2f}")
+
+        if is_resting or (prob_neutral >= 0.60 and conf_single < 0.30):
             heur = "NEUTRAL"
-            conf = max(prob_neutral, conf if raw_pred.lower() == "neutral" else 0.60)
+            conf = max(prob_neutral, 0.75 if is_resting else conf_single)
+            pred_status = "valid"
+        elif verified_single is None:
+            heur = None
+            conf = conf_single
         else:
-            heur = raw_pred.upper()
-            cand_clean = clean_display_label(heur).lower()
+            if verified_single.lower() == "neutral":
+                heur = "NEUTRAL"
+                conf = conf_single
+            else:
+                heur = aslo_features.apply_heuristics(single_lms, verified_single, is_left_hand=False, confidence=conf_single)
+                cand_clean = clean_display_label(heur).lower()
 
-            # START and STOP strictly require both hands; never allow them from single-hand inference
-            if str(heur).upper() in ("START", "STOP") or cand_clean in ("start", "stop"):
-                heur = "—"
-                conf = 0.0
+                # START and STOP strictly require both hands; never allow them from single-hand inference
+                if str(heur).upper() in ("START", "STOP") or cand_clean in ("start", "stop"):
+                    heur = None
+                    pred_status = "ambiguous"
+                conf = conf_single
 
         pred_label = heur
         confidence = conf
         detected_hand = "right"
-        right_live_gesture = heur
+        right_live_gesture = heur if heur else "—"
         right_live_conf = conf
 
-    clean_pred = clean_display_label(pred_label)
+    clean_pred = clean_display_label(pred_label) if pred_label else None
+    if clean_pred in ("—", "NONE", ""):
+        clean_pred = None
+
     clean_r = clean_display_label(right_live_gesture) if right_live_gesture != "TRACKED" else "TRACKED"
     clean_l = clean_display_label(left_live_gesture) if left_live_gesture != "TRACKED" else "TRACKED"
     clean_both = clean_display_label(both_live_gesture)
 
-    # Final safeguard: START and STOP strictly require both hands!
+    # Final safeguard: START, STOP, and two-handed dynamic phrases strictly require both hands!
     if detected_hand != "both":
-        if str(pred_label).upper() in ("START", "STOP"):
-            pred_label = "—"
+        two_hand_guards = ("START", "STOP", "HOW ARE YOU", "NICE TO MEET YOU")
+        if pred_label and any(str(pred_label).upper().startswith(g) for g in two_hand_guards):
+            pred_label = None
             confidence = 0.0
-        if str(clean_pred).upper() in ("START", "STOP"):
-            clean_pred = "—"
+            pred_status = "ambiguous"
+        if clean_pred and any(str(clean_pred).upper().startswith(g) for g in two_hand_guards):
+            clean_pred = None
             confidence = 0.0
-        if str(right_live_gesture).upper() in ("START", "STOP"):
+            pred_status = "ambiguous"
+        if any(str(right_live_gesture).upper().startswith(g) for g in two_hand_guards):
             right_live_gesture = "—"
             right_live_conf = 0.0
 
-    is_neutral_signal = (clean_pred == "NEUTRAL" or pred_label == "NEUTRAL" or clean_pred == "—")
+    is_neutral_signal = bool(clean_pred == "NEUTRAL" or pred_label == "NEUTRAL")
     is_dynamic_signal = bool(
         pred_label and (
             str(pred_label).upper().endswith("_START") or
@@ -378,6 +435,10 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         "raw_pred": pred_label,
         "is_dynamic": is_dynamic_signal,
         "confidence": float(round(confidence, 2)),
+        "status": pred_status,
+        "top_label": top_class_name,
+        "second_label": second_class_name,
+        "margin": float(round(margin_value, 2)),
         "detected_hand": detected_hand,
         "dominant_hand": "right",
         "live_gesture": clean_pred,
@@ -389,7 +450,6 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         "left_conf": float(round(left_live_conf, 2)),
         "both_gesture": clean_both,
         "both_conf": float(round(both_live_conf, 2)),
-        "status": "running"
     }
 
 
