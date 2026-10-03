@@ -69,6 +69,46 @@ let mobileVoiceSentence = "";
 let clientLastWord = "";
 let clientStabilityBuffer = [];
 let clientLastTriggerTime = 0;
+let mobileDisplayHistory = [];
+let mobileSmoothedDisplaySign = "—";
+
+function getSmoothedDisplaySign(newDisplay) {
+    if (!newDisplay || newDisplay === "—") {
+        mobileDisplayHistory.push("—");
+        if (mobileDisplayHistory.length > 3) mobileDisplayHistory.shift();
+        if (mobileDisplayHistory.filter(x => x === "—").length >= 2) {
+            mobileSmoothedDisplaySign = "—";
+        }
+        return mobileSmoothedDisplaySign;
+    }
+
+    if (newDisplay.includes("(IN MOTION)")) {
+        mobileDisplayHistory = [newDisplay];
+        mobileSmoothedDisplaySign = newDisplay;
+        return newDisplay;
+    }
+
+    mobileDisplayHistory.push(newDisplay);
+    if (mobileDisplayHistory.length > 3) mobileDisplayHistory.shift();
+
+    const counts = {};
+    for (const g of mobileDisplayHistory) {
+        counts[g] = (counts[g] || 0) + 1;
+    }
+    let topSign = mobileSmoothedDisplaySign;
+    let maxCount = 0;
+    for (const [g, count] of Object.entries(counts)) {
+        if (count > maxCount) {
+            maxCount = count;
+            topSign = g;
+        }
+    }
+    if (maxCount >= 2) {
+        mobileSmoothedDisplaySign = topSign;
+    }
+    return mobileSmoothedDisplaySign;
+}
+
 let clientDynamicGesture = null;
 let clientDynamicStartTime = 0;
 const CLIENT_DYNAMIC_MAX_SEC = 2.8;
@@ -791,8 +831,8 @@ async function sendMobileLandmarks(results, stabilizedHands = []) {
             const y1 = w1.y !== undefined ? w1.y : w1[1];
             const wristDist = Math.hypot(x0 - x1, y0 - y1);
 
-            // If wrists are overlapping (< 0.15), or same hand detected twice with dist < 0.22:
-            if (wristDist < 0.15 || (h0Hand === h1Hand && wristDist < 0.22)) {
+            // If wrists are in the exact same location (< 0.05), it is a single physical hand detected twice
+            if (wristDist < 0.05) {
                 const primaryHand = (h0Hand === "Right") ? h0Smoothed : ((h1Hand === "Right") ? h1Smoothed : h0Smoothed);
                 const primaryLabel = (h0Hand === "Right" || h1Hand === "Right") ? "Right" : h0Hand;
                 if (primaryLabel === "Left") {
@@ -1007,7 +1047,8 @@ function applyMobileTelemetry(data) {
     }
 
     // 1. Current Sign Hero Card
-    if (dom.signVal) dom.signVal.textContent = displaySign;
+    const smoothedDisplay = getSmoothedDisplaySign(displaySign);
+    if (dom.signVal) dom.signVal.textContent = smoothedDisplay;
     if (dom.signSub) dom.signSub.textContent = isGestureRecordingActive ? "Live tracking" : "Paused";
 
     if (dom.confPill) {
@@ -1077,13 +1118,13 @@ function applyMobileTelemetry(data) {
             // 3. True LAST FRAME (held at >= 1.5s): user performs end pose (Nice to meet you_END or YOU)
             const isPointingYou = (rawPredUpper === "YOU" || cleanPredUpper === "YOU" || (data.right_gesture && String(data.right_gesture).toUpperCase() === "YOU"));
             const isNiceEndPose = (rawPredUpper === "NICE TO MEET YOU_END" || rawPredUpper.endsWith("_END"));
-            if ((elapsedSec >= 1.5 && isNiceEndPose) || (elapsedSec >= 1.2 && isPointingYou)) {
+            if (elapsedSec >= 1.5 && (isNiceEndPose || isPointingYou)) {
                 isEndSignal = true;
             }
         } else if (clientDynamicGesture === "HOW ARE YOU") {
             const isPointingYou = (rawPredUpper === "YOU" || cleanPredUpper === "YOU" || (data.right_gesture && String(data.right_gesture).toUpperCase() === "YOU"));
             const isHowEndPose = (rawPredUpper === "HOW ARE YOU_END" || rawPredUpper.endsWith("_END"));
-            if (elapsedSec >= 0.65 && (isPointingYou || isHowEndPose)) {
+            if (elapsedSec >= 0.8 && (isPointingYou || isHowEndPose)) {
                 isEndSignal = true;
             }
         } else {
@@ -1129,7 +1170,7 @@ function applyMobileTelemetry(data) {
     const isStartCandidate = (now >= clientDynamicCooldownUntil) && (
         rawPredUpper.endsWith("_START")
     );
-    if (isStartCandidate && confVal >= 0.40) {
+    if (isStartCandidate && confVal >= 0.40 && DYNAMIC_GESTURES.has(cleanPredUpper)) {
         const candidate = cleanPredUpper;
         clientDynamicGesture = candidate;
         clientDynamicStartTime = now;
@@ -1194,7 +1235,7 @@ function applyMobileTelemetry(data) {
             return;
         }
         if (upper === "START" || upper === "STOP") {
-            if (detHand !== "both" || confVal < 0.55) {
+            if (detHand !== "both" || confVal < 0.35) {
                 clientStabilityBuffer = [];
                 return;
             }

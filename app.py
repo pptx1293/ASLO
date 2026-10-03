@@ -262,7 +262,7 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             w0 = np.array([h0_pts[0][0], h0_pts[0][1]])
             w1 = np.array([h1_pts[0][0], h1_pts[0][1]])
             d_wrists = float(np.linalg.norm(w0 - w1))
-            if d_wrists < 0.14:
+            if d_wrists < 0.05:
                 is_phantom_duplicate = True
 
         if is_phantom_duplicate:
@@ -302,15 +302,9 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
         # Check if two-hand inference is neutral
         prob_both_neutral = float(p_both[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(p_both)) else 0.0
-        if label_both.lower() == "neutral" or (prob_both_neutral >= 0.25 and conf_both < 0.65):
+        if label_both.lower() == "neutral" or (prob_both_neutral >= 0.60 and conf_both < 0.30):
             both_live_gesture = "NEUTRAL"
             conf_both = max(prob_both_neutral, conf_both)
-
-        # Check if ME is indicated
-        prob_both_me = float(p_both[ME_INDEX]) if (ME_INDEX is not None and ME_INDEX < len(p_both)) else 0.0
-        if label_both.upper() == "ME" or (prob_both_me >= 0.25 and conf_both < 0.65):
-            label_both = "ME"
-            conf_both = max(prob_both_me, conf_both)
 
         # Right single-hand inference
         feats_r = aslo_features.extract_single_hand_features(r_lms, is_left_hand=False)
@@ -331,38 +325,9 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         left_live_gesture = label_l
         left_live_conf = conf_l
 
-        y_r = r_lms.landmark[0].y
-        y_l = l_lms.landmark[0].y
-        is_dynamic_two_handed = label_both.upper() in ("HOW ARE YOU_START", "HOW ARE YOU_END", "NICE TO MEET YOU_START", "NICE TO MEET YOU_END")
-        both_raised = (y_r < 0.90 and y_l < 0.92) if is_dynamic_two_handed else (y_r < 0.85 and y_l < 0.85 and abs(y_r - y_l) < 0.40)
-        is_two_handed = both_raised and (
-            label_both.upper() in TWO_HANDED_LABELS
-            or is_dynamic_two_handed
-        )
-        is_control_sign = label_both.upper() in ("START", "STOP", "SPACE", "BACKSPACE", "BACK SPACE")
-        if is_control_sign:
-            req_conf = 0.50
-        elif is_dynamic_two_handed:
-            req_conf = 0.30
-        else:
-            req_conf = 0.40
-
-        if is_two_handed and conf_both >= req_conf:
-            pred_label = label_both
-            confidence = conf_both
-            detected_hand = "both"
-        else:
-            if str(heur_r).upper() in ("START", "STOP"):
-                heur_r = "—"
-                conf_r = 0.0
-            if is_dynamic_two_handed and conf_both >= 0.25:
-                pred_label = label_both
-                confidence = conf_both
-                detected_hand = "both"
-            else:
-                pred_label = heur_r
-                confidence = conf_r
-                detected_hand = "right"
+        pred_label = label_both
+        confidence = conf_both
+        detected_hand = "both"
 
     # Case 2: Single Right hand detected
     else:
@@ -385,44 +350,21 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
         is_neutral = (
             raw_pred.lower() == "neutral"
-            or (prob_neutral >= 0.20 and conf < 0.65)
-            or wrist_y > 0.88
+            or (prob_neutral >= 0.60 and conf < 0.30)
+            or wrist_y > 0.90
         )
 
         if is_neutral:
             heur = "NEUTRAL"
             conf = max(prob_neutral, conf if raw_pred.lower() == "neutral" else 0.60)
         else:
-            if prob_me >= 0.22 and conf < 0.65:
-                raw_pred = "ME"
-                conf = max(prob_me, conf)
-            elif prob_x >= 0.15 and raw_pred.upper() in ("P", "Q", "Z", "Z_START", "Z_END", "D") and conf < 0.75:
-                raw_pred = "X"
-                conf = max(prob_x, conf)
-            elif prob_h >= 0.15 and raw_pred.upper() in ("U", "W", "V", "R") and conf < 0.75:
-                raw_pred = "H"
-                conf = max(prob_h, conf)
-            heur = aslo_features.apply_heuristics(single_lms, raw_pred, is_left_hand=False, confidence=conf)
+            heur = raw_pred.upper()
             cand_clean = clean_display_label(heur).lower()
 
             # START and STOP strictly require both hands; never allow them from single-hand inference
-            if str(heur).upper() in ("START", "STOP") or raw_pred.upper() in ("START", "STOP") or cand_clean in ("start", "stop"):
+            if str(heur).upper() in ("START", "STOP") or cand_clean in ("start", "stop"):
                 heur = "—"
                 conf = 0.0
-
-            if cand_clean in ("how are you", "nice to meet you"):
-                # Both _START and _END frames of dynamic signs are valid in single-hand detection!
-                # In "Nice to meet you", the opening phase ("Nice") has palms touching/sliding,
-                # which MediaPipe frequently detects as 1 merged hand.
-                # In "How are you", initial hand elevation may register 1 hand before both are tracked.
-                if raw_pred.upper().endswith("_START") or raw_pred.upper().endswith("_END") or str(heur).upper().endswith("_START") or str(heur).upper().endswith("_END"):
-                    heur = raw_pred.upper()
-            elif cand_clean == "fine":
-                if raw_pred.upper().endswith("_END") or str(heur).upper().endswith("_END"):
-                    heur = raw_pred.upper()
-                else:
-                    heur = "—"
-                    conf = 0.0
 
         pred_label = heur
         confidence = conf

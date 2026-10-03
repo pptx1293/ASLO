@@ -96,6 +96,46 @@ let voiceSentence = "";
 let clientLastWord = "";
 let clientStabilityBuffer = [];
 let clientLastTriggerTime = 0;
+let clientDisplayHistory = [];
+let clientSmoothedDisplayGesture = "—";
+
+function getSmoothedDisplayGesture(newDisplay) {
+    if (!newDisplay || newDisplay === "—") {
+        clientDisplayHistory.push("—");
+        if (clientDisplayHistory.length > 3) clientDisplayHistory.shift();
+        if (clientDisplayHistory.filter(x => x === "—").length >= 2) {
+            clientSmoothedDisplayGesture = "—";
+        }
+        return clientSmoothedDisplayGesture;
+    }
+
+    if (newDisplay.includes("(IN MOTION)")) {
+        clientDisplayHistory = [newDisplay];
+        clientSmoothedDisplayGesture = newDisplay;
+        return newDisplay;
+    }
+
+    clientDisplayHistory.push(newDisplay);
+    if (clientDisplayHistory.length > 3) clientDisplayHistory.shift();
+
+    const counts = {};
+    for (const g of clientDisplayHistory) {
+        counts[g] = (counts[g] || 0) + 1;
+    }
+    let topGesture = clientSmoothedDisplayGesture;
+    let maxCount = 0;
+    for (const [g, count] of Object.entries(counts)) {
+        if (count > maxCount) {
+            maxCount = count;
+            topGesture = g;
+        }
+    }
+    if (maxCount >= 2) {
+        clientSmoothedDisplayGesture = topGesture;
+    }
+    return clientSmoothedDisplayGesture;
+}
+
 let clientDynamicGesture = null;
 let clientDynamicStartTime = 0;
 let clientDynamicNeutralStart = 0;
@@ -783,9 +823,8 @@ async function sendLandmarksInference(results, stabilizedHands = []) {
             const y1 = w1.y !== undefined ? w1.y : w1[1];
             const wristDist = Math.hypot(x0 - x1, y0 - y1);
 
-            // If wrists are in the same location (< 0.15), or same hand detected twice with dist < 0.22,
-            // this is a single physical hand detected twice!
-            if (wristDist < 0.15 || (h0Hand === h1Hand && wristDist < 0.22)) {
+            // If wrists are in the exact same location (< 0.05), it is a single physical hand detected twice
+            if (wristDist < 0.05) {
                 const primaryHand = (h0Hand === "Right") ? h0Smoothed : ((h1Hand === "Right") ? h1Smoothed : h0Smoothed);
                 const primaryLabel = (h0Hand === "Right" || h1Hand === "Right") ? "Right" : h0Hand;
                 if (primaryLabel === "Left") {
@@ -2077,12 +2116,13 @@ function applyTelemetry(data) {
         displayGesture = cleanPredUpper;
     }
 
+    const smoothedDisplay = getSmoothedDisplayGesture(displayGesture);
     if (dom.gestureLabel) {
-        dom.gestureLabel.textContent = displayGesture;
+        dom.gestureLabel.textContent = smoothedDisplay;
     }
     const currentSignEl = document.getElementById("current-sign");
     if (currentSignEl && currentSignEl !== dom.gestureLabel) {
-        currentSignEl.textContent = displayGesture;
+        currentSignEl.textContent = smoothedDisplay;
     }
 
     // Live confidence
@@ -2167,13 +2207,13 @@ function applyTelemetry(data) {
             // 3. True LAST FRAME (held at >= 1.5s): user performs end pose (Nice to meet you_END or YOU)
             const isPointingYou = (rawPredUpper === "YOU" || cleanPredUpper === "YOU" || (data.right_gesture && String(data.right_gesture).toUpperCase() === "YOU"));
             const isNiceEndPose = (rawPredUpper === "NICE TO MEET YOU_END" || rawPredUpper.endsWith("_END"));
-            if ((elapsedSec >= 1.5 && isNiceEndPose) || (elapsedSec >= 1.2 && isPointingYou)) {
+            if (elapsedSec >= 1.5 && (isNiceEndPose || isPointingYou)) {
                 isEndSignal = true;
             }
         } else if (clientDynamicGesture === "HOW ARE YOU") {
             const isPointingYou = (rawPredUpper === "YOU" || cleanPredUpper === "YOU" || (data.right_gesture && String(data.right_gesture).toUpperCase() === "YOU"));
             const isHowEndPose = (rawPredUpper === "HOW ARE YOU_END" || rawPredUpper.endsWith("_END"));
-            if (elapsedSec >= 0.65 && (isPointingYou || isHowEndPose)) {
+            if (elapsedSec >= 0.8 && (isPointingYou || isHowEndPose)) {
                 isEndSignal = true;
             }
         } else {
@@ -2234,7 +2274,7 @@ function applyTelemetry(data) {
     const isStartCandidate = (now >= clientDynamicCooldownUntil) && (
         rawPredUpper.endsWith("_START")
     );
-    if (isStartCandidate && confVal >= 0.40) {
+    if (isStartCandidate && confVal >= 0.40 && DYNAMIC_GESTURES.has(cleanPredUpper)) {
         const candidate = cleanPredUpper;
         clientDynamicGesture = candidate;
         clientDynamicStartTime = now;
@@ -2303,7 +2343,7 @@ function applyTelemetry(data) {
             return;
         }
         if (upper === "START" || upper === "STOP") {
-            if (data.detected_hand !== "both" || confVal < 0.55) {
+            if (data.detected_hand !== "both" || confVal < 0.35) {
                 clientStabilityBuffer = [];
                 return;
             }
