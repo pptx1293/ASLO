@@ -80,31 +80,10 @@ if os.path.exists(DATASET_DIR):
             FOLDER_NAMES_MAP[fname.lower().replace(" ", "_").strip()] = fname
 
 NEUTRAL_INDEX = None
-ME_INDEX = None
-X_INDEX = None
-U_INDEX = None
-V_INDEX = None
-R_INDEX = None
-H_INDEX = None
-W_INDEX = None
 if label_classes is not None:
     classes_list = list(label_classes)
     if "neutral" in classes_list:
         NEUTRAL_INDEX = classes_list.index("neutral")
-    if "ME" in classes_list:
-        ME_INDEX = classes_list.index("ME")
-    if "X" in classes_list:
-        X_INDEX = classes_list.index("X")
-    if "U" in classes_list:
-        U_INDEX = classes_list.index("U")
-    if "V" in classes_list:
-        V_INDEX = classes_list.index("V")
-    if "R" in classes_list:
-        R_INDEX = classes_list.index("R")
-    if "H" in classes_list:
-        H_INDEX = classes_list.index("H")
-    if "W" in classes_list:
-        W_INDEX = classes_list.index("W")
 
 
 def get_clean_folder_label(label: str):
@@ -342,11 +321,6 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         # Check if neutral probability is elevated or hand is in resting position
         wrist_y = single_lms.landmark[0].y
         prob_neutral = float(probs[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(probs)) else 0.0
-        prob_me = float(probs[ME_INDEX]) if (ME_INDEX is not None and ME_INDEX < len(probs)) else 0.0
-        prob_x = float(probs[X_INDEX]) if (X_INDEX is not None and X_INDEX < len(probs)) else 0.0
-        prob_u = float(probs[U_INDEX]) if (U_INDEX is not None and U_INDEX < len(probs)) else 0.0
-        prob_h = float(probs[H_INDEX]) if (H_INDEX is not None and H_INDEX < len(probs)) else 0.0
-        prob_w = float(probs[W_INDEX]) if (W_INDEX is not None and W_INDEX < len(probs)) else 0.0
 
         is_neutral = (
             raw_pred.lower() == "neutral"
@@ -619,7 +593,7 @@ def api_transcribe_audio():
 
 
 def _retrain_model_background():
-    global is_retraining, model, label_classes, NEUTRAL_INDEX, ME_INDEX, X_INDEX, U_INDEX, V_INDEX, R_INDEX, H_INDEX, W_INDEX
+    global is_retraining, model, label_classes, NEUTRAL_INDEX
     try:
         subprocess.run([sys.executable, "train_model.py"], check=True)
         model = models.load_model(model_path)
@@ -627,13 +601,6 @@ def _retrain_model_background():
         if label_classes is not None:
             classes_list = list(label_classes)
             NEUTRAL_INDEX = classes_list.index("neutral") if "neutral" in classes_list else None
-            ME_INDEX = classes_list.index("ME") if "ME" in classes_list else None
-            X_INDEX = classes_list.index("X") if "X" in classes_list else None
-            U_INDEX = classes_list.index("U") if "U" in classes_list else None
-            V_INDEX = classes_list.index("V") if "V" in classes_list else None
-            R_INDEX = classes_list.index("R") if "R" in classes_list else None
-            H_INDEX = classes_list.index("H") if "H" in classes_list else None
-            W_INDEX = classes_list.index("W") if "W" in classes_list else None
         print(f"Model successfully retrained and reloaded. Now has {len(label_classes)} classes.")
     except Exception as e:
         print(f"Error during retraining: {e}")
