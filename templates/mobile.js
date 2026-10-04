@@ -74,8 +74,10 @@ let mobileSmoothedDisplaySign = "—";
 let mobileSmoothedConf = 0;
 
 // ── Sliding Window & Hysteresis Hold Constants & State ─────────────────────
-const PREDICTION_WINDOW_MAX = 4;
-const MAJORITY_VOTE_RATIO = 0.75; // 3 out of 4 frames
+const N_FRAME = 5;
+const N_FRAMES = 5;
+const PREDICTION_WINDOW_MAX = 5;
+const MAJORITY_VOTE_RATIO = 0.60; // 3 out of 5 frames
 const GESTURE_LOCK_HOLD_MS = 120; // Sub-150ms hold lockout
 
 let mobilePredictionWindow = [];
@@ -129,8 +131,8 @@ let dynamicReadyForStart = true;
 let clientLastDynamicCommitted = { gesture: "", time: 0 };
 let lastLeftHandToastTime = 0;
 const REPEAT_DELAY_MS = 140; // Sub-150ms repeat cooldown
-const STABILITY_REQUIRED_COUNT = 3; // 3 out of 4 frames
-const BUFFER_MAX_LEN = 4;
+const STABILITY_REQUIRED_COUNT = 3; // 3 out of 5 frames
+const BUFFER_MAX_LEN = 5;
 
 let isSoundMuted = localStorage.getItem("aslo_mobile_sound_muted") === "true";
 let stabilitySegmentsCount = 8;
@@ -399,21 +401,29 @@ function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
     for (let j = 1; j < pool.length; j++) {
         const cand = pool[j];
 
-        // 1. Strict handedness pairing: exactly ONE Right and ONE Left
-        const isOpposite = (
-            (primary.physicalHand === "Right" && cand.physicalHand === "Left") ||
-            (primary.physicalHand === "Left" && cand.physicalHand === "Right")
-        );
-        if (!isOpposite) continue;
-
-        // 2. Spatial anthropometric consistency
         const dy = Math.abs(primary.wrist.y - cand.wrist.y);
         const dx = Math.abs(primary.wrist.x - cand.wrist.x);
         const wristDist = Math.hypot(primary.wrist.x - cand.wrist.x, primary.wrist.y - cand.wrist.y);
 
-        if (dy >= 0.25 || dx >= 0.55) continue;
-        if ((primary.wrist.x < 0.20 && cand.wrist.x > 0.80) || (cand.wrist.x < 0.20 && primary.wrist.x > 0.80)) continue;
-        if (wristDist < 0.12) continue;
+        if (dy >= 0.40 || dx >= 0.65) continue;
+        if ((primary.wrist.x < 0.15 && cand.wrist.x > 0.85) || (cand.wrist.x < 0.15 && primary.wrist.x > 0.85)) continue;
+        if (wristDist < 0.04) continue; // Only discard exact identical duplicate detections
+
+        // Handedness pairing: opposite or spatial assignment if MediaPipe misclassified identical handedness
+        let isOpposite = (
+            (primary.physicalHand === "Right" && cand.physicalHand === "Left") ||
+            (primary.physicalHand === "Left" && cand.physicalHand === "Right")
+        );
+        if (!isOpposite) {
+            // Assign opposite based on horizontal position so touching/overlapping hands in START/STOP pair reliably
+            if (cand.wrist.x < primary.wrist.x) {
+                cand.physicalHand = isMirrored ? "Right" : "Left";
+                primary.physicalHand = isMirrored ? "Left" : "Right";
+            } else {
+                cand.physicalHand = isMirrored ? "Left" : "Right";
+                primary.physicalHand = isMirrored ? "Right" : "Left";
+            }
+        }
 
         pairedSecond = cand;
         break;
@@ -1276,7 +1286,6 @@ function applyMobileTelemetry(data) {
 
     const now = Date.now();
     const rawPred = String(data.raw_pred || data.prediction || "").toUpperCase().trim();
-    const cleanPred = stripInternalSuffix(data.prediction).trim();
 
     // 2. Dynamic Gesture Sequence Countdown Handling
     if (clientDynamicGesture) {
@@ -1431,6 +1440,7 @@ function applyMobileTelemetry(data) {
     }
 
     // ── State Hysteresis & Latching Prediction Handler ──
+    const cleanPred = displaySign || cleanPredUpper || stripInternalSuffix(data.prediction || "");
     if (now < lockUntil && activeSign !== null) {
         // Cooldown lockout: maintain current sign without volatile interim swapping
         if (dom.signVal) dom.signVal.textContent = activeSign;

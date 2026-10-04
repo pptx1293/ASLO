@@ -418,7 +418,12 @@ def validate_feature_vector(feature_vector) -> np.ndarray:
 
 def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, route_mode="STATIC"):
     """
-    Stabilizes and disambiguates signs using anatomical finger curl and thumb geometry checks.
+    Stabilizes and disambiguates signs using anatomical finger curl and thumb geometry checks:
+    1. Disambiguates N vs T (fist with thumb under index PIP vs thumb between index & middle).
+    2. Disambiguates A vs S (fist with thumb upright on side vs thumb folded across front knuckles).
+    3. Disambiguates S vs O (fist with curled tucked fingertips vs curved circular "O" loop).
+    4. Disambiguates P vs Q vs Z (middle pointing down with index forward vs index pointing sharply down vs index pointing up).
+    5. Disambiguates U vs V vs R (parallel fingers side-by-side vs spread apart V vs crossed fingers R).
     """
     if label is None or str(label).strip() in ("", "—", "none", "NONE"):
         return "—"
@@ -442,30 +447,78 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
         ring_pip = np.array([lms[14].x, lms[14].y], dtype=np.float32)
         pky_tip = np.array([lms[20].x, lms[20].y], dtype=np.float32)
         pky_pip = np.array([lms[18].x, lms[18].y], dtype=np.float32)
+        thb_tip = np.array([lms[4].x, lms[4].y], dtype=np.float32)
 
-        # Check if 3 outer fingers are curled into palm
+        pky_mcp = np.array([lms[17].x, lms[17].y], dtype=np.float32)
+        idx_mcp = np.array([lms[5].x, lms[5].y], dtype=np.float32)
+        palm_w = float(max(np.linalg.norm(pky_mcp - idx_mcp), 1e-6))
+        palm_scale = float(max(np.linalg.norm(np.array([lms[9].x, lms[9].y], dtype=np.float32) - wrist), 1e-6))
+
+        # Check if outer fingers are curled into palm
         is_curled_mid = (np.linalg.norm(mid_tip - wrist) <= np.linalg.norm(mid_pip - wrist) * 1.20)
         is_curled_ring = (np.linalg.norm(ring_tip - wrist) <= np.linalg.norm(ring_pip - wrist) * 1.20)
         is_curled_pky = (np.linalg.norm(pky_tip - wrist) <= np.linalg.norm(pky_pip - wrist) * 1.20)
         is_fist = bool(is_curled_mid and is_curled_ring and is_curled_pky)
 
-        if is_fist:
-            # Disambiguate N vs T:
-            # In ASL 'T', thumb is tucked under index finger, resting right at index PIP knuckle (d_idx_pip < 0.42).
-            # In ASL 'N', thumb is tucked under index & middle fingers, resting between middle & ring (d_idx_pip >= 0.42).
-            pky_mcp = np.array([lms[17].x, lms[17].y], dtype=np.float32)
-            idx_mcp = np.array([lms[5].x, lms[5].y], dtype=np.float32)
-            palm_w = float(max(np.linalg.norm(pky_mcp - idx_mcp), 1e-6))
-            thb_tip = np.array([lms[4].x, lms[4].y], dtype=np.float32)
+        # ── 1. N vs T Disambiguation ──
+        if is_fist and lbl_clean in ("t", "n"):
             d_idx_pip = float(np.linalg.norm(thb_tip - idx_pip) / palm_w)
+            if d_idx_pip >= 0.42:
+                return "N"
+            else:
+                return "T"
 
-            if lbl_clean in ("t", "n"):
-                if d_idx_pip >= 0.42:
-                    return "N"
-                else:
-                    return "T"
+        # ── 2. A vs S Disambiguation ──
+        # In ASL 'A', thumb is resting straight up on the outer side of the index finger.
+        # In ASL 'S', thumb is folded horizontally across the front of the curled fingers.
+        if is_fist and lbl_clean in ("a", "s"):
+            mid_mcp = np.array([lms[9].x, lms[9].y], dtype=np.float32)
+            d4_to_9 = float(np.linalg.norm(thb_tip - mid_mcp) / palm_w)
+            dy_thb_idx = float((lms[4].y - lms[5].y) / palm_w)  # y is positive downward
 
-        # Disambiguate two-extended fingers family: U vs V vs R
+            if d4_to_9 >= 0.65 or dy_thb_idx < -0.40:
+                return "A"
+            elif d4_to_9 < 0.55 and dy_thb_idx > -0.35:
+                return "S"
+            return "A" if lbl_clean == "a" else "S"
+
+        # ── 3. S vs O Disambiguation ──
+        # In 'S' (fist), fingertips 8 & 12 are tucked close into palm (< 0.98 of palm scale).
+        # In 'O', fingers arc forward touching thumb to form an open circle (tips >= 1.02 of palm scale).
+        if lbl_clean in ("s", "o"):
+            tuck8 = float(np.linalg.norm(idx_tip - wrist) / palm_scale)
+            tuck12 = float(np.linalg.norm(mid_tip - wrist) / palm_scale)
+            if tuck8 < 0.98 and tuck12 < 0.98:
+                return "S"
+            elif tuck8 >= 1.02 and tuck12 >= 1.02:
+                return "O"
+            return "S" if lbl_clean == "s" else "O"
+
+        # ── 4. P vs Q vs Z Disambiguation ──
+        # In 'P': index points forward/downward (-0.50 <= idx_dy <= 0.85) and middle points DOWN (mid_dy >= 0.75).
+        # In 'Q': index points sharply straight down to floor (idx_dy >= 1.20) and middle is curled in palm.
+        # In 'Z': index points up or forward-up (idx_dy < 0.35) and middle is curled in palm.
+        if lbl_clean in ("p", "q", "z", "z_start", "z_end"):
+            idx_dy = float((lms[8].y - lms[5].y) / palm_w)
+            mid_dy = float((lms[12].y - lms[9].y) / palm_w)
+
+            # In P, middle finger points downward and index is forward/downward
+            is_p_mid_down = (mid_dy >= 0.75 and lms[12].y > lms[9].y + 0.02)
+            is_p_idx_fwd = (idx_dy < 0.90)
+
+            if is_p_mid_down and is_p_idx_fwd:
+                return "P"
+            elif idx_dy >= 1.20 and (mid_dy < 1.0 or lms[8].y > lms[12].y + 0.05):
+                return "Q"
+            elif idx_dy < 0.35 and mid_dy < 0.70:
+                return "Z" if (lbl_clean == "z" or route_mode == "DYNAMIC") else "P"
+            return "P" if lbl_clean == "p" else ("Q" if lbl_clean == "q" else "Z")
+
+        # ── 5. U vs V vs R Disambiguation ──
+        # ASL anatomy:
+        # U: Index + Middle extended straight up, parallel side-by-side. Ring + Pinky curled.
+        # V: Index + Middle extended straight up, spread apart in distinct 'V'. Ring + Pinky curled.
+        # R: Index + Middle extended straight up, crossed over each other. Ring + Pinky curled.
         is_ext_idx = (np.linalg.norm(idx_tip - wrist) > np.linalg.norm(idx_pip - wrist) * 1.15)
         is_ext_mid = (np.linalg.norm(mid_tip - wrist) > np.linalg.norm(mid_pip - wrist) * 1.15)
         is_curled_ring = (np.linalg.norm(ring_tip - wrist) <= np.linalg.norm(ring_pip - wrist) * 1.30)
@@ -473,10 +526,6 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
         is_two_extended = bool(is_ext_idx and is_ext_mid and is_curled_ring and is_curled_pky)
 
         if is_two_extended and lbl_clean in ("u", "v", "r"):
-            pky_mcp = np.array([lms[17].x, lms[17].y], dtype=np.float32)
-            idx_mcp = np.array([lms[5].x, lms[5].y], dtype=np.float32)
-            palm_w = float(max(np.linalg.norm(pky_mcp - idx_mcp), 1e-6))
-
             p5 = np.array([lms[5].x, lms[5].y], dtype=np.float32)
             p8 = np.array([lms[8].x, lms[8].y], dtype=np.float32)
             p9 = np.array([lms[9].x, lms[9].y], dtype=np.float32)
@@ -494,14 +543,28 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
                 return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
             has_cross = (_ccw(p5, p9, p12) != _ccw(p8, p9, p12)) and (_ccw(p5, p8, p9) != _ccw(p5, p8, p12))
 
-            # 1. In V, index and middle fingertips are spread apart
-            if d_tip >= 0.46:
-                return "V"
-            # 2. In R, middle finger crosses over index finger
-            elif has_cross or proj <= 0.35:
-                return "R"
-            # 3. In U, fingers are held straight and parallel side-by-side
-            else:
+            # Preserve neural network predictions without spurious overrides:
+            if lbl_clean == "u":
+                # Only override U with V if fingertips are spread wide apart (clear V)
+                if d_tip >= 0.65 and proj >= 1.40:
+                    return "V"
+                # Only override U with R if fingers are crossed
+                elif has_cross or proj <= 0.15:
+                    return "R"
                 return "U"
+            elif lbl_clean == "r":
+                # R: fingers crossed. Do not override with U or V unless clearly spread or parallel
+                if d_tip >= 0.65 and proj >= 1.40:
+                    return "V"
+                elif proj >= 0.70 and d_tip >= 0.32 and not has_cross:
+                    return "U"
+                return "R"
+            elif lbl_clean == "v":
+                # Only override V with U if fingertips are held close together
+                if d_tip < 0.38 and proj < 0.85:
+                    return "U"
+                elif has_cross or proj <= 0.15:
+                    return "R"
+                return "V"
 
     return str(label).strip().upper()

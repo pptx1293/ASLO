@@ -69,6 +69,8 @@ hands = None
 # ── ASLO Pipeline Configurations ───────────────────────────────────────────
 low_light_enhancer = LowLightEnhancer(base_clip_limit=2.5, tile_grid_size=(8, 8))
 margin_verifier = SoftmaxMarginVerifier(min_confidence=0.55, min_margin=0.10)
+N_FRAME = 5
+N_FRAMES = 5
 
 TWO_HANDED_LABELS = {
     "START", "STOP", "SPACE", "BACK SPACE", "BACKSPACE", "NEUTRAL",
@@ -254,8 +256,8 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
     is_two_hand_inference = False
     if all_hands and len(all_hands) >= 2:
-        h0_pts = all_hands[0].get("points", [])
-        h1_pts = all_hands[1].get("points", [])
+        h0_pts = _to_mirrored(all_hands[0].get("points", []))
+        h1_pts = _to_mirrored(all_hands[1].get("points", []))
         h0_lbl = (all_hands[0].get("label") or "").capitalize().strip()
         h1_lbl = (all_hands[1].get("label") or "").capitalize().strip()
 
@@ -267,7 +269,7 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             w1 = np.array([h1_pts[0][0], h1_pts[0][1]])
             d_wrists = float(np.linalg.norm(w0 - w1))
 
-        if has_opposite_handedness and d_wrists >= 0.20:
+        if d_wrists >= 0.04 and (has_opposite_handedness or (hand_type_clean == "both") or len(all_hands) == 2):
             is_two_hand_inference = True
         else:
             # Fall back to single hand: prioritize Right hand if detected
@@ -279,8 +281,6 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
                 landmarks_data = h0_pts
 
     if is_two_hand_inference:
-        h0_pts = all_hands[0].get("points", [])
-        h1_pts = all_hands[1].get("points", [])
         h0_label = (all_hands[0].get("label") or "Right").capitalize().strip()
         h1_label = (all_hands[1].get("label") or "Left").capitalize().strip()
 
@@ -296,8 +296,8 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             else:
                 r_pts, l_pts = h1_pts, h0_pts
 
-        r_lms = aslo_features.HandLandmarks(_to_mirrored(r_pts))
-        l_lms = aslo_features.HandLandmarks(_to_mirrored(l_pts))
+        r_lms = aslo_features.HandLandmarks(r_pts)
+        l_lms = aslo_features.HandLandmarks(l_pts)
 
         feats_both = aslo_features.validate_feature_vector(aslo_features.extract_two_hand_features(r_lms, l_lms))
         feats_r = aslo_features.validate_feature_vector(aslo_features.extract_single_hand_features(r_lms, is_left_hand=False))
@@ -325,6 +325,10 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             verified_both = "NEUTRAL"
             pred_status = "valid"
         else:
+            if top_class_name and str(top_class_name).lower() in ("start", "stop") and p_top_both >= 0.40:
+                verified_both = str(top_class_name).upper()
+                conf_both = p_top_both
+                pred_status = "valid"
             both_live_gesture = (verified_both.upper() if verified_both else "—")
             both_live_conf = conf_both
 
@@ -375,8 +379,23 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             conf = max(prob_neutral, 0.75 if is_resting else conf_single)
             pred_status = "valid"
         elif verified_single is None:
-            heur = None
-            conf = conf_single
+            # Check if ambiguity is between known disambiguation pairs
+            pair_set = {str(top_class_name).upper().strip(), str(second_class_name).upper().strip()}
+            can_disambiguate = (
+                bool(pair_set.intersection({"U", "V", "R"})) or
+                bool(pair_set.intersection({"A", "S"})) or
+                bool(pair_set.intersection({"S", "O"})) or
+                bool(pair_set.intersection({"P", "Q", "Z", "Z_START", "Z_END"})) or
+                bool(pair_set.intersection({"N", "T"}))
+            )
+            if can_disambiguate and p_top_single >= 0.40:
+                resolved = aslo_features.apply_heuristics(single_lms, top_class_name, is_left_hand=False, confidence=p_top_single)
+                heur = resolved
+                conf = p_top_single
+                pred_status = "valid"
+            else:
+                heur = None
+                conf = conf_single
         else:
             if verified_single.lower() == "neutral":
                 heur = "NEUTRAL"
