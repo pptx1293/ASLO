@@ -4,8 +4,8 @@ import time
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-FIST_GEOMETRY_LEN = 24
-FEATURE_LEN = 226 + 2 * FIST_GEOMETRY_LEN  # 274
+FIST_GEOMETRY_LEN = 42
+FEATURE_LEN = 226 + 2 * FIST_GEOMETRY_LEN  # 310
 
 
 class LandmarkPoint:
@@ -155,14 +155,22 @@ def _joint_angles(hand_landmarks) -> list[float]:
 
 
 def _fist_geometry_from_norm_coords(norm_pts: np.ndarray) -> list[float]:
-    """Computes explicit 24-dim thumb-to-finger relational geometry:
+    """Computes explicit 42-dim knuckle-slot relational geometry:
     1. Distances and vectors from Thumb Tip (4) to Index MCP (5), Index PIP (6), Middle MCP (9), Middle PIP (10), Ring MCP (13), and Index Tip (8).
     2. Thumb curl vector (1 -> 4) and direction alignment with Index proximal vector (5 -> 6).
     3. Fingertip tuck depths from wrist (0) for fingertips 8, 12, 16, 20.
+    4. Disambiguating "T" vs "S":
+       - Offset vector v_T_slot = P4 - (P5 + P9) / 2 (x, y, z) and distance.
+       - Height of Thumb Tip (4) relative to Index PIP (6), Middle PIP (10), and crease between 6 and 10.
+    5. Disambiguating "N" vs "M":
+       - Slot N distance: dist(P4, (P9 + P13) / 2) and offset vector (x, y, z).
+       - Slot M distance: dist(P4, (P13 + P17) / 2) and offset vector (x, y, z).
+       - Thumb Tip relative to Ring MCP (13): dx = P4[0] - P13[0], dy = P4[1] - P13[1].
+       - Slot difference: dist_slot_N - dist_slot_M.
     """
     pts = norm_pts.astype(np.float32)
 
-    # 1. Thumb Tip (4) relative to Index MCP (5), Index PIP (6), Middle MCP (9), Middle PIP (10)
+    # 1. Base knuckle distances and vectors from Thumb Tip (4)
     v45 = pts[4] - pts[5]
     d45 = float(np.linalg.norm(v45))
 
@@ -194,14 +202,56 @@ def _fist_geometry_from_norm_coords(norm_pts: np.ndarray) -> list[float]:
     tuck16 = float(np.linalg.norm(pts[16] - pts[0]))
     tuck20 = float(np.linalg.norm(pts[20] - pts[0]))
 
+    # 4. Explicit Disambiguation for "T" vs "S":
+    # Midpoint between Index MCP (5) and Middle MCP (9)
+    mid_59 = (pts[5] + pts[9]) * 0.5
+    v_t_slot = pts[4] - mid_59
+    d_t_slot = float(np.linalg.norm(v_t_slot))
+
+    # Height of Thumb Tip (4) relative to Index PIP (6) and Middle PIP (10)
+    h_4_6 = float(pts[4][1] - pts[6][1])
+    h_4_10 = float(pts[4][1] - pts[10][1])
+    mid_pip_6_10_y = float((pts[6][1] + pts[10][1]) * 0.5)
+    h_crease = float(pts[4][1] - mid_pip_6_10_y)
+
+    # 5. Explicit Disambiguation for "N" vs "M":
+    # Slot N: Midpoint between Middle MCP (9) and Ring MCP (13)
+    mid_913 = (pts[9] + pts[13]) * 0.5
+    v_slot_n = pts[4] - mid_913
+    dist_slot_n = float(np.linalg.norm(v_slot_n))
+
+    # Slot M: Midpoint between Ring MCP (13) and Pinky MCP (17)
+    mid_1317 = (pts[13] + pts[17]) * 0.5
+    v_slot_m = pts[4] - mid_1317
+    dist_slot_m = float(np.linalg.norm(v_slot_m))
+
+    # Thumb Tip relative to Ring MCP (13)
+    dx_4_13 = float(pts[4][0] - pts[13][0])
+    dy_4_13 = float(pts[4][1] - pts[13][1])
+    diff_slot_nm = float(dist_slot_n - dist_slot_m)
+
     feats = [
+        # Base 24 features
         d45, d46, d49, d410, d413, d48,
         float(v45[0]), float(v45[1]), float(v45[2]),
         float(v46[0]), float(v46[1]), float(v46[2]),
         float(v49[0]), float(v49[1]), float(v49[2]),
         float(v_th[0]), float(v_th[1]), float(v_th[2]),
         dot, angle,
-        tuck8, tuck12, tuck16, tuck20
+        tuck8, tuck12, tuck16, tuck20,
+
+        # T vs S features (7 features)
+        float(v_t_slot[0]), float(v_t_slot[1]), float(v_t_slot[2]),
+        d_t_slot,
+        h_4_6, h_4_10, h_crease,
+
+        # N vs M features (11 features)
+        float(v_slot_n[0]), float(v_slot_n[1]), float(v_slot_n[2]),
+        dist_slot_n,
+        float(v_slot_m[0]), float(v_slot_m[1]), float(v_slot_m[2]),
+        dist_slot_m,
+        dx_4_13, dy_4_13,
+        diff_slot_nm
     ]
     return feats
 
@@ -209,12 +259,12 @@ def _fist_geometry_from_norm_coords(norm_pts: np.ndarray) -> list[float]:
 def resolve_fist_tie_breaker(norm_pts: np.ndarray, top_label: str, runner_up_label: str = None, margin: float = 0.0) -> Optional[str]:
     """
     Deterministic Geometric Tie-Breakers for closed-fist cluster ['A', 'S', 'T', 'N', 'M', 'E'].
-    Evaluates exact knuckle & thumb placement geometry:
-    - 'A': Thumb Tip (4) rests laterally along outer edge of Index MCP (5), pointing upright, not crossing over fingers.
-    - 'S': Thumb Tip (4) crosses directly over center of curled fingers (across index ID 6 and middle ID 10).
-    - 'T': Thumb Tip (4) is tucked strictly between index (5/6) and middle (9/10), poking upward.
-    - 'N': Thumb Tip (4) crosses under index and middle fingers, protruding between middle and ring fingers.
-    - 'M': Thumb Tip (4) crosses under index, middle, and ring fingers, protruding between ring and pinky.
+    Specialized for T vs S and N vs M disambiguation:
+    - 'T': Thumb Tip (4) is wedged between Index (5/6) and Middle (9/10), poking upward (y4 < y6).
+    - 'S': Thumb Tip (4) crosses flat across the front curled fingers (y4 >= y6).
+    - 'N': Thumb Tip (4) is closer to Slot N (between Middle 9 and Ring 13), resting on thumb-side of Ring MCP (13).
+    - 'M': Thumb Tip (4) penetrates past Ring MCP (13) towards Slot M (between Ring 13 and Pinky 17).
+    - 'A': Thumb Tip (4) rests laterally along outer edge of Index MCP (5), pointing upright.
     - 'E': All four fingertips curl tightly into palm base with the thumb curled flat beneath them.
     """
     pts = np.asarray(norm_pts, dtype=np.float32)
@@ -263,34 +313,74 @@ def resolve_fist_tie_breaker(norm_pts: np.ndarray, top_label: str, runner_up_lab
     tuck20 = float(np.linalg.norm(p20 - p0))
     avg_tuck = (tuck8 + tuck12 + tuck16 + tuck20) / 4.0
 
-    # 1. Check 'E': all 4 fingertips tightly tucked into palm, thumb pulled flat underneath
-    if up_proj < -0.05 and avg_tuck < 0.95 and cross_proj > 0.05:
+    # Invariant knuckle span and projection (from Index 5 to Pinky 17)
+    L_knuckle = float(np.linalg.norm(p17 - p5)) + 1e-6
+    u_across = (p17 - p5) / L_knuckle
+    proj_k = float(np.dot(p4 - p5, u_across) / L_knuckle)
+
+    # Invariant vertical extension along fingers (proximal -> distal)
+    u_up = (p9 - p0) / (float(np.linalg.norm(p9 - p0)) + 1e-6)
+    up_proj = float(np.dot(p4 - p9, u_up))
+    is_protruding_up = (p4[1] < p6[1]) or (up_proj > 0.08)
+
+    passed_middle = (p4[0] < p9[0]) if (p17[0] < p5[0]) else (p4[0] > p9[0])
+    passed_ring = (p4[0] < p13[0]) if (p17[0] < p5[0]) else (p4[0] > p13[0])
+
+    dist_to_slot_N = float(np.linalg.norm(p4[:2] - ((p9[:2] + p13[:2]) * 0.5)))
+    dist_to_slot_M = float(np.linalg.norm(p4[:2] - ((p13[:2] + p17[:2]) * 0.5)))
+
+    top_upper = (top_label or "").upper().strip()
+    runner_upper = (runner_up_label or "").upper().strip()
+    pair_set = {top_upper, runner_upper}
+
+    # 1. Confident model prediction preservation
+    if top_upper in ["A", "S", "T", "N", "M", "E"] and margin >= 0.25 and runner_upper not in ["S", "T", "M", "N"]:
+        return top_upper
+
+    # 2. Check 'E': all 4 fingertips tightly tucked into palm, thumb pulled flat underneath
+    if up_proj < -0.05 and avg_tuck < 0.95 and proj_k > 0.05:
         return "E"
 
-    # 2. Check 'A': Thumb rests laterally on outer edge of index, pointing upright (NOT crossing over fingers)
-    if (lat_proj > 0.04 or cross_proj < -0.05) and up_proj > 0.10 and d49 > 0.38:
+    # 3. Check 'A': Thumb rests laterally on outer edge of index, pointing upright
+    if proj_k < -0.20 and up_proj > 0.10:
         return "A"
 
-    # 3. Check 'T': Thumb tip tucked between index and middle, poking upward
-    if d46 < 0.22 and d410 < 0.25 and up_proj > 0.15:
-        return "T"
-
-    # 4. Check 'N': Thumb tucked under index & middle, protruding between middle and ring
-    if cross_proj > 0.01 and cross_proj < 0.12 and d410 < 0.28 and d414 < 0.30:
-        return "N"
-
-    # 5. Check 'M': Thumb tucked under index, middle & ring, protruding between ring and pinky
-    if cross_proj >= 0.13 and d414 < 0.32:
-        return "M"
-
-    # 6. Check 'S': Thumb wrapped horizontally across front of curled fingers (across index 6 and middle 10)
-    if d46 < 0.40 and d410 < 0.40 and cross_proj > -0.02:
+    # 4. Check 'S' vs any protruding sign (T, N, M):
+    if "S" in pair_set and not is_protruding_up:
         return "S"
 
-    if top_label in ["A", "S", "T", "N", "M", "E"] and margin >= 0.20:
-        return top_label
+    # 5. Pairwise T vs N disambiguation:
+    if "T" in pair_set and "N" in pair_set:
+        return "N" if passed_middle else "T"
 
-    return top_label or "S"
+    # 6. Pairwise T vs S disambiguation:
+    if "T" in pair_set and "S" in pair_set:
+        return "T" if (is_protruding_up and not passed_middle) else "S"
+
+    # 7. Pairwise N vs S disambiguation:
+    if "N" in pair_set and "S" in pair_set:
+        return "N" if (is_protruding_up and passed_middle) else "S"
+
+    # 8. Pairwise M vs N disambiguation:
+    if "M" in pair_set and "N" in pair_set:
+        return "N" if dist_to_slot_N < dist_to_slot_M else "M"
+
+    # 9. Pairwise M vs S disambiguation:
+    if "M" in pair_set and "S" in pair_set:
+        return "M" if is_protruding_up else "S"
+
+    # 10. General fist resolution for ambiguous tight-margin predictions:
+    if top_upper in ["S", "T", "N", "M"] and margin < 0.25:
+        if not is_protruding_up:
+            return "S"
+        elif not passed_middle:
+            return "T"
+        elif dist_to_slot_N < dist_to_slot_M:
+            return "N"
+        else:
+            return "M"
+
+    return top_upper or "S"
 
 
 def _fist_disambiguation_features(hand_landmarks) -> list[float]:

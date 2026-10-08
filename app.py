@@ -383,19 +383,36 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
         print(f"[PREDICT] Detected: {top_class_name} ({p_top_single:.2f}), Runner-up: {second_class_name} ({p_second_single:.2f}), Diff: {margin_value:.2f}")
 
+        # Explicit Post-Inference Deterministic Geometric Tie-Breakers for Fist Ambiguities (T, N, M, S)
+        raw_pts = np.array([aslo_features._coords(lm) for lm in single_lms.landmark], dtype=np.float32)
+        top_upper = str(top_class_name).upper().strip()
+        second_upper = str(second_class_name).upper().strip()
+        pair_set = {top_upper, second_upper}
+        fist_set = {"S", "T", "N", "M", "A", "E"}
+
+        if (bool(pair_set.intersection(fist_set)) and margin_value < 0.25) or (top_upper in fist_set and margin_value < 0.25):
+            sc = float(np.linalg.norm(raw_pts[9] - raw_pts[0])) + 1e-6
+            norm_pts = (raw_pts - raw_pts[0]) / sc
+            resolved_fist = aslo_features.resolve_fist_tie_breaker(norm_pts, top_class_name, second_class_name, margin_value)
+            if resolved_fist:
+                top_class_name = resolved_fist
+                verified_single = resolved_fist
+                p_top_single = max(p_top_single, 0.85)
+                conf_single = p_top_single
+                pred_status = "valid"
+
         if is_resting or (prob_neutral >= 0.60 and conf_single < 0.30):
             heur = "NEUTRAL"
             conf = max(prob_neutral, 0.75 if is_resting else conf_single)
             pred_status = "valid"
-        elif (str(top_class_name).upper().strip() in FIST_CLUSTER and str(second_class_name).upper().strip() in FIST_CLUSTER and margin_value < 0.20):
+        elif (str(top_class_name).upper().strip() in FIST_CLUSTER and str(second_class_name).upper().strip() in FIST_CLUSTER and margin_value < 0.25):
             # Deterministic geometric tie-breaker for fist cluster
-            raw_pts = np.array([aslo_features._coords(lm) for lm in single_lms.landmark], dtype=np.float32)
             sc = float(np.linalg.norm(raw_pts[9] - raw_pts[0])) + 1e-6
             norm_pts = (raw_pts - raw_pts[0]) / sc
             tb_sign = aslo_features.resolve_fist_tie_breaker(norm_pts, str(top_class_name).upper().strip(), str(second_class_name).upper().strip(), margin_value)
             if tb_sign:
                 heur = tb_sign
-                conf = max(p_top_single, 0.75)
+                conf = max(p_top_single, 0.85)
                 pred_status = "valid"
             else:
                 heur = None

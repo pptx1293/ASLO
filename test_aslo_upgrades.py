@@ -65,6 +65,80 @@ def test_fist_cluster_disambiguation():
     print(f"Prediction for canonical 'A': {data.get('prediction')}, conf: {data.get('live_conf')}, status: {data.get('status')}")
     assert data.get("prediction") == "A", f"Expected 'A', got {data.get('prediction')}"
     
+    # Test canonical landmarks for T, S, N, M, A
+    for sign in ["T", "S", "N", "M", "A"]:
+        pts = can[sign]["h0"]
+        payload = {
+            "hand_type": "right",
+            "handedness": "Right",
+            "landmarks": pts,
+            "is_mirrored": False,
+            "seq_id": 1
+        }
+        res = client.post("/predict_landmarks", json=payload)
+        assert res.status_code == 200
+        d = json.loads(res.data.decode("utf-8"))
+        print(f"Prediction for canonical '{sign}': {d.get('prediction')}, conf: {d.get('live_conf')}, status: {d.get('status')}")
+        assert d.get("prediction") == sign, f"Expected '{sign}', got '{d.get('prediction')}'"
+        assert d.get("status") == "valid"
+
+    # Test geometric tie-breaker logic for T vs S:
+    # Construct base fist landmarks
+    lms = np.zeros((21, 3), dtype=np.float32)
+    lms[0] = [0.0, 0.0, 0.0]
+    lms[5] = [0.20, -0.90, 0.0]
+    lms[6] = [0.20, -1.25, 0.0]
+    lms[9] = [0.10, -0.95, 0.0]
+    lms[10] = [0.10, -1.30, 0.0]
+    lms[13] = [0.00, -0.95, 0.0]
+    lms[14] = [0.00, -1.25, 0.0]
+    lms[17] = [-0.10, -0.90, 0.0]
+    lms[18] = [-0.10, -1.15, 0.0]
+
+    # In T: Thumb tip (4) wedged between index (5) and middle (9), protruding up (y4 < y6)
+    lms_T = lms.copy()
+    lms_T[4] = [0.15, -1.30, 0.0]
+    tb_T = app.aslo_features.resolve_fist_tie_breaker(lms_T, "S", "T", margin=0.05)
+    assert tb_T == "T", f"Expected 'T', got {tb_T}"
+
+    # In S: Thumb tip (4) curls flat across front (y4 >= y6)
+    lms_S = lms.copy()
+    lms_S[4] = [0.15, -0.95, 0.0]
+    tb_S = app.aslo_features.resolve_fist_tie_breaker(lms_S, "T", "S", margin=0.05)
+    assert tb_S == "S", f"Expected 'S', got {tb_S}"
+
+    # In N: Thumb in Slot N (between middle 9 and ring 13)
+    lms_N = lms.copy()
+    lms_N[4] = (lms[9] + lms[13]) / 2.0
+    tb_N = app.aslo_features.resolve_fist_tie_breaker(lms_N, "M", "N", margin=0.05)
+    assert tb_N == "N", f"Expected 'N', got {tb_N}"
+
+    # In M: Thumb in Slot M (between ring 13 and pinky 17)
+    lms_M = lms.copy()
+    lms_M[4] = (lms[13] + lms[17]) / 2.0
+    tb_M = app.aslo_features.resolve_fist_tie_breaker(lms_M, "N", "M", margin=0.05)
+    assert tb_M == "M", f"Expected 'M', got {tb_M}"
+
+    # Pairwise T vs N disambiguation on canonical landmarks:
+    # 1. N landmarks with T predicted by mistake -> must resolve to N
+    pts_can_N = np.array([[lm['x'], lm['y'], lm['z']] for lm in can['N']['h0']], dtype=np.float32)
+    sc_N = float(np.linalg.norm(pts_can_N[9] - pts_can_N[0])) + 1e-6
+    norm_can_N = (pts_can_N - pts_can_N[0]) / sc_N
+    tb_can_N = app.aslo_features.resolve_fist_tie_breaker(norm_can_N, "T", "N", margin=0.05)
+    assert tb_can_N == "N", f"Expected 'N', got {tb_can_N}"
+
+    # 2. T landmarks with N predicted by mistake -> must resolve to T
+    pts_can_T = np.array([[lm['x'], lm['y'], lm['z']] for lm in can['T']['h0']], dtype=np.float32)
+    sc_T = float(np.linalg.norm(pts_can_T[9] - pts_can_T[0])) + 1e-6
+    norm_can_T = (pts_can_T - pts_can_T[0]) / sc_T
+    tb_can_T = app.aslo_features.resolve_fist_tie_breaker(norm_can_T, "N", "T", margin=0.05)
+    assert tb_can_T == "T", f"Expected 'T', got {tb_can_T}"
+
+    # Verify feature vector length is 310
+    assert app.aslo_features.FEATURE_LEN == 310
+    assert app.aslo_features.FIST_GEOMETRY_LEN == 42
+    print("[PASS] Knuckle-slot geometric tie-breakers (including T vs N) and feature lengths (310) verified!")
+
     # Test ambiguous payload gating:
     # We test the margin gate verifier directly with ambiguous fist cluster probabilities
     verifier = app.margin_verifier

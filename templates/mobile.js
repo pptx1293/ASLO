@@ -1817,7 +1817,14 @@ function applyMobileTelemetry(data) {
         return;
     }
 
-    if (now < lockUntil && activeSign !== null) {
+    const FIST_SIGNS = new Set(["A", "S", "T", "N", "M", "E"]);
+    const candUpper = (cleanPred || "").toUpperCase().trim();
+    const predUpper = (data.prediction || "").toUpperCase().trim();
+    const isFistDisambiguationSwap = (
+        FIST_SIGNS.has(activeSign) && (FIST_SIGNS.has(candUpper) || FIST_SIGNS.has(predUpper))
+    );
+
+    if (now < lockUntil && activeSign !== null && !isFistDisambiguationSwap) {
         // Cooldown lockout: maintain current sign without volatile interim swapping
         if (dom.signVal) dom.signVal.textContent = activeSign;
         updateMobilePipelineStatusUI("Stable");
@@ -1945,12 +1952,17 @@ function handlePrediction(predictedLabel, confidence, status = "ok") {
 
     // 350ms hysteresis lock:
     // Once a gesture commits to the UI, lock it from being replaced by an adjacent similar sign
-    // unless the new sign is held consistently past the lock duration
+    // unless the new sign is held consistently past the lock duration (or it's a disambiguation tie-breaker)
+    const FIST_SIGNS = new Set(["A", "S", "T", "N", "M", "E"]);
+    const isFistDisambiguationSwap = (
+        FIST_SIGNS.has(activeSign) && FIST_SIGNS.has(winningCandidate)
+    );
+
     if (activeSign !== null) {
         if (winningCandidate === activeSign) {
             return;
         }
-        if (now < lockUntil) {
+        if (now < lockUntil && !isFistDisambiguationSwap) {
             // Locked: suppress rapid swap
             return;
         }
