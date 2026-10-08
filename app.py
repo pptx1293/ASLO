@@ -1,6 +1,7 @@
 import base64
 import collections
 import csv
+import json
 import os
 import re
 import subprocess
@@ -35,6 +36,9 @@ app = Flask(__name__, static_folder="templates", static_url_path="")
 if CORS is not None:
     CORS(app)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+dynamic_state_machine = aslo_features.MultiStageDynamicGestureStateMachine()
+FIST_CLUSTER = {"A", "S", "T", "E", "M", "N"}
 
 model_path = "gesture_model.keras"
 labels_path = "label_classes.npy"
@@ -378,15 +382,18 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             heur = "NEUTRAL"
             conf = max(prob_neutral, 0.75 if is_resting else conf_single)
             pred_status = "valid"
+        elif (str(top_class_name).upper().strip() in FIST_CLUSTER and str(second_class_name).upper().strip() in FIST_CLUSTER and margin_value < 0.15):
+            # Fist cluster ambiguity margin gate: drop ambiguous raw predictions to hold prior confirmed state
+            heur = None
+            conf = p_top_single
+            pred_status = "ambiguous"
         elif verified_single is None:
             # Check if ambiguity is between known disambiguation pairs
             pair_set = {str(top_class_name).upper().strip(), str(second_class_name).upper().strip()}
             can_disambiguate = (
                 bool(pair_set.intersection({"U", "V", "R"})) or
-                bool(pair_set.intersection({"A", "S"})) or
                 bool(pair_set.intersection({"S", "O"})) or
-                bool(pair_set.intersection({"P", "Q", "Z", "Z_START", "Z_END"})) or
-                bool(pair_set.intersection({"N", "T"}))
+                bool(pair_set.intersection({"P", "Q", "Z", "Z_START", "Z_END"}))
             )
             if can_disambiguate and p_top_single >= 0.40:
                 resolved = aslo_features.apply_heuristics(single_lms, top_class_name, is_left_hand=False, confidence=p_top_single)
@@ -424,6 +431,24 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
     clean_l = clean_display_label(left_live_gesture) if left_live_gesture != "TRACKED" else "TRACKED"
     clean_both = clean_display_label(both_live_gesture)
 
+    # Dynamic sequence state machine evaluation:
+    # Evaluates motion trajectories concurrently without locking out static recognition
+    active_landmarks = r_pts if is_two_hand_inference else single_pts
+    is_dynamic_signal = False
+    dyn_eval = dynamic_state_machine.update(
+        landmarks=active_landmarks,
+        raw_pred=pred_label,
+        confidence=confidence
+    )
+    if dyn_eval.get("committed_sign"):
+        clean_pred = dyn_eval["committed_sign"]
+        pred_label = clean_pred
+        confidence = 0.95
+        pred_status = "valid"
+        is_dynamic_signal = True
+    elif dyn_eval.get("state") == "TRACKING":
+        is_dynamic_signal = True
+
     # Final safeguard: START, STOP, and two-handed dynamic phrases strictly require both hands!
     if detected_hand != "both":
         two_hand_guards = ("START", "STOP", "HOW ARE YOU", "NICE TO MEET YOU")
@@ -441,10 +466,12 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
     is_neutral_signal = bool(clean_pred == "NEUTRAL" or pred_label == "NEUTRAL")
     is_dynamic_signal = bool(
-        pred_label and (
-            str(pred_label).upper().endswith("_START") or
-            str(pred_label).upper().endswith("_END") or
-            str(pred_label).upper() in ("HOW ARE YOU", "NICE TO MEET YOU")
+        is_dynamic_signal or (
+            pred_label and (
+                str(pred_label).upper().endswith("_START") or
+                str(pred_label).upper().endswith("_END") or
+                str(pred_label).upper() in ("HOW ARE YOU", "NICE TO MEET YOU")
+            )
         )
     )
 
@@ -715,6 +742,113 @@ def correct_gesture():
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy", "service": "aslo-engine"})
+
+
+@app.route("/api/dictionary", methods=["GET"])
+def api_dictionary():
+    """Returns complete sign dictionary catalogue with metadata, descriptions,
+    usage tips, and canonical keyframe landmarks for 2D stick-figure animation."""
+    canonical_file = "canonical_landmarks.json"
+    canonical_data = {}
+    if os.path.exists(canonical_file):
+        try:
+            with open(canonical_file, "r") as f:
+                canonical_data = json.load(f)
+        except Exception as e:
+            print(f"Error loading canonical landmarks: {e}")
+
+    SIGN_METADATA = {
+        "A": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Closed fist with thumb resting straight upright along outer edge of index finger.", "tips": "Keep thumb upright on the side. Do NOT fold thumb across front knuckles (which is 'S')."},
+        "B": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Four fingers extended straight upward and held together, with thumb tucked across the palm.", "tips": "Keep fingers closely parallel with palm facing forward."},
+        "C": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Curved fingers and thumb forming an open 'C' profile shape.", "tips": "Arch all five fingers gently toward each other like holding an invisible cup."},
+        "D": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index finger extended straight up; middle, ring, pinky, and thumb curl together forming a closed circle.", "tips": "Only index finger points up; the other 3 fingers touch the thumb."},
+        "E": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "All 4 fingertips curled tightly down against top of palm, with thumb folded flat underneath.", "tips": "Tuck all fingertips down completely without extending knuckles outward."},
+        "F": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index finger and thumb touch tips forming an 'OK' circle; middle, ring, and pinky extended upright.", "tips": "Spread the top three fingers open upward while index and thumb touch."},
+        "G": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index finger and thumb extended horizontally parallel like pointing a small gauge.", "tips": "Orient hand sideways with index and thumb pointing to the side."},
+        "H": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index and middle fingers extended horizontally side-by-side, pointing outward.", "tips": "Keep index and middle tightly together, thumb tucked under ring finger."},
+        "I": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Pinky finger extended straight up, other fingers curled into a fist with thumb folded across.", "tips": "Only the pinky extends straight up vertically."},
+        "J": {"category": "dynamic", "type": "alphabet", "handedness": "right", "desc": "Pinky finger extended, tracing a downward and upward curving 'J' hook in space.", "tips": "Start with pinky upright, then sweep down and hook outward smoothly."},
+        "K": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index extended straight up, middle finger forward at a 45-degree angle, thumb tucked between them.", "tips": "Thumb tip rests at the base knuckle of the middle finger."},
+        "L": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index finger pointing up and thumb extended outward horizontally forming an 'L'.", "tips": "Form a crisp 90-degree angle between thumb and index finger."},
+        "M": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Closed fist with thumb tucked under the index, middle, and ring fingers.", "tips": "Thumb tip peaks out between the ring and pinky fingers."},
+        "N": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Closed fist with thumb tucked under the index and middle fingers.", "tips": "Thumb tip peaks out between the middle and ring fingers."},
+        "O": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "All 5 fingertips curved forward touching the thumb tip to form an open circle.", "tips": "Keep fingers smoothly arched forming a clear circular silhouette."},
+        "P": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Hand tilted downward: middle finger points down, index points forward, thumb between them.", "tips": "Similar finger configuration to 'K', but oriented pointing downward."},
+        "Q": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index finger and thumb pointing downward, separated like gripping a small object.", "tips": "Similar to 'G', but hand is oriented pointing down toward the floor."},
+        "R": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Middle finger crossed over index finger, both pointing straight up.", "tips": "Fingers crossed for good luck; other fingers curled into palm with thumb over them."},
+        "S": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Closed fist with thumb folded horizontally across front knuckles of the fingers.", "tips": "Wrap thumb across the front of index and middle fingers (unlike 'A' where thumb is on side)."},
+        "T": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Closed fist with thumb tucked up between index and middle fingers.", "tips": "Thumb pops out over index finger between index and middle fingers."},
+        "U": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index and middle fingers extended straight up, held close together side-by-side.", "tips": "Keep index and middle tightly touching; ring and pinky curled into palm."},
+        "V": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index and middle fingers extended straight up, spread apart in a clear 'V' peace sign.", "tips": "Separate index and middle fingers widely; ring and pinky curled into palm."},
+        "W": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index, middle, and ring fingers extended straight up, spread apart forming a 'W'.", "tips": "Pinky held down by thumb; three middle fingers spread upright."},
+        "X": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index finger bent into a curved hook, other fingers curled into palm.", "tips": "Bend the top knuckle of the index finger like a pirate's hook."},
+        "Y": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Thumb and pinky extended outward like 'hang loose' / phone, three middle fingers curled.", "tips": "Extend thumb and pinky as wide as comfortable."},
+        "Z": {"category": "dynamic", "type": "alphabet", "handedness": "right", "desc": "Index finger extended, tracing a 'Z' zigzag path horizontally, diagonally down, and horizontally.", "tips": "Draw the letter Z cleanly in the air with the index fingertip."},
+        "HELLO": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Open hand touching side of forehead/temple and waving gently outward in a salute.", "tips": "Salute outward from temple toward the conversation partner."},
+        "THANK YOU": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Flat open hand touches chin/lips and extends forward and outward toward receiver.", "tips": "Palm faces upward/inward as hand extends forward toward the person."},
+        "I LOVE YOU": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Thumb, index, and pinky extended upright (combines I, L, Y); middle and ring curled.", "tips": "Universal ASL 'ILY' sign with palm facing forward."},
+        "LOVE": {"category": "static", "type": "phrase", "handedness": "both", "desc": "Both hands crossed over chest in a gentle hug.", "tips": "Cross wrists over upper chest with hands resting against shoulders."},
+        "FINE": {"category": "static", "type": "phrase", "handedness": "both", "desc": "Open 5 hands with thumbs touching chest, fingers spread.", "tips": "Thumbs touch chest with fingers pointing upright and spread."},
+        "ME": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Index finger points directly to own chest.", "tips": "Point index finger cleanly at center of chest."},
+        "YOU": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Index finger points forward directly toward the conversational partner.", "tips": "Point index finger straight forward at chest height."},
+        "HOW ARE YOU": {"category": "dynamic", "type": "phrase", "handedness": "both", "desc": "Both hands cupped facing chest, arcing outward and opening palms upward.", "tips": "Start with knuckles touching/facing chest, rotate hands forward opening palms up."},
+        "NICE TO MEET YOU": {"category": "dynamic", "type": "phrase", "handedness": "both", "desc": "Right hand slides forward across left open palm, then indices meet pointing forward.", "tips": "Part 1: Slide right palm across left palm (Nice); Part 2: Hands come together pointing forward (Meet you)."},
+        "START": {"category": "static", "type": "control", "handedness": "both", "desc": "Two hands raised open with palms facing outward toward camera.", "tips": "Requires both hands in signing frame to initialize translation engine."},
+        "STOP": {"category": "static", "type": "control", "handedness": "both", "desc": "Two flat hands held upright facing camera (universal halt signal).", "tips": "Raise both open palms facing camera to pause recognition."},
+        "SPACE": {"category": "static", "type": "control", "handedness": "both", "desc": "Two hands move horizontally outward adding a word space to the sentence.", "tips": "Move both flat hands outward sideways in synchronization."},
+        "BACKSPACE": {"category": "static", "type": "control", "handedness": "both", "desc": "Swipe hands backward deleting the previous letter or sign.", "tips": "Quick flick backward deletes last character or word."},
+        "NEUTRAL": {"category": "static", "type": "control", "handedness": "both", "desc": "Hands resting comfortably at waist level or off-screen in relaxed posture.", "tips": "Return hands to resting position to clear candidate latches."}
+    }
+
+    canonical_lower = {k.lower(): v for k, v in canonical_data.items()}
+    def get_can(name):
+        return canonical_data.get(name) or canonical_lower.get(name.lower()) or {}
+
+    result = []
+    for sign_key, meta in SIGN_METADATA.items():
+        can = get_can(sign_key)
+        h0 = can.get("h0")
+        h1 = can.get("h1")
+
+        if sign_key == "I" and not h0:
+            h0 = get_can("J_START").get("h0")
+
+        keyframes = []
+        if meta["category"] == "dynamic":
+            start_can = get_can(f"{sign_key}_START") or can
+            end_can = get_can(f"{sign_key}_END") or can
+            s_pts = start_can.get("h0") or h0 or []
+            e_pts = end_can.get("h0") or h0 or []
+
+            if s_pts and not h0:
+                h0 = s_pts
+
+            if s_pts and e_pts:
+                for step in range(12):
+                    t = step / 11.0
+                    frame_pts = []
+                    for p0, p1 in zip(s_pts, e_pts):
+                        frame_pts.append({
+                            "x": round(p0["x"] * (1 - t) + p1["x"] * t, 4),
+                            "y": round(p0["y"] * (1 - t) + p1["y"] * t, 4),
+                            "z": round(p0["z"] * (1 - t) + p1["z"] * t, 4)
+                        })
+                    keyframes.append(frame_pts)
+
+        result.append({
+            "id": sign_key,
+            "name": sign_key,
+            "category": meta["category"],
+            "type": meta["type"],
+            "handedness": meta["handedness"],
+            "description": meta["desc"],
+            "tips": meta["tips"],
+            "landmarks": h0,
+            "landmarks_secondary": h1,
+            "keyframes": keyframes
+        })
+
+    return jsonify({"ok": True, "dictionary": result, "count": len(result)})
 
 
 if __name__ == "__main__":

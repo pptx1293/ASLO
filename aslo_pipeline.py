@@ -361,9 +361,20 @@ class SoftmaxMarginVerifier:
             "p_second": p_second,
         }
 
+        FIST_CLUSTER = {"A", "S", "T", "E", "M", "N"}
+        top_u = top_label.upper().strip()
+        sec_u = second_label.upper().strip()
+
         # Gate 1: Confidence
         if p_top < self.min_confidence:
             return None, p_top, "low_confidence", telemetry
+
+        # Fist Cluster Ambiguity Margin Gate:
+        # If (p_top - p_second) < 0.15 and both belong to similar fist cluster ['A', 'S', 'T', 'E', 'M', 'N'],
+        # mark prediction as "ambiguous" to drop or hold prior confirmed state
+        if (top_u in FIST_CLUSTER and sec_u in FIST_CLUSTER) and margin < 0.15:
+            telemetry["is_fist_ambiguous"] = True
+            return None, p_top, "ambiguous", telemetry
 
         # Gate 2: Margin
         if margin < self.min_margin:

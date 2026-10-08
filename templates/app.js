@@ -100,18 +100,31 @@ let clientDisplayHistory = [];
 let clientSmoothedDisplayGesture = "—";
 let clientSmoothedConf = 0;
 
+// ── Dual-Host API Resolver ──────────────────────────────────────────────────
+const API_BASE_URL = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+    ? '' 
+    : window.location.origin;
+
 // ── State Hysteresis & Latching Constants & State ──────────────────────────
 let activeSign = null;
 let candidateSign = null;
 let candidateCount = 0;
-const COMMIT_THRESHOLD = 3; // Must be detected consistently across 3 consecutive responses
+const COMMIT_THRESHOLD = 3; // Must win >= 3 out of 4 consecutive frames
+const CONFIRM_BUFFER_SIZE = 4;
+const CONFIRM_WIN_COUNT = 3;
+let confirmationBuffer = [];
+const HYSTERESIS_LOCK_MS = 350; // 350ms hysteresis lock against adjacent sign overriding
 let lockUntil = 0; // Cooldown timestamp
+
+// Optional Local Edge Inference Fallback State
+let edgeModel = null;
+let isEdgeModelReady = false;
 
 const N_FRAME = 5;
 const N_FRAMES = 5;
 const PREDICTION_WINDOW_MAX = 5;
-const MAJORITY_VOTE_RATIO = 0.60; // 3 out of 5 frames
-const GESTURE_LOCK_HOLD_MS = 120; // Sub-150ms hold lockout
+const MAJORITY_VOTE_RATIO = 0.60;
+const GESTURE_LOCK_HOLD_MS = 120;
 
 let predictionWindow = [];
 let lastConfirmedGesture = "—";
@@ -1062,19 +1075,33 @@ async function sendLandmarksInference(results, stabilizedHands = [], precomputed
 }
 
 async function sendInferenceRequest(payload, seqId) {
+    // Optional Local Edge Inference Fallback:
+    if (isEdgeModelReady && edgeModel && !navigator.onLine) {
+        try {
+            const edgeResult = await runEdgeInference(payload);
+            if (edgeResult && seqId > lastHandledSequenceId) {
+                lastHandledSequenceId = seqId;
+                applyTelemetry(edgeResult);
+            }
+            return;
+        } catch (edgeErr) {
+            console.warn("Edge inference fallback error, reverting to server fetch:", edgeErr);
+        }
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 2500);
 
     let response = null;
     try {
-        response = await fetch("/predict_landmarks", {
+        response = await fetch(`${API_BASE_URL}/predict_landmarks`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
             signal: controller.signal
         });
         if (!response.ok && response.status === 404) {
-            response = await fetch("/predict", {
+            response = await fetch(`${API_BASE_URL}/predict`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)
@@ -1556,7 +1583,7 @@ async function stopVoiceRecording() {
     formData.append("language", selectedSTTLanguage);
     formData.append("append", isAppend ? "true" : "false");
 
-    fetch("/api/stt/transcribe", {
+    fetch(`${API_BASE_URL}/api/stt/transcribe`, {
         method: "POST",
         body: formData
     })
@@ -2080,7 +2107,7 @@ function submitCorrection(customLabel = null) {
 
     showToast(`Teaching AI gesture: "${label}"`, "info");
 
-    fetch("/correct_gesture", {
+    fetch(`${API_BASE_URL}/correct_gesture`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ label: label })
@@ -2119,36 +2146,450 @@ function quickTeach(label) {
     submitCorrection(label);
 }
 
-// ── Gesture Reference Modal ─────────────────────────────────────────────────
+// ── Interactive Sign Dictionary & Stick Figure Animation Visualizer ─────────
+let dictionaryData = [];
+let dictionaryMap = {};
+let currentDictSign = null;
+let dictAnimRunning = true;
+let dictAnimSpeed = 1.0;
+let dictCurrentKeyframeIndex = 0;
+let dictLastFrameTimestamp = 0;
+let dictAnimReqId = null;
+let currentDictCategory = 'all';
+
+async function loadDictionaryData() {
+    try {
+        const res = await fetch(`${API_BASE_URL}/api/dictionary`);
+        if (res.ok) {
+            const data = await res.json();
+            if (data.ok && data.dictionary) {
+                dictionaryData = data.dictionary;
+                dictionaryMap = {};
+                for (const item of dictionaryData) {
+                    dictionaryMap[item.id] = item;
+                }
+                if (!currentDictSign) {
+                    selectDictionarySign('A');
+                }
+            }
+        }
+    } catch (e) {
+        console.warn("Failed to load sign dictionary data:", e);
+    }
+}
+
 function openGestureModal() {
     if (dom.gestureModal) {
         dom.gestureModal.style.display = "flex";
         dom.gestureModal.style.opacity = "1";
     }
+    if (dictionaryData.length === 0) {
+        loadDictionaryData();
+    } else if (!currentDictSign) {
+        selectDictionarySign('A');
+    }
+    startDictAnimationLoop();
 }
 
 function closeGestureModal() {
     if (dom.gestureModal) {
         dom.gestureModal.style.display = "none";
     }
+    if (dictAnimReqId) {
+        cancelAnimationFrame(dictAnimReqId);
+        dictAnimReqId = null;
+    }
 }
 
-function filterGestures(query) {
-    const q = query.toUpperCase().trim();
-    const items = document.querySelectorAll(".gesture-badge-item");
-    items.forEach(item => {
-        const text = item.getAttribute("data-label") || item.textContent;
-        if (!q || text.toUpperCase().includes(q)) {
-            item.style.display = "flex";
+function setDictCategory(cat) {
+    currentDictCategory = cat;
+    const pills = document.querySelectorAll('.dict-tab-pill');
+    pills.forEach(p => {
+        const text = p.textContent.toLowerCase();
+        if (cat === 'all' ? text.includes('all') : text.includes(cat)) {
+            p.classList.add('active');
         } else {
-            item.style.display = "none";
+            p.classList.remove('active');
+        }
+    });
+
+    const searchInput = document.getElementById('gesture-search');
+    filterDictionaryList(searchInput ? searchInput.value : '');
+}
+
+function filterDictionaryList(query) {
+    const q = (query || "").toUpperCase().trim();
+    const items = document.querySelectorAll('.gesture-badge-item');
+
+    items.forEach(item => {
+        const itemCat = item.getAttribute('data-category') || 'static';
+        const label = (item.getAttribute('data-label') || item.textContent).toUpperCase().trim();
+        const matchesQuery = !q || label.includes(q);
+        const matchesCat = (currentDictCategory === 'all') || (itemCat === currentDictCategory);
+
+        if (matchesQuery && matchesCat) {
+            item.style.display = 'flex';
+        } else {
+            item.style.display = 'none';
         }
     });
 }
 
+function selectDictionarySign(signId) {
+    let sign = dictionaryMap[signId];
+    if (!sign) {
+        // Case-insensitive lookup
+        const upper = String(signId).toUpperCase().trim();
+        for (const k in dictionaryMap) {
+            if (k.toUpperCase().trim() === upper) {
+                sign = dictionaryMap[k];
+                break;
+            }
+        }
+    }
+    if (!sign) return;
+
+    currentDictSign = sign;
+    dictCurrentKeyframeIndex = 0;
+
+    // Highlight active item in list
+    document.querySelectorAll('.gesture-badge-item').forEach(el => {
+        const lbl = (el.getAttribute('data-label') || el.textContent).toUpperCase().trim();
+        if (lbl === sign.id.toUpperCase().trim()) {
+            el.classList.add('active-dict-item');
+        } else {
+            el.classList.remove('active-dict-item');
+        }
+    });
+
+    // Update details pane
+    const titleEl = document.getElementById('dict-sign-title');
+    if (titleEl) titleEl.textContent = `Sign "${sign.name}"`;
+
+    const catBadge = document.getElementById('dict-sign-badge');
+    if (catBadge) {
+        const isDyn = (sign.category === 'dynamic');
+        catBadge.textContent = isDyn ? 'DYNAMIC' : 'STATIC';
+        catBadge.className = `dict-badge ${isDyn ? 'dynamic' : 'static'}`;
+    }
+
+    const handBadge = document.getElementById('dict-hand-badge');
+    if (handBadge) {
+        const isBoth = (sign.handedness === 'both');
+        handBadge.textContent = isBoth ? '🙌 BOTH HANDS' : '✋ RIGHT HAND';
+    }
+
+    const descEl = document.getElementById('dict-sign-desc');
+    if (descEl) descEl.textContent = sign.description || "Canonical gesture posture.";
+
+    const tipsEl = document.getElementById('dict-sign-tips');
+    if (tipsEl) tipsEl.textContent = sign.tips || "Maintain steady finger alignment.";
+
+    renderDictionaryCanvas();
+}
+
+function toggleDictAnimation() {
+    dictAnimRunning = !dictAnimRunning;
+    const icon = document.getElementById('dict-anim-icon');
+    const text = document.getElementById('dict-anim-text');
+    if (icon) icon.textContent = dictAnimRunning ? '⏸' : '▶';
+    if (text) text.textContent = dictAnimRunning ? 'Pause' : 'Play';
+}
+
+function toggleDictSpeed() {
+    dictAnimSpeed = (dictAnimSpeed === 1.0) ? 0.5 : 1.0;
+    const btn = document.getElementById('dict-anim-speed');
+    if (btn) btn.textContent = `⚡ Speed: ${dictAnimSpeed}x`;
+}
+
+function restartDictAnimation() {
+    dictCurrentKeyframeIndex = 0;
+    renderDictionaryCanvas();
+}
+
+function startDictAnimationLoop() {
+    if (dictAnimReqId) cancelAnimationFrame(dictAnimReqId);
+
+    const loop = (timestamp) => {
+        if (!dictLastFrameTimestamp) dictLastFrameTimestamp = timestamp;
+        const elapsed = timestamp - dictLastFrameTimestamp;
+
+        // Base frame interval: 100ms per keyframe (~10 fps) adjusted by speed
+        const frameInterval = 100 / dictAnimSpeed;
+        if (dictAnimRunning && elapsed >= frameInterval) {
+            dictLastFrameTimestamp = timestamp;
+            if (currentDictSign && currentDictSign.keyframes && currentDictSign.keyframes.length > 0) {
+                dictCurrentKeyframeIndex = (dictCurrentKeyframeIndex + 1) % currentDictSign.keyframes.length;
+            }
+            renderDictionaryCanvas();
+        } else if (!dictAnimRunning) {
+            renderDictionaryCanvas();
+        }
+
+        dictAnimReqId = requestAnimationFrame(loop);
+    };
+
+    dictAnimReqId = requestAnimationFrame(loop);
+}
+
+function renderDictionaryCanvas() {
+    const canvas = document.getElementById('dictionary-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width;
+    const H = canvas.height;
+
+    // 1. Dark Cybernetic Background
+    ctx.clearRect(0, 0, W, H);
+    const bgGrad = ctx.createRadialGradient(W / 2, H / 2, 20, W / 2, H / 2, W * 0.7);
+    bgGrad.addColorStop(0, '#0f172a');
+    bgGrad.addColorStop(1, '#050811');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Subtle Grid Backdrop
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.05)';
+    ctx.lineWidth = 1;
+    for (let x = 30; x < W; x += 35) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, H);
+        ctx.stroke();
+    }
+    for (let y = 30; y < H; y += 35) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+    }
+
+    // Determine current hand pose points
+    let rHandPoints = null;
+    let lHandPoints = null;
+
+    if (currentDictSign) {
+        if (currentDictSign.category === 'dynamic' && currentDictSign.keyframes && currentDictSign.keyframes.length > 0) {
+            rHandPoints = currentDictSign.keyframes[dictCurrentKeyframeIndex] || currentDictSign.landmarks;
+        } else {
+            rHandPoints = currentDictSign.landmarks;
+        }
+        lHandPoints = currentDictSign.landmarks_secondary;
+    }
+
+    // 2. Anatomical Stick Figure Skeleton
+    // Center alignment coordinates
+    const headX = W / 2;
+    const headY = 48;
+    const neckY = 72;
+    const chestY = 88;
+    const spineBottomY = 175;
+
+    const shoulderLX = headX - 52;
+    const shoulderRX = headX + 52;
+    const shoulderY = chestY;
+
+    // Head Visor & Outline
+    ctx.save();
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 2.5;
+    ctx.fillStyle = 'rgba(14, 165, 233, 0.15)';
+    ctx.beginPath();
+    ctx.arc(headX, headY, 18, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Futuristic Sleek Visor
+    ctx.strokeStyle = '#00f0ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(headX - 10, headY - 1);
+    ctx.lineTo(headX + 10, headY - 1);
+    ctx.stroke();
+
+    // Neck
+    ctx.strokeStyle = '#64748b';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(headX, headY + 18);
+    ctx.lineTo(headX, neckY);
+    ctx.stroke();
+
+    // Shoulder Crossbar
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 3.5;
+    ctx.beginPath();
+    ctx.moveTo(shoulderLX, shoulderY);
+    ctx.lineTo(shoulderRX, shoulderY);
+    ctx.stroke();
+
+    // Spine & Torso
+    ctx.strokeStyle = '#475569';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(headX, neckY);
+    ctx.lineTo(headX, spineBottomY);
+    ctx.stroke();
+
+    // Hips / Waist Bar
+    ctx.strokeStyle = '#64748b';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(headX - 30, spineBottomY);
+    ctx.lineTo(headX + 30, spineBottomY);
+    ctx.stroke();
+
+    // 3. Dynamic Arm & Hand Placement
+    const isBoth = (currentDictSign && (currentDictSign.handedness === 'both' || (lHandPoints && lHandPoints.length > 0)));
+
+    // Right Arm: Dominant Hand
+    let rElbowX = shoulderRX + 26;
+    let rElbowY = shoulderY + 48;
+    let rWristX = shoulderRX + 12;
+    let rWristY = shoulderY + 98;
+
+    // If dynamic, add subtle rhythmic motion offset to right arm
+    if (currentDictSign && currentDictSign.category === 'dynamic') {
+        const dynOffset = Math.sin((dictCurrentKeyframeIndex / 12) * Math.PI * 2) * 8;
+        rWristX += dynOffset;
+    }
+
+    // Draw Right Arm Bones (Upper arm & Forearm)
+    ctx.strokeStyle = '#0284c7';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(shoulderRX, shoulderY);
+    ctx.lineTo(rElbowX, rElbowY);
+    ctx.lineTo(rWristX, rWristY);
+    ctx.stroke();
+
+    // Draw Right Arm Joints
+    ctx.fillStyle = '#38bdf8';
+    ctx.beginPath();
+    ctx.arc(shoulderRX, shoulderY, 4, 0, Math.PI * 2);
+    ctx.arc(rElbowX, rElbowY, 3.5, 0, Math.PI * 2);
+    ctx.arc(rWristX, rWristY, 4.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Left Arm
+    if (isBoth) {
+        let lElbowX = shoulderLX - 26;
+        let lElbowY = shoulderY + 48;
+        let lWristX = shoulderLX - 12;
+        let lWristY = shoulderY + 98;
+
+        ctx.strokeStyle = '#c026d3';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(shoulderLX, shoulderY);
+        ctx.lineTo(lElbowX, lElbowY);
+        ctx.lineTo(lWristX, lWristY);
+        ctx.stroke();
+
+        ctx.fillStyle = '#e879f9';
+        ctx.beginPath();
+        ctx.arc(shoulderLX, shoulderY, 4, 0, Math.PI * 2);
+        ctx.arc(lElbowX, lElbowY, 3.5, 0, Math.PI * 2);
+        ctx.arc(lWristX, lWristY, 4.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Draw Left Hand 21 Landmarks
+        if (lHandPoints && lHandPoints.length >= 21) {
+            drawHandSkeleton(ctx, lWristX, lWristY, lHandPoints, '#e879f9', '#a21caf', 56);
+        }
+    } else {
+        // Resting Left Arm at side
+        const lElbowX = shoulderLX - 10;
+        const lElbowY = shoulderY + 46;
+        const lHandX = shoulderLX - 6;
+        const lHandY = shoulderY + 92;
+
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(shoulderLX, shoulderY);
+        ctx.lineTo(lElbowX, lElbowY);
+        ctx.lineTo(lHandX, lHandY);
+        ctx.stroke();
+
+        ctx.fillStyle = '#475569';
+        ctx.beginPath();
+        ctx.arc(lElbowX, lElbowY, 3, 0, Math.PI * 2);
+        ctx.arc(lHandX, lHandY, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Draw Right Hand 21 Landmarks
+    if (rHandPoints && rHandPoints.length >= 21) {
+        drawHandSkeleton(ctx, rWristX, rWristY, rHandPoints, '#00f0ff', '#10b981', 58);
+    }
+
+    // Motion indicator for dynamic signs
+    if (currentDictSign && currentDictSign.category === 'dynamic') {
+        ctx.fillStyle = 'rgba(0, 240, 255, 0.85)';
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        const totalKf = (currentDictSign.keyframes && currentDictSign.keyframes.length) || 12;
+        ctx.fillText(`KEYFRAME ${dictCurrentKeyframeIndex + 1} / ${totalKf}`, W / 2, H - 12);
+    }
+    ctx.restore();
+}
+
+function drawHandSkeleton(ctx, wristX, wristY, landmarks, boneColor, tipColor, scale) {
+    if (!landmarks || landmarks.length < 21) return;
+
+    // 1. Draw Bones
+    ctx.strokeStyle = boneColor;
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    for (const [i, j] of HAND_CONNECTIONS) {
+        const p0 = landmarks[i];
+        const p1 = landmarks[j];
+        if (!p0 || !p1) continue;
+
+        const x0 = wristX + p0.x * scale;
+        const y0 = wristY + p0.y * scale;
+        const x1 = wristX + p1.x * scale;
+        const y1 = wristY + p1.y * scale;
+
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+    }
+
+    // 2. Draw Joints and Fingertips
+    const fingertips = new Set([4, 8, 12, 16, 20]);
+    for (let k = 0; k < 21; k++) {
+        const p = landmarks[k];
+        if (!p) continue;
+
+        const px = wristX + p.x * scale;
+        const py = wristY + p.y * scale;
+
+        ctx.beginPath();
+        if (fingertips.has(k)) {
+            // Highlighted Fingertip Node
+            ctx.fillStyle = tipColor;
+            ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        } else {
+            // Knuckle / Joint Node
+            ctx.fillStyle = boneColor;
+            ctx.arc(px, py, 2.2, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+}
+
 // ── Dominant Hand Switching ─────────────────────────────────────────────────
 function setDominantHand(hand) {
-    fetch("/set_dominant_hand", {
+    fetch(`${API_BASE_URL}/set_dominant_hand`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ hand: hand })
@@ -2493,7 +2934,8 @@ function applyTelemetry(data) {
             activeSign = null;
             candidateSign = null;
             candidateCount = 0;
-            renderStability(0, COMMIT_THRESHOLD, false);
+            confirmationBuffer = [];
+            renderStability(0, CONFIRM_WIN_COUNT, false);
         }
         if (clientDynamicGesture) {
             clientDynamicGesture = null;
@@ -2511,6 +2953,22 @@ function applyTelemetry(data) {
 
     // ── State Hysteresis & Latching Prediction Handler ──
     const cleanPred = displayGesture || cleanPredUpper || stripInternalSuffix(data.prediction || "");
+
+    // Backend Margin Gate handling:
+    // If backend marked the prediction status as "ambiguous" (e.g. fist cluster margin < 0.15)
+    if (data.status === "ambiguous") {
+        updatePipelineStatusUI("Ambiguous (Stabilizing...)");
+        if (activeSign !== null) {
+            // Drop rapid override swapping and hold prior confirmed state
+            if (dom.gestureLabel) dom.gestureLabel.textContent = activeSign;
+            const currentSignEl = document.getElementById("current-sign");
+            if (currentSignEl && currentSignEl !== dom.gestureLabel) {
+                currentSignEl.textContent = activeSign;
+            }
+        }
+        return;
+    }
+
     if (now < lockUntil && activeSign !== null) {
         // Cooldown lockout: maintain current sign without volatile interim swapping
         if (dom.gestureLabel) dom.gestureLabel.textContent = activeSign;
@@ -2520,7 +2978,7 @@ function applyTelemetry(data) {
         }
         updatePipelineStatusUI("Stable");
     } else {
-        handlePrediction(cleanPred, confVal);
+        handlePrediction(cleanPred, confVal, data.status);
         const displayWord = (activeSign !== null)
             ? activeSign
             : ((lastConfirmedGesture && lastConfirmedGesture !== "—") ? lastConfirmedGesture : (cleanPred || "—"));
@@ -2546,7 +3004,7 @@ function commitSignToUI(sign) {
     lastConfirmedGesture = sign;
     confirmedGestureTime = performance.now();
     updatePipelineStatusUI("Stable");
-    renderStability(COMMIT_THRESHOLD, COMMIT_THRESHOLD, true);
+    renderStability(CONFIRM_WIN_COUNT, CONFIRM_WIN_COUNT, true);
 
     const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "J", "Z"]);
     if (upper === "NEUTRAL" || upper === "IDLE") {
@@ -2608,32 +3066,60 @@ function commitSignToUI(sign) {
     }
 }
 
-function handlePrediction(predictedLabel, confidence) {
+function handlePrediction(predictedLabel, confidence, status = "ok") {
     const now = Date.now();
-    if (!predictedLabel || confidence < 0.55) return;
+    if (!predictedLabel || confidence < 0.50 || status === "ambiguous") return;
 
-    // If locked, maintain current sign
-    if (now < lockUntil && activeSign !== null) return;
-
-    if (predictedLabel === candidateSign) {
-        candidateCount++;
-        renderStability(candidateCount, COMMIT_THRESHOLD, candidateCount >= COMMIT_THRESHOLD);
-        if (candidateCount >= COMMIT_THRESHOLD && activeSign !== candidateSign) {
-            activeSign = candidateSign;
-            commitSignToUI(activeSign);
-            lockUntil = now + 400; // Hold sign steadily for 400ms before allowing a swap
-        }
-    } else {
-        candidateSign = predictedLabel;
-        candidateCount = 1;
-        renderStability(1, COMMIT_THRESHOLD, false);
+    // 4-frame confirmation buffer:
+    // Push new inference label into the sliding window of size 4
+    confirmationBuffer.push(predictedLabel);
+    if (confirmationBuffer.length > CONFIRM_BUFFER_SIZE) {
+        confirmationBuffer.shift();
     }
+
+    // A gesture must win at least 3 out of 4 consecutive inference frames to become the active candidate
+    const counts = {};
+    let winningCandidate = null;
+    let maxWins = 0;
+    for (const label of confirmationBuffer) {
+        counts[label] = (counts[label] || 0) + 1;
+        if (counts[label] > maxWins) {
+            maxWins = counts[label];
+        }
+        if (counts[label] >= CONFIRM_WIN_COUNT) {
+            winningCandidate = label;
+        }
+    }
+
+    renderStability(maxWins, CONFIRM_WIN_COUNT, !!winningCandidate);
+
+    if (!winningCandidate) {
+        return; // Did not meet 3-of-4 confirmation threshold yet
+    }
+
+    // 350ms hysteresis lock:
+    // Once a gesture commits to the UI, lock it from being replaced by an adjacent similar sign
+    // unless the new sign is held consistently past the lock duration
+    if (activeSign !== null) {
+        if (winningCandidate === activeSign) {
+            return;
+        }
+        if (now < lockUntil) {
+            // Locked: suppress rapid swap
+            return;
+        }
+    }
+
+    // Commit confirmed winning candidate
+    activeSign = winningCandidate;
+    commitSignToUI(activeSign);
+    lockUntil = now + HYSTERESIS_LOCK_MS; // 350ms hysteresis lock
 }
 
 // ── Fallback Polling Loop (Only when webcam not active) ─────────────────────
 function poll() {
     if (isWebcamActive) return;
-    fetch("/gesture")
+    fetch(`${API_BASE_URL}/gesture`)
         .then(r => r.json())
         .then(data => {
             applyTelemetry(data);
@@ -2656,7 +3142,7 @@ function stopServer() {
         dom.stopBtn.textContent = "Shutting down…";
     }
 
-    fetch("/shutdown", { method: "POST" }).catch(() => {});
+    fetch(`${API_BASE_URL}/shutdown`, { method: "POST" }).catch(() => {});
 
     if (pollTimer) clearInterval(pollTimer);
     if (dom.cameraFeed) dom.cameraFeed.src = "";

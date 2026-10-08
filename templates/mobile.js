@@ -73,12 +73,32 @@ let mobileDisplayHistory = [];
 let mobileSmoothedDisplaySign = "—";
 let mobileSmoothedConf = 0;
 
+// ── Dual-Host API Resolver ──────────────────────────────────────────────────
+const API_BASE_URL = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+    ? '' 
+    : window.location.origin;
+
+// ── State Hysteresis & Latching Constants & State ──────────────────────────
+let activeSign = null;
+let candidateSign = null;
+let candidateCount = 0;
+const COMMIT_THRESHOLD = 3; // Must win >= 3 out of 4 consecutive frames
+const CONFIRM_BUFFER_SIZE = 4;
+const CONFIRM_WIN_COUNT = 3;
+let confirmationBuffer = [];
+const HYSTERESIS_LOCK_MS = 350; // 350ms hysteresis lock against adjacent sign overriding
+let lockUntil = 0; // Cooldown timestamp
+
+// Optional Local Edge Inference Fallback State
+let edgeModel = null;
+let isEdgeModelReady = false;
+
 // ── Sliding Window & Hysteresis Hold Constants & State ─────────────────────
 const N_FRAME = 5;
 const N_FRAMES = 5;
 const PREDICTION_WINDOW_MAX = 5;
-const MAJORITY_VOTE_RATIO = 0.60; // 3 out of 5 frames
-const GESTURE_LOCK_HOLD_MS = 120; // Sub-150ms hold lockout
+const MAJORITY_VOTE_RATIO = 0.60;
+const GESTURE_LOCK_HOLD_MS = 120;
 
 let mobilePredictionWindow = [];
 let mobileLastConfirmedGesture = "—";
@@ -87,13 +107,6 @@ let mobileHasPassedThroughNeutral = false;
 let mobileCurrentPipelineState = "Detecting...";
 let mobilePredictSequenceId = 0;
 let mobileLastHandledSequenceId = 0;
-
-// ── State Hysteresis & Latching Constants & State ──────────────────────────
-let activeSign = null;
-let candidateSign = null;
-let candidateCount = 0;
-const COMMIT_THRESHOLD = 3; // Must be detected consistently across 3 consecutive responses
-let lockUntil = 0; // Cooldown timestamp
 
 function getSmoothedDisplaySign(newDisplay, conf = 0) {
     if (newDisplay && newDisplay.includes("(IN MOTION)")) {
@@ -1070,19 +1083,33 @@ async function sendMobileLandmarks(results, stabilizedHands = [], precomputedIso
 }
 
 async function sendMobileInferenceRequest(payload, seqId) {
+    // Optional Local Edge Inference Fallback:
+    if (isEdgeModelReady && edgeModel && !navigator.onLine) {
+        try {
+            const edgeResult = await runEdgeInference(payload);
+            if (edgeResult && seqId > mobileLastHandledSequenceId) {
+                mobileLastHandledSequenceId = seqId;
+                applyMobileTelemetry(edgeResult);
+            }
+            return;
+        } catch (edgeErr) {
+            console.warn("Mobile edge inference error, reverting to server fetch:", edgeErr);
+        }
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 2500);
 
     let response = null;
     try {
-        response = await fetch("/predict_landmarks", {
+        response = await fetch(`${API_BASE_URL}/predict_landmarks`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
             signal: controller.signal
         });
         if (!response.ok && response.status === 404) {
-            response = await fetch("/predict", {
+            response = await fetch(`${API_BASE_URL}/predict`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)
@@ -1423,6 +1450,7 @@ function applyMobileTelemetry(data) {
             activeSign = null;
             candidateSign = null;
             candidateCount = 0;
+            confirmationBuffer = [];
             updateStabilityDots(0);
         }
 
@@ -1441,12 +1469,24 @@ function applyMobileTelemetry(data) {
 
     // ── State Hysteresis & Latching Prediction Handler ──
     const cleanPred = displaySign || cleanPredUpper || stripInternalSuffix(data.prediction || "");
+
+    // Backend Margin Gate handling:
+    // If backend marked the prediction status as "ambiguous" (e.g. fist cluster margin < 0.15)
+    if (data.status === "ambiguous") {
+        updateMobilePipelineStatusUI("Ambiguous");
+        if (activeSign !== null && dom.signVal) {
+            // Drop rapid override swapping and hold prior confirmed state
+            dom.signVal.textContent = activeSign;
+        }
+        return;
+    }
+
     if (now < lockUntil && activeSign !== null) {
         // Cooldown lockout: maintain current sign without volatile interim swapping
         if (dom.signVal) dom.signVal.textContent = activeSign;
         updateMobilePipelineStatusUI("Stable");
     } else {
-        handlePrediction(cleanPred, confVal);
+        handlePrediction(cleanPred, confVal, data.status);
         const displayWord = (activeSign !== null)
             ? activeSign
             : ((mobileLastConfirmedGesture && mobileLastConfirmedGesture !== "—") ? mobileLastConfirmedGesture : (cleanPred || "—"));
@@ -1463,7 +1503,7 @@ function commitSignToUI(sign) {
     mobileLastConfirmedGesture = sign;
     mobileConfirmedGestureTime = performance.now();
     updateMobilePipelineStatusUI("Stable");
-    updateStabilityDots(COMMIT_THRESHOLD);
+    updateStabilityDots(CONFIRM_WIN_COUNT);
 
     const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "J", "Z"]);
     if (upper === "NEUTRAL" || upper === "IDLE") {
@@ -1536,26 +1576,54 @@ function commitSignToUI(sign) {
     }
 }
 
-function handlePrediction(predictedLabel, confidence) {
+function handlePrediction(predictedLabel, confidence, status = "ok") {
     const now = Date.now();
-    if (!predictedLabel || confidence < 0.55) return;
+    if (!predictedLabel || confidence < 0.50 || status === "ambiguous") return;
 
-    // If locked, maintain current sign
-    if (now < lockUntil && activeSign !== null) return;
-
-    if (predictedLabel === candidateSign) {
-        candidateCount++;
-        updateStabilityDots(candidateCount);
-        if (candidateCount >= COMMIT_THRESHOLD && activeSign !== candidateSign) {
-            activeSign = candidateSign;
-            commitSignToUI(activeSign);
-            lockUntil = now + 400; // Hold sign steadily for 400ms before allowing a swap
-        }
-    } else {
-        candidateSign = predictedLabel;
-        candidateCount = 1;
-        updateStabilityDots(1);
+    // 4-frame confirmation buffer:
+    // Push new inference label into the sliding window of size 4
+    confirmationBuffer.push(predictedLabel);
+    if (confirmationBuffer.length > CONFIRM_BUFFER_SIZE) {
+        confirmationBuffer.shift();
     }
+
+    // A gesture must win at least 3 out of 4 consecutive inference frames to become the active candidate
+    const counts = {};
+    let winningCandidate = null;
+    let maxWins = 0;
+    for (const label of confirmationBuffer) {
+        counts[label] = (counts[label] || 0) + 1;
+        if (counts[label] > maxWins) {
+            maxWins = counts[label];
+        }
+        if (counts[label] >= CONFIRM_WIN_COUNT) {
+            winningCandidate = label;
+        }
+    }
+
+    updateStabilityDots(maxWins);
+
+    if (!winningCandidate) {
+        return; // Did not meet 3-of-4 confirmation threshold yet
+    }
+
+    // 350ms hysteresis lock:
+    // Once a gesture commits to the UI, lock it from being replaced by an adjacent similar sign
+    // unless the new sign is held consistently past the lock duration
+    if (activeSign !== null) {
+        if (winningCandidate === activeSign) {
+            return;
+        }
+        if (now < lockUntil) {
+            // Locked: suppress rapid swap
+            return;
+        }
+    }
+
+    // Commit confirmed winning candidate
+    activeSign = winningCandidate;
+    commitSignToUI(activeSign);
+    lockUntil = now + HYSTERESIS_LOCK_MS; // 350ms hysteresis lock
 }
 
 // ── Control Actions ─────────────────────────────────────────────────────────
@@ -1889,7 +1957,7 @@ async function stopMobileVoiceRecording() {
     formData.append("language", "en-US");
 
     try {
-        const resp = await fetch("/api/stt/transcribe", {
+        const resp = await fetch(`${API_BASE_URL}/api/stt/transcribe`, {
             method: "POST",
             body: formData
         });
@@ -1948,7 +2016,7 @@ function toggleCameraMirror() {
 // Dominant Hand Toggle
 function setDominantHand(hand) {
     triggerHaptic(25);
-    fetch("/set_dominant_hand", {
+    fetch(`${API_BASE_URL}/set_dominant_hand`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ hand: hand })

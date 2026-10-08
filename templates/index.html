@@ -38,7 +38,7 @@
                 <span>Mobile App</span>
             </a>
 
-            <button class="btn-header-tool" onclick="openGestureModal()" title="View supported gestures (Shortcut: ?)">
+            <button id="dictionary-btn" class="btn-header-tool" onclick="openGestureModal()" title="View supported gestures (Shortcut: ?)">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
                     <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
@@ -434,75 +434,143 @@
 
     </main>
 
-    <!-- ── Gesture Dictionary Modal ────────────────────────────────────── -->
+    <!-- ── Gesture Dictionary & Stick Figure Visualizer Modal ──────────── -->
     <div id="gesture-modal" class="modal-backdrop" style="display:none;" onclick="if(event.target === this) closeGestureModal()">
-        <div class="gesture-modal-card">
+        <div class="gesture-modal-card dictionary-expanded">
             <div class="gesture-modal-header">
                 <div>
-                    <h3 style="font-size:1.1rem; font-weight:700; color:#fff;">Supported Signs & Gestures</h3>
-                    <p style="font-size:0.75rem; color:var(--text-muted); margin-top:2px;">33 trained classes in the ASLO neural model. Click any to teach or test.</p>
+                    <h3 style="font-size:1.15rem; font-weight:800; color:#fff; display:flex; align-items:center; gap:8px;">
+                        <span>🤟</span> ASLO Sign Dictionary & 2D Animated Visualizer
+                    </h3>
+                    <p style="font-size:0.75rem; color:var(--text-muted); margin-top:2px;">
+                        43 supported signs. Select any sign below to inspect its animated stick-figure skeleton demonstration and usage tips.
+                    </p>
                 </div>
-                <button class="tool-icon-btn" onclick="closeGestureModal()" style="font-size:1.1rem;">✕</button>
+                <button class="tool-icon-btn" onclick="closeGestureModal()" style="font-size:1.1rem;" title="Close Dictionary">✕</button>
             </div>
 
-            <div class="gesture-modal-body">
-                <!-- Search Filter -->
-                <input type="text" id="gesture-search" class="teaching-input" placeholder="Filter gestures..." oninput="filterGestures(this.value)">
+            <!-- Category Filter Pills & Search Input -->
+            <div style="padding: 12px 16px 0 16px;">
+                <div class="dict-tab-bar">
+                    <button class="dict-tab-pill active" id="tab-pill-all" onclick="setDictCategory('all')">All Signs (43)</button>
+                    <button class="dict-tab-pill" id="tab-pill-static" onclick="setDictCategory('static')">Static Signs (Alphabet / Control)</button>
+                    <button class="dict-tab-pill" id="tab-pill-dynamic" onclick="setDictCategory('dynamic')">Dynamic Signs (Words / Phrases)</button>
+                </div>
+                <input type="text" id="gesture-search" class="teaching-input" placeholder="Search signs by name or keyword (e.g. 'A', 'Hello', 'How are you', 'Z')…" oninput="filterDictionaryList(this.value)" style="margin-bottom:8px;">
+            </div>
 
-                <!-- Alphabet Group -->
-                <div>
-                    <div class="gesture-group-title">Alphabet Letters (A – Y) — ✋ Single Hand (Right Hand Only)</div>
-                    <div class="gesture-grid">
-                        <div class="gesture-badge-item" onclick="quickTeach('A'); closeGestureModal();" data-label="A">A</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('B'); closeGestureModal();" data-label="B">B</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('C'); closeGestureModal();" data-label="C">C</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('D'); closeGestureModal();" data-label="D">D</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('E'); closeGestureModal();" data-label="E">E</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('F'); closeGestureModal();" data-label="F">F</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('G'); closeGestureModal();" data-label="G">G</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('H'); closeGestureModal();" data-label="H">H</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('J'); closeGestureModal();" data-label="J">J</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('K'); closeGestureModal();" data-label="K">K</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('L'); closeGestureModal();" data-label="L">L</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('M'); closeGestureModal();" data-label="M">M</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('N'); closeGestureModal();" data-label="N">N</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('O'); closeGestureModal();" data-label="O">O</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('P'); closeGestureModal();" data-label="P">P</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('Q'); closeGestureModal();" data-label="Q">Q</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('R'); closeGestureModal();" data-label="R">R</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('S'); closeGestureModal();" data-label="S">S</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('T'); closeGestureModal();" data-label="T">T</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('U'); closeGestureModal();" data-label="U">U</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('V'); closeGestureModal();" data-label="V">V</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('W'); closeGestureModal();" data-label="W">W</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('X'); closeGestureModal();" data-label="X">X</div>
-                        <div class="gesture-badge-item" onclick="quickTeach('Y'); closeGestureModal();" data-label="Y">Y</div>
+            <div class="gesture-modal-body" style="padding-top:4px;">
+                <div class="dict-split-layout">
+                    <!-- Left: Catalogue List Pane -->
+                    <div class="dict-catalogue-pane" id="dict-catalogue-pane">
+                        <!-- Static Alphabet Group -->
+                        <div class="dict-group-block" data-category="static">
+                            <div class="gesture-group-title">Static Signs (Alphabet A–Y) — ✋ Single Hand (Right Hand)</div>
+                            <div class="gesture-grid" id="dict-grid-alphabet">
+                                <div class="gesture-badge-item active-sign" onclick="selectDictionarySign('A')" data-label="A" data-category="static">A</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('B')" data-label="B" data-category="static">B</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('C')" data-label="C" data-category="static">C</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('D')" data-label="D" data-category="static">D</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('E')" data-label="E" data-category="static">E</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('F')" data-label="F" data-category="static">F</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('G')" data-label="G" data-category="static">G</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('H')" data-label="H" data-category="static">H</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('I')" data-label="I" data-category="static">I</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('K')" data-label="K" data-category="static">K</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('L')" data-label="L" data-category="static">L</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('M')" data-label="M" data-category="static">M</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('N')" data-label="N" data-category="static">N</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('O')" data-label="O" data-category="static">O</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('P')" data-label="P" data-category="static">P</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('Q')" data-label="Q" data-category="static">Q</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('R')" data-label="R" data-category="static">R</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('S')" data-label="S" data-category="static">S</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('T')" data-label="T" data-category="static">T</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('U')" data-label="U" data-category="static">U</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('V')" data-label="V" data-category="static">V</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('W')" data-label="W" data-category="static">W</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('X')" data-label="X" data-category="static">X</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('Y')" data-label="Y" data-category="static">Y</div>
+                            </div>
+                        </div>
+
+                        <!-- Dynamic Signs Group -->
+                        <div class="dict-group-block" data-category="dynamic">
+                            <div class="gesture-group-title">⚡ Dynamic Signs (Moving Sequences) — Traced Paths & Multi-Pose</div>
+                            <div class="gesture-grid" id="dict-grid-dynamic">
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('HOW ARE YOU')" data-label="HOW ARE YOU" data-category="dynamic">⚡ HOW ARE YOU</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('NICE TO MEET YOU')" data-label="NICE TO MEET YOU" data-category="dynamic">⚡ NICE TO MEET YOU</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('J')" data-label="J" data-category="dynamic">⚡ J</div>
+                                <div class="gesture-badge-item" onclick="selectDictionarySign('Z')" data-label="Z" data-category="dynamic">⚡ Z</div>
+                            </div>
+                        </div>
+
+                        <!-- Conversational Words Group -->
+                        <div class="dict-group-block" data-category="static">
+                            <div class="gesture-group-title">Conversational Words & Phrases</div>
+                            <div class="gesture-grid" id="dict-grid-phrases">
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('HELLO')" data-label="HELLO" data-category="static">HELLO</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('THANK YOU')" data-label="THANK YOU" data-category="static">THANK YOU</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('I LOVE YOU')" data-label="I LOVE YOU" data-category="static">I LOVE YOU</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('LOVE')" data-label="LOVE" data-category="static">LOVE</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('FINE')" data-label="FINE" data-category="static">FINE</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('ME')" data-label="ME" data-category="static">ME</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('YOU')" data-label="YOU" data-category="static">YOU</div>
+                            </div>
+                        </div>
+
+                        <!-- Control Signals Group -->
+                        <div class="dict-group-block" data-category="static">
+                            <div class="gesture-group-title">System & Flow Control Signs — 🙌 Two-Handed (Both Hands)</div>
+                            <div class="gesture-grid" id="dict-grid-control">
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('START')" data-label="START" data-category="static">START</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('STOP')" data-label="STOP" data-category="static">STOP</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('SPACE')" data-label="SPACE" data-category="static">SPACE</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('BACKSPACE')" data-label="BACKSPACE" data-category="static">BACKSPACE</div>
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('NEUTRAL')" data-label="NEUTRAL" data-category="static">NEUTRAL</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Stick Figure Skeleton Visualizer Pane -->
+                    <div class="dict-viewer-pane" id="dict-viewer-pane">
+                        <div class="dict-viewer-header">
+                            <span class="dict-viewer-title" id="dict-sign-title">Sign "A"</span>
+                            <div class="dict-viewer-badges">
+                                <span class="dict-badge static" id="dict-sign-badge">STATIC</span>
+                                <span class="dict-badge hand" id="dict-hand-badge">✋ RIGHT</span>
+                            </div>
+                        </div>
+
+                        <canvas id="dictionary-canvas" width="350" height="350"></canvas>
+
+                        <!-- Stick Figure Animation Controls -->
+                        <div class="dict-anim-controls">
+                            <button id="dict-anim-play-pause" class="btn-dict-control" onclick="toggleDictAnimation()">
+                                <span id="dict-anim-icon">⏸️</span> <span id="dict-anim-text">Pause</span>
+                            </button>
+                            <button id="dict-anim-speed" class="btn-dict-control" onclick="toggleDictSpeed()">
+                                <span>⚡</span> Speed: 1.0x
+                            </button>
+                            <button class="btn-dict-control" onclick="restartDictAnimation()">
+                                <span>🔄</span> Replay
+                            </button>
+                        </div>
+
+                        <!-- Description & Anatomical Tips -->
+                        <div class="dict-desc-box">
+                            <div class="dict-sec-title">
+                                <span>📖</span> Description
+                            </div>
+                            <p id="dict-sign-desc">Closed fist with thumb resting straight upright along the outer lateral side of the index finger.</p>
+                            
+                            <div class="dict-sec-title" style="color:var(--amber);">
+                                <span>💡</span> Usage Tips
+                            </div>
+                            <p id="dict-sign-tips">Keep thumb straight on the side. Do NOT fold thumb across front knuckles (which is 'S').</p>
+                        </div>
                     </div>
                 </div>
-
-                <!-- Phrases Group -->
-                <div>
-                    <div class="gesture-group-title">Conversational Words & Phrases — ✋ Right Hand / ✋🤚 YOU & ME (Both/Either Hand)</div>
-                    <div class="gesture-grid">
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('HELLO'); closeGestureModal();" data-label="HELLO">HELLO</div>
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('THANK YOU'); closeGestureModal();" data-label="THANK YOU">THANK YOU</div>
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('ME'); closeGestureModal();" data-label="ME">ME</div>
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('YOU'); closeGestureModal();" data-label="YOU">YOU</div>
-                    </div>
-                </div>
-
-                <!-- Control Signals Group -->
-                <div>
-                    <div class="gesture-group-title">System & Flow Control Signs — 🙌 Two-Handed (Both Hands)</div>
-                    <div class="gesture-grid">
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('START'); closeGestureModal();" data-label="START">START</div>
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('STOP'); closeGestureModal();" data-label="STOP">STOP</div>
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('SPACE'); closeGestureModal();" data-label="SPACE">SPACE</div>
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('BACKSPACE'); closeGestureModal();" data-label="BACKSPACE">BACKSPACE</div>
-                        <div class="gesture-badge-item control-item" onclick="quickTeach('NEUTRAL'); closeGestureModal();" data-label="NEUTRAL">NEUTRAL</div>
-                    </div>
-                </div>
-
             </div>
         </div>
     </div>

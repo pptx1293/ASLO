@@ -17,23 +17,29 @@ def main():
     data_path = "gesture_data.csv"
 
     if not os.path.exists(data_path):
-        print(
-            f"Error: '{data_path}' not found. Please run collect_data.py first to generate the dataset."
-        )
-        return
-
-    print(f"Loading dataset from '{data_path}'...")
-    df = pd.read_csv(data_path)
+        if os.path.exists("gesture_data_original_backup.csv"):
+            print("gesture_data.csv not found; loading from 'gesture_data_original_backup.csv'...")
+            df = pd.read_csv("gesture_data_original_backup.csv")
+        else:
+            print(
+                f"Error: '{data_path}' and backup not found. Please run collect_data.py first to generate the dataset."
+            )
+            return
+    else:
+        print(f"Loading dataset from '{data_path}'...")
+        df = pd.read_csv(data_path)
 
     if df.empty:
         print("Dataset is empty. Please ensure images were properly processed.")
         return
 
     num_cols = df.shape[1]
-    # Check if dataset needs fist disambiguation feature enrichment (226 -> 252 features)
-    if num_cols == 227:
-        print("Enriching dataset with fist disambiguation feature geometry (226 -> 252 features)...")
-        base_features = df.iloc[:, :-1].values
+    # Check if dataset needs fist disambiguation feature enrichment (226 -> 272 features)
+    if num_cols == 227 or (num_cols != (FEATURE_LEN + 1) and os.path.exists("gesture_data_original_backup.csv")):
+        print(f"Enriching dataset with fist disambiguation feature geometry (226 -> {FEATURE_LEN} features)...")
+        if num_cols != 227 and os.path.exists("gesture_data_original_backup.csv"):
+            df = pd.read_csv("gesture_data_original_backup.csv")
+        base_features = df.iloc[:, :226].values
         labels = df.iloc[:, -1].values
 
         h0_coords = base_features[:, 0:63]
@@ -53,8 +59,8 @@ def main():
         print(f"Saved enriched dataset with shape {enriched_df.shape} to '{data_path}'")
         X = enriched_features
         y = labels
-    elif num_cols == 253:
-        print(f"Dataset already enriched with 252 features ({df.shape[0]} rows).")
+    elif num_cols == FEATURE_LEN + 1:
+        print(f"Dataset already enriched with {FEATURE_LEN} features ({df.shape[0]} rows).")
         X = df.iloc[:, :-1].values
         y = df.iloc[:, -1].values
     else:

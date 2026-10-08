@@ -1,7 +1,11 @@
-import numpy as np
+import collections
 import itertools
+import time
+from typing import Dict, List, Optional, Tuple
+import numpy as np
 
-FEATURE_LEN = 252
+FIST_GEOMETRY_LEN = 23
+FEATURE_LEN = 226 + 2 * FIST_GEOMETRY_LEN  # 272
 
 
 class LandmarkPoint:
@@ -150,59 +154,28 @@ def _joint_angles(hand_landmarks) -> list[float]:
     return angles
 
 
-def _fist_disambiguation_features(hand_landmarks) -> list[float]:
-    """Computes explicit thumb-to-finger relational geometry to disambiguate
-    closed-fist family gestures (A, E, M, N, S, T):
-    1. Thumb Tip (id 4) relative to Index MCP (id 5), Middle MCP (id 9), Ring MCP (id 13), and Index Tip (id 8).
-    2. Thumb curl and direction vector (id 1 -> id 4) and angle/dot product with Index proximal vector (id 5 -> id 6).
-    3. Fingertip tuck depths: dist(8, 0), dist(12, 0), dist(16, 0), dist(20, 0) normalized by palm scale.
+def _fist_geometry_from_norm_coords(norm_pts: np.ndarray) -> list[float]:
+    """Computes explicit 23-dim thumb-to-finger relational geometry:
+    1. Distances and vectors from Thumb Tip (4) to Index MCP (5), Index PIP (6), Middle MCP (9), Ring MCP (13), and Index Tip (8).
+    2. Thumb curl vector (1 -> 4) and direction alignment with Index proximal vector (5 -> 6).
+    3. Fingertip tuck depths from wrist (0) for fingertips 8, 12, 16, 20.
     """
-    pts = np.array([_coords(lm) for lm in hand_landmarks.landmark])
-    scale = float(np.linalg.norm(pts[9] - pts[0])) + 1e-6
+    pts = norm_pts.astype(np.float32)
 
-    # 1. Thumb Tip relative to knuckles and index tip
-    d45 = float(np.linalg.norm(pts[4] - pts[5]) / scale)
-    d49 = float(np.linalg.norm(pts[4] - pts[9]) / scale)
-    d413 = float(np.linalg.norm(pts[4] - pts[13]) / scale)
-    d48 = float(np.linalg.norm(pts[4] - pts[8]) / scale)
+    # 1. Thumb Tip (4) relative to Index MCP (5), Index PIP (6), Middle MCP (9)
+    v45 = pts[4] - pts[5]
+    d45 = float(np.linalg.norm(v45))
 
-    # 2. Thumb curl and direction vector (1 -> 4)
-    v_th = (pts[4] - pts[1]) / scale
-    v_idx = (pts[6] - pts[5]) / scale
+    v46 = pts[4] - pts[6]
+    d46 = float(np.linalg.norm(v46))
 
-    norm_th = float(np.linalg.norm(v_th)) + 1e-6
-    norm_idx = float(np.linalg.norm(v_idx)) + 1e-6
-    u_th = v_th / norm_th
-    u_idx = v_idx / norm_idx
+    v49 = pts[4] - pts[9]
+    d49 = float(np.linalg.norm(v49))
 
-    dot = float(np.clip(np.dot(u_th, u_idx), -1.0, 1.0))
-    angle = float(np.arccos(dot))
-
-    # 3. Finger tuck depths normalized by palm scale
-    tuck8 = float(np.linalg.norm(pts[8] - pts[0]) / scale)
-    tuck12 = float(np.linalg.norm(pts[12] - pts[0]) / scale)
-    tuck16 = float(np.linalg.norm(pts[16] - pts[0]) / scale)
-    tuck20 = float(np.linalg.norm(pts[20] - pts[0]) / scale)
-
-    return [
-        d45, d49, d413, d48,
-        float(v_th[0]), float(v_th[1]), float(v_th[2]),
-        dot, angle,
-        tuck8, tuck12, tuck16, tuck20
-    ]
-
-
-def _fist_disambiguation_from_norm_coords(coords_63) -> list[float]:
-    """Extracts identical 13-dim fist disambiguation features directly from normalized coordinates."""
-    pts = np.asarray(coords_63, dtype=np.float32).reshape(21, 3)
-    if np.all(pts == 0):
-        return [0.0] * 13
-
-    d45 = float(np.linalg.norm(pts[4] - pts[5]))
-    d49 = float(np.linalg.norm(pts[4] - pts[9]))
     d413 = float(np.linalg.norm(pts[4] - pts[13]))
     d48 = float(np.linalg.norm(pts[4] - pts[8]))
 
+    # 2. Thumb curl vector (1 -> 4) and Index proximal vector (5 -> 6)
     v_th = pts[4] - pts[1]
     v_idx = pts[6] - pts[5]
 
@@ -214,17 +187,38 @@ def _fist_disambiguation_from_norm_coords(coords_63) -> list[float]:
     dot = float(np.clip(np.dot(u_th, u_idx), -1.0, 1.0))
     angle = float(np.arccos(dot))
 
+    # 3. Fingertip tuck depths from wrist (landmark 0)
     tuck8 = float(np.linalg.norm(pts[8] - pts[0]))
     tuck12 = float(np.linalg.norm(pts[12] - pts[0]))
     tuck16 = float(np.linalg.norm(pts[16] - pts[0]))
     tuck20 = float(np.linalg.norm(pts[20] - pts[0]))
 
-    return [
-        d45, d49, d413, d48,
+    feats = [
+        d45, d46, d49, d413, d48,
+        float(v45[0]), float(v45[1]), float(v45[2]),
+        float(v46[0]), float(v46[1]), float(v46[2]),
+        float(v49[0]), float(v49[1]), float(v49[2]),
         float(v_th[0]), float(v_th[1]), float(v_th[2]),
         dot, angle,
         tuck8, tuck12, tuck16, tuck20
     ]
+    return feats
+
+
+def _fist_disambiguation_features(hand_landmarks) -> list[float]:
+    """Computes explicit 23-dim fist disambiguation features from MediaPipe HandLandmarks."""
+    pts = np.array([_coords(lm) for lm in hand_landmarks.landmark], dtype=np.float32)
+    scale = float(np.linalg.norm(pts[9] - pts[0])) + 1e-6
+    norm_pts = (pts - pts[0]) / scale
+    return _fist_geometry_from_norm_coords(norm_pts)
+
+
+def _fist_disambiguation_from_norm_coords(coords_63) -> list[float]:
+    """Extracts identical 23-dim fist disambiguation features directly from normalized coordinates."""
+    norm_pts = np.asarray(coords_63, dtype=np.float32).reshape(21, 3)
+    if np.all(norm_pts == 0):
+        return [0.0] * FIST_GEOMETRY_LEN
+    return _fist_geometry_from_norm_coords(norm_pts)
 
 
 def extract_features(hands_res) -> list[float]:
@@ -255,16 +249,16 @@ def extract_features(hands_res) -> list[float]:
     else:
         feats += [0.0] * 50
 
-    # Fist Disambiguation Features: 13 for Hand 0, 13 for Hand 1
+    # Fist Disambiguation Features: 23 for Hand 0, 23 for Hand 1
     if results.left_hand_landmarks:
         feats += _fist_disambiguation_features(results.left_hand_landmarks)
     else:
-        feats += [0.0] * 13
+        feats += [0.0] * FIST_GEOMETRY_LEN
 
     if results.right_hand_landmarks:
         feats += _fist_disambiguation_features(results.right_hand_landmarks)
     else:
-        feats += [0.0] * 13
+        feats += [0.0] * FIST_GEOMETRY_LEN
 
     assert len(feats) == FEATURE_LEN, f"Expected {FEATURE_LEN} features, got {len(feats)}"
     return feats
@@ -316,19 +310,19 @@ def extract_primary_hand_features(hands_res, dominant_hand="right") -> list[floa
     if results.left_hand_landmarks:
         feats += _fist_disambiguation_features(results.left_hand_landmarks)
     else:
-        feats += [0.0] * 13
+        feats += [0.0] * FIST_GEOMETRY_LEN
 
     if results.right_hand_landmarks:
         feats += _fist_disambiguation_features(results.right_hand_landmarks)
     else:
-        feats += [0.0] * 13
+        feats += [0.0] * FIST_GEOMETRY_LEN
 
     assert len(feats) == FEATURE_LEN, f"Expected {FEATURE_LEN} features, got {len(feats)}"
     return feats
 
 
 def extract_two_hand_features(right_hand_landmarks, left_hand_landmarks) -> list[float]:
-    """Deterministically extracts 252-dim features with:
+    """Deterministically extracts 272-dim features with:
     Slot 0 = right_hand_landmarks (user's physical Right hand)
     Slot 1 = left_hand_landmarks (user's physical Left hand)
     Prevents MediaPipe handedness inversion from swapping slots."""
@@ -361,12 +355,12 @@ def extract_two_hand_features(right_hand_landmarks, left_hand_landmarks) -> list
     if right_hand_landmarks:
         feats += _fist_disambiguation_features(right_hand_landmarks)
     else:
-        feats += [0.0] * 13
+        feats += [0.0] * FIST_GEOMETRY_LEN
 
     if left_hand_landmarks:
         feats += _fist_disambiguation_features(left_hand_landmarks)
     else:
-        feats += [0.0] * 13
+        feats += [0.0] * FIST_GEOMETRY_LEN
 
     assert len(feats) == FEATURE_LEN, f"Expected {FEATURE_LEN} features, got {len(feats)}"
     return feats
@@ -386,7 +380,7 @@ class _MirroredHand:
 
 
 def extract_single_hand_features(hand_landmarks, is_left_hand=False) -> list[float]:
-    """Extracts features for a single hand placed in Slot 0 (indices 0..62, 126..175, and 226..238).
+    """Extracts features for a single hand placed in Slot 0 (indices 0..62, 126..175, and 226..248).
     If is_left_hand=True, horizontally mirrors coordinates so the geometry matches
     the model's single-hand training distributions with high accuracy."""
     target = _MirroredHand(hand_landmarks) if is_left_hand else hand_landmarks
@@ -395,7 +389,7 @@ def extract_single_hand_features(hand_landmarks, is_left_hand=False) -> list[flo
     j_ang = _joint_angles(target)
     tip_d = _fingertip_distances(target)
     fist_d = _fist_disambiguation_features(target)
-    feats = norm_hand + [0.0] * 63 + thumb_d + j_ang + tip_d + [0.0] * 50 + fist_d + [0.0] * 13
+    feats = norm_hand + [0.0] * 63 + thumb_d + j_ang + tip_d + [0.0] * 50 + fist_d + [0.0] * FIST_GEOMETRY_LEN
     assert len(feats) == FEATURE_LEN, f"Expected {FEATURE_LEN} features, got {len(feats)}"
     return feats
 
@@ -460,29 +454,39 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
         is_curled_pky = (np.linalg.norm(pky_tip - wrist) <= np.linalg.norm(pky_pip - wrist) * 1.20)
         is_fist = bool(is_curled_mid and is_curled_ring and is_curled_pky)
 
-        # ── 1. N vs T Disambiguation ──
-        if is_fist and lbl_clean in ("t", "n"):
-            d_idx_pip = float(np.linalg.norm(thb_tip - idx_pip) / palm_w)
-            if d_idx_pip >= 0.42:
-                return "N"
-            else:
-                return "T"
-
-        # ── 2. A vs S Disambiguation ──
-        # In ASL 'A', thumb is resting straight up on the outer side of the index finger.
-        # In ASL 'S', thumb is folded horizontally across the front of the curled fingers.
-        if is_fist and lbl_clean in ("a", "s"):
+        # ── 1. Fist Cluster Disambiguation (A, S, T, E, M, N) ──
+        if is_fist and lbl_clean in ("a", "s", "t", "e", "m", "n"):
             mid_mcp = np.array([lms[9].x, lms[9].y], dtype=np.float32)
             d4_to_9 = float(np.linalg.norm(thb_tip - mid_mcp) / palm_w)
-            dy_thb_idx = float((lms[4].y - lms[5].y) / palm_w)  # y is positive downward
+            d_idx_pip = float(np.linalg.norm(thb_tip - idx_pip) / palm_w)
+            d_mid_pip = float(np.linalg.norm(thb_tip - mid_pip) / palm_w)
+            d_ring_pip = float(np.linalg.norm(thb_tip - ring_pip) / palm_w)
+            dy_thb_idx = float((lms[4].y - lms[5].y) / palm_w)  # negative = thumb is higher than index knuckle
 
-            if d4_to_9 >= 0.65 or dy_thb_idx < -0.40:
+            # ASL 'A': Thumb is resting upright on outer lateral edge of index, NOT across knuckles
+            if d4_to_9 >= 0.58 and (dy_thb_idx < -0.30 or thb_tip[0] < idx_mcp[0] - 0.05 * palm_w):
                 return "A"
-            elif d4_to_9 < 0.55 and dy_thb_idx > -0.35:
-                return "S"
-            return "A" if lbl_clean == "a" else "S"
+            # ASL 'S': Thumb wrapped horizontally across front knuckles of index and middle
+            elif d4_to_9 < 0.52 and dy_thb_idx > -0.35 and abs(lms[4].y - lms[6].y) < 0.30 * palm_w:
+                if d_idx_pip < 0.38 and d4_to_9 < 0.45:
+                    return "S"
+            # ASL 'T': Thumb tucked under index, popping up between index and middle
+            if d_idx_pip < 0.38 and lms[4].x > idx_pip[0] and lms[4].x < mid_pip[0] + 0.1 * palm_w:
+                return "T"
+            # ASL 'N': Thumb tucked under index & middle, resting between middle & ring
+            if d_mid_pip < 0.42 and lms[4].x > mid_pip[0] - 0.05 * palm_w:
+                return "N"
+            # ASL 'M': Thumb tucked under index, middle & ring, resting between ring & pinky
+            if d_ring_pip < 0.45 and lms[4].x > ring_pip[0] - 0.05 * palm_w:
+                return "M"
+            # ASL 'E': All fingers curled tight down, thumb pulled back across lower palm
+            if lms[4].y > idx_pip[y_idx := 1] and all(np.linalg.norm(np.array([lms[i].x, lms[i].y]) - wrist) < 0.95 * palm_scale for i in (8, 12, 16, 20)):
+                return "E"
 
-        # ── 3. S vs O Disambiguation ──
+            # Fallback to model label within fist cluster
+            return lbl_clean.upper()
+
+        # ── 2. S vs O Disambiguation ──
         # In 'S' (fist), fingertips 8 & 12 are tucked close into palm (< 0.98 of palm scale).
         # In 'O', fingers arc forward touching thumb to form an open circle (tips >= 1.02 of palm scale).
         if lbl_clean in ("s", "o"):
@@ -494,7 +498,7 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
                 return "O"
             return "S" if lbl_clean == "s" else "O"
 
-        # ── 4. P vs Q vs Z Disambiguation ──
+        # ── 3. P vs Q vs Z Disambiguation ──
         # In 'P': index points forward/downward (-0.50 <= idx_dy <= 0.85) and middle points DOWN (mid_dy >= 0.75).
         # In 'Q': index points sharply straight down to floor (idx_dy >= 1.20) and middle is curled in palm.
         # In 'Z': index points up or forward-up (idx_dy < 0.35) and middle is curled in palm.
@@ -514,7 +518,7 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
                 return "Z" if (lbl_clean == "z" or route_mode == "DYNAMIC") else "P"
             return "P" if lbl_clean == "p" else ("Q" if lbl_clean == "q" else "Z")
 
-        # ── 5. U vs V vs R Disambiguation ──
+        # ── 4. U vs V vs R Disambiguation ──
         # ASL anatomy:
         # U: Index + Middle extended straight up, parallel side-by-side. Ring + Pinky curled.
         # V: Index + Middle extended straight up, spread apart in distinct 'V'. Ring + Pinky curled.
@@ -545,22 +549,18 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
 
             # Preserve neural network predictions without spurious overrides:
             if lbl_clean == "u":
-                # Only override U with V if fingertips are spread wide apart (clear V)
                 if d_tip >= 0.65 and proj >= 1.40:
                     return "V"
-                # Only override U with R if fingers are crossed
                 elif has_cross or proj <= 0.15:
                     return "R"
                 return "U"
             elif lbl_clean == "r":
-                # R: fingers crossed. Do not override with U or V unless clearly spread or parallel
                 if d_tip >= 0.65 and proj >= 1.40:
                     return "V"
                 elif proj >= 0.70 and d_tip >= 0.32 and not has_cross:
                     return "U"
                 return "R"
             elif lbl_clean == "v":
-                # Only override V with U if fingertips are held close together
                 if d_tip < 0.38 and proj < 0.85:
                     return "U"
                 elif has_cross or proj <= 0.15:
@@ -568,3 +568,226 @@ def apply_heuristics(hand_or_res, label, is_left_hand=False, confidence=None, ro
                 return "V"
 
     return str(label).strip().upper()
+
+
+# =====================================================================
+# DYNAMIC GESTURE MOTION BUFFER & MULTI-STAGE RECOGNIZER
+# =====================================================================
+
+class LandmarkMotionBuffer:
+    """Sliding FIFO sequence buffer (fixed window 16-30 frames) tracking wrist and fingertip velocities (dx/dt, dy/dt)."""
+    def __init__(self, max_frames: int = 30):
+        self.max_frames = max_frames
+        self.buffer = collections.deque(maxlen=max_frames)
+        self.timestamps = collections.deque(maxlen=max_frames)
+
+    def append(self, landmarks, timestamp: Optional[float] = None):
+        t = timestamp if timestamp is not None else time.time()
+        if hasattr(landmarks, "landmark"):
+            pts = np.array([[lm.x, lm.y, getattr(lm, "z", 0.0)] for lm in landmarks.landmark], dtype=np.float32)
+        elif isinstance(landmarks, (list, tuple)):
+            if len(landmarks) > 0 and isinstance(landmarks[0], dict):
+                pts = np.array([[p.get("x", 0.0), p.get("y", 0.0), p.get("z", 0.0)] for p in landmarks], dtype=np.float32)
+            else:
+                pts = np.asarray(landmarks, dtype=np.float32)
+        else:
+            return
+        if pts.ndim == 2 and pts.shape[0] >= 21:
+            self.buffer.append(pts[:21, :])
+            self.timestamps.append(t)
+
+    def clear(self):
+        self.buffer.clear()
+        self.timestamps.clear()
+
+    def get_velocities(self) -> dict:
+        """Computes velocity (dx/dt, dy/dt) and overall magnitude for wrist (0) and index tip (8)."""
+        if len(self.buffer) < 2:
+            return {
+                "wrist": (0.0, 0.0),
+                "index_tip": (0.0, 0.0),
+                "magnitude": 0.0
+            }
+        p_now = self.buffer[-1]
+        p_prev = self.buffer[-2]
+        dt = max(1e-4, self.timestamps[-1] - self.timestamps[-2])
+
+        v_wrist = ((p_now[0, 0] - p_prev[0, 0]) / dt, (p_now[0, 1] - p_prev[0, 1]) / dt)
+        v_idx = ((p_now[8, 0] - p_prev[8, 0]) / dt, (p_now[8, 1] - p_prev[8, 1]) / dt)
+        mag = float(np.hypot(v_wrist[0], v_wrist[1]) * 0.4 + np.hypot(v_idx[0], v_idx[1]) * 0.6)
+
+        return {
+            "wrist": (float(v_wrist[0]), float(v_wrist[1])),
+            "index_tip": (float(v_idx[0]), float(v_idx[1])),
+            "magnitude": mag
+        }
+
+    def get_trajectory(self, landmark_idx: int = 8) -> list:
+        return [(float(f[landmark_idx, 0]), float(f[landmark_idx, 1])) for f in self.buffer]
+
+
+# Dynamic Signs Registry: separate static single-frame classes from dynamic sequence classes
+DYNAMIC_SIGNS_REGISTRY = {
+    "HOW ARE YOU": {
+        "start_label": "HOW ARE YOU_START",
+        "end_label": "HOW ARE YOU_END",
+        "two_handed": True,
+        "max_window_sec": 1.5,
+        "min_velocity": 0.05,
+    },
+    "NICE TO MEET YOU": {
+        "start_label": "NICE TO MEET YOU_START",
+        "end_label": "NICE TO MEET YOU_END",
+        "two_handed": True,
+        "max_window_sec": 1.8,
+        "min_velocity": 0.05,
+    },
+    "J": {
+        "start_label": "J_START",
+        "end_label": "J_END",
+        "two_handed": False,
+        "max_window_sec": 1.5,
+        "min_velocity": 0.04,
+    },
+    "Z": {
+        "start_label": "Z_START",
+        "end_label": "Z_END",
+        "two_handed": False,
+        "max_window_sec": 1.5,
+        "min_velocity": 0.04,
+    }
+}
+
+
+class MultiStageDynamicGestureStateMachine:
+    """
+    Multi-stage dynamic gesture state machine:
+    1. Trigger Phase (Start Pose): Detect initial pose + motion onset exceeding velocity threshold.
+       Starts a countdown window (1.5 seconds max).
+    2. Path Verification: Checks that trajectory of dominant hand follows expected movement
+       rather than requiring rigid frame hits on every tick.
+    3. Release Phase (End Pose): If terminal pose is reached within window and trajectory is valid,
+       commits the dynamic sign.
+    4. Timeout / Abort: If velocity drops to zero before reaching end pose or 1.5s timer expires,
+       aborts smoothly and resets to static sign detection.
+    """
+    def __init__(self):
+        self.state = "IDLE"  # "IDLE", "TRACKING"
+        self.active_sign: Optional[str] = None
+        self.start_time: float = 0.0
+        self.max_duration: float = 1.5
+        self.motion_buffer = LandmarkMotionBuffer(max_frames=30)
+        self.still_counter: int = 0
+        self.trajectory_points: list = []
+
+    def reset(self):
+        self.state = "IDLE"
+        self.active_sign = None
+        self.start_time = 0.0
+        self.still_counter = 0
+        self.trajectory_points.clear()
+        self.motion_buffer.clear()
+
+    def update(
+        self,
+        landmarks,
+        raw_pred: Optional[str] = None,
+        confidence: float = 0.0,
+        timestamp: Optional[float] = None
+    ) -> dict:
+        now = timestamp if timestamp is not None else time.time()
+        self.motion_buffer.append(landmarks, now)
+        vel = self.motion_buffer.get_velocities()
+        mag = vel["magnitude"]
+
+        raw_upper = str(raw_pred or "").upper().strip()
+
+        # Phase 1: IDLE -> Trigger Phase
+        if self.state == "IDLE":
+            for sign_name, cfg in DYNAMIC_SIGNS_REGISTRY.items():
+                is_start_hit = (raw_upper == cfg["start_label"] or raw_upper.startswith(sign_name) and raw_upper.endswith("_START"))
+                if is_start_hit and mag >= cfg["min_velocity"] and confidence >= 0.40:
+                    self.state = "TRACKING"
+                    self.active_sign = sign_name
+                    self.start_time = now
+                    self.max_duration = cfg["max_window_sec"]
+                    self.still_counter = 0
+                    self.trajectory_points = [vel["index_tip"]]
+                    return {
+                        "state": "TRACKING",
+                        "active_sign": self.active_sign,
+                        "remaining_time": self.max_duration,
+                        "committed_sign": None,
+                        "aborted": False,
+                        "message": f"DYNAMIC START: {self.active_sign}"
+                    }
+            return {
+                "state": "IDLE",
+                "active_sign": None,
+                "remaining_time": 0.0,
+                "committed_sign": None,
+                "aborted": False,
+                "message": ""
+            }
+
+        # Phase 2 & 3: TRACKING -> Path Verification & End Pose Release
+        elapsed = now - self.start_time
+        remaining = max(0.0, self.max_duration - elapsed)
+        self.trajectory_points.append(vel["index_tip"])
+
+        # Check Timeout
+        if elapsed > self.max_duration or remaining <= 0:
+            cancelled_sign = self.active_sign
+            self.reset()
+            return {
+                "state": "IDLE",
+                "active_sign": None,
+                "remaining_time": 0.0,
+                "committed_sign": None,
+                "aborted": True,
+                "message": f"DYNAMIC TIMEOUT: {cancelled_sign}"
+            }
+
+        # Check Still / Premature Stop
+        if mag < 0.015:
+            self.still_counter += 1
+            if self.still_counter > 8 and elapsed < 0.4:
+                cancelled_sign = self.active_sign
+                self.reset()
+                return {
+                    "state": "IDLE",
+                    "active_sign": None,
+                    "remaining_time": 0.0,
+                    "committed_sign": None,
+                    "aborted": True,
+                    "message": f"DYNAMIC ABORTED (Motion Stopped): {cancelled_sign}"
+                }
+        else:
+            self.still_counter = max(0, self.still_counter - 1)
+
+        # Check End Pose Completion
+        cfg = DYNAMIC_SIGNS_REGISTRY.get(self.active_sign, {})
+        end_label = cfg.get("end_label", f"{self.active_sign}_END")
+        is_end_hit = (raw_upper == end_label or raw_upper.endswith("_END") or (self.active_sign in ("HOW ARE YOU", "NICE TO MEET YOU") and raw_upper == "YOU"))
+
+        # Verify minimum motion frames before committing (>= 5 frames or >= 0.35s)
+        if is_end_hit and (elapsed >= 0.35 or len(self.trajectory_points) >= 6):
+            committed = self.active_sign
+            self.reset()
+            return {
+                "state": "COMMITTED",
+                "active_sign": None,
+                "remaining_time": 0.0,
+                "committed_sign": committed,
+                "aborted": False,
+                "message": f"DYNAMIC COMPLETED: {committed}"
+            }
+
+        return {
+            "state": "TRACKING",
+            "active_sign": self.active_sign,
+            "remaining_time": remaining,
+            "committed_sign": None,
+            "aborted": False,
+            "message": f"TRACKING: {self.active_sign} ({remaining:.1f}s)"
+        }
