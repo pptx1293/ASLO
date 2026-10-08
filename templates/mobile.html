@@ -66,6 +66,26 @@
     <!-- ── Main Scrollable Content ──────────────────────────────────────── -->
     <main class="mobile-content">
 
+        <!-- Server Mode Negotiation Bar -->
+        <div class="server-mode-container" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 6px 12px; margin: 4px 10px 8px 10px; background: rgba(15,23,42,0.75); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px;">
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label for="server-mode-select" style="font-weight: 600; font-size: 12px; color: #94a3b8;">Inference:</label>
+            <select id="server-mode-select" class="form-select" style="padding: 3px 6px; border-radius: 6px; font-size: 12px; background: #0f172a; color: #fff; border: 1px solid rgba(255,255,255,0.15);">
+              <option value="auto">Auto-Detect</option>
+              <option value="local">Local (0ms)</option>
+              <option value="cloud">Cloud</option>
+            </select>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <span id="server-status-pill" class="badge" style="padding: 3px 8px; border-radius: 10px; font-size: 11px; background: #6c757d; color: #fff;">
+              Checking...
+            </span>
+            <a id="local-engine-download-link" href="https://github.com/pptx1293/ASLO/releases" target="_blank" style="font-size: 11px; text-decoration: underline; display: none; color: #38bdf8;">
+              Download Engine
+            </a>
+          </div>
+        </div>
+
         <!-- ── Sci-Fi Viewfinder Container ──────────────────────────────── -->
         <section class="mobile-cam-box" id="mobile-cam-box">
             <!-- HUD Sci-Fi Corner Brackets -->
@@ -345,6 +365,24 @@
                     <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
                 <input type="text" id="m-dict-search" placeholder="Search signs (e.g. 'hello', 'how are you', 'A')…" oninput="filterDictionary(this.value)">
+            </div>
+
+            <!-- Interactive Dual-View Skeleton Visualizer Pane -->
+            <div class="m-dict-viewer" id="m-dict-viewer" style="display:none; padding:12px; background:rgba(10,17,30,0.95); border:1px solid rgba(0,240,255,0.35); border-radius:12px; margin-bottom:12px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                    <span id="m-dict-title" style="font-weight:800; color:#fff; font-family:var(--font-mono); font-size:1rem;">Sign "A"</span>
+                    <div style="display:flex; gap:6px;">
+                        <span class="m-dict-badge" id="m-dict-cat-badge" style="font-size:0.65rem; padding:2px 6px; border-radius:10px; background:rgba(16,185,129,0.2); color:#10b981; border:1px solid rgba(16,185,129,0.4);">STATIC</span>
+                        <span class="m-dict-badge" id="m-dict-placement-badge" style="font-size:0.65rem; padding:2px 6px; border-radius:10px; background:rgba(255,152,0,0.2); color:#ff9800; border:1px solid rgba(255,152,0,0.45);">Thumb: Lateral</span>
+                    </div>
+                </div>
+                <canvas id="dictionary-canvas" width="340" height="210" style="width:100%; height:210px; border-radius:8px; background:#050811; display:block; border:1px solid rgba(0,240,255,0.25);"></canvas>
+                <div style="display:flex; justify-content:center; gap:8px; margin-top:8px;">
+                    <button class="btn-dict-control" id="m-dict-play-pause" onclick="toggleMobileDictAnim()" style="background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:4px 10px; border-radius:6px; font-size:0.75rem;">⏸ Pause</button>
+                    <button class="btn-dict-control" id="m-dict-speed" onclick="toggleMobileDictSpeed()" style="background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:4px 10px; border-radius:6px; font-size:0.75rem;">⚡ Speed: 1.0x</button>
+                    <button class="btn-dict-control" onclick="restartMobileDictAnim()" style="background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:4px 10px; border-radius:6px; font-size:0.75rem;">🔄 Replay</button>
+                </div>
+                <p id="m-dict-desc" style="font-size:0.75rem; color:#94a3b8; margin-top:6px; line-height:1.4; margin-bottom:0;"></p>
             </div>
 
             <div class="m-sheet-content" id="m-dict-content">

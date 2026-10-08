@@ -2,6 +2,7 @@ import base64
 import collections
 import csv
 import json
+import math
 import os
 import re
 import subprocess
@@ -34,8 +35,12 @@ from speech_to_text import SUPPORTED_LANGUAGES, engine as stt_engine
 
 app = Flask(__name__, static_folder="templates", static_url_path="")
 if CORS is not None:
-    CORS(app)
+    CORS(app, resources={r"/*": {"origins": "*"}})
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "online", "engine": "local"}), 200
 
 dynamic_state_machine = aslo_features.MultiStageDynamicGestureStateMachine()
 FIST_CLUSTER = {"A", "S", "T", "E", "M", "N"}
@@ -382,18 +387,28 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             heur = "NEUTRAL"
             conf = max(prob_neutral, 0.75 if is_resting else conf_single)
             pred_status = "valid"
-        elif (str(top_class_name).upper().strip() in FIST_CLUSTER and str(second_class_name).upper().strip() in FIST_CLUSTER and margin_value < 0.15):
-            # Fist cluster ambiguity margin gate: drop ambiguous raw predictions to hold prior confirmed state
-            heur = None
-            conf = p_top_single
-            pred_status = "ambiguous"
+        elif (str(top_class_name).upper().strip() in FIST_CLUSTER and str(second_class_name).upper().strip() in FIST_CLUSTER and margin_value < 0.20):
+            # Deterministic geometric tie-breaker for fist cluster
+            raw_pts = np.array([aslo_features._coords(lm) for lm in single_lms.landmark], dtype=np.float32)
+            sc = float(np.linalg.norm(raw_pts[9] - raw_pts[0])) + 1e-6
+            norm_pts = (raw_pts - raw_pts[0]) / sc
+            tb_sign = aslo_features.resolve_fist_tie_breaker(norm_pts, str(top_class_name).upper().strip(), str(second_class_name).upper().strip(), margin_value)
+            if tb_sign:
+                heur = tb_sign
+                conf = max(p_top_single, 0.75)
+                pred_status = "valid"
+            else:
+                heur = None
+                conf = p_top_single
+                pred_status = "ambiguous"
         elif verified_single is None:
             # Check if ambiguity is between known disambiguation pairs
             pair_set = {str(top_class_name).upper().strip(), str(second_class_name).upper().strip()}
             can_disambiguate = (
                 bool(pair_set.intersection({"U", "V", "R"})) or
                 bool(pair_set.intersection({"S", "O"})) or
-                bool(pair_set.intersection({"P", "Q", "Z", "Z_START", "Z_END"}))
+                bool(pair_set.intersection({"P", "Q", "Z", "Z_START", "Z_END"})) or
+                bool(pair_set.intersection({"Y", "YOU", "J_START"}))
             )
             if can_disambiguate and p_top_single >= 0.40:
                 resolved = aslo_features.apply_heuristics(single_lms, top_class_name, is_left_hand=False, confidence=p_top_single)
@@ -416,6 +431,20 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
                     heur = None
                     pred_status = "ambiguous"
                 conf = conf_single
+
+        # Mid-sweep "O" suppression & "J" protection:
+        # "O" requires closed loop between index and thumb (d48 < 0.32) and NO extended pinky
+        if heur and str(heur).upper().strip() == "O":
+            raw_pts = np.array([aslo_features._coords(lm) for lm in single_lms.landmark], dtype=np.float32)
+            sc = float(np.linalg.norm(raw_pts[9] - raw_pts[0])) + 1e-6
+            d_thumb_idx = float(np.linalg.norm(raw_pts[4] - raw_pts[8]) / sc)
+            is_pinky_up = bool(raw_pts[20, 1] < raw_pts[18, 1])
+            if d_thumb_idx > 0.32 or is_pinky_up:
+                if is_pinky_up:
+                    heur = "J_START"
+                else:
+                    heur = None
+                    pred_status = "ambiguous"
 
         pred_label = heur
         confidence = conf
@@ -827,12 +856,24 @@ def api_dictionary():
                 for step in range(12):
                     t = step / 11.0
                     frame_pts = []
-                    for p0, p1 in zip(s_pts, e_pts):
-                        frame_pts.append({
-                            "x": round(p0["x"] * (1 - t) + p1["x"] * t, 4),
-                            "y": round(p0["y"] * (1 - t) + p1["y"] * t, 4),
-                            "z": round(p0["z"] * (1 - t) + p1["z"] * t, 4)
-                        })
+                    # For J, add a smooth arc swoop (downward stroke + inward curved hook)
+                    if sign_key == "J":
+                        # Smooth curved hook offset: arc down then sweep up inward
+                        arc_offset_x = -0.05 * math.sin(math.pi * t)
+                        arc_offset_y = 0.08 * math.sin(math.pi * min(1.0, t * 1.3))
+                        for p0, p1 in zip(s_pts, e_pts):
+                            frame_pts.append({
+                                "x": round(p0["x"] * (1 - t) + p1["x"] * t + arc_offset_x, 4),
+                                "y": round(p0["y"] * (1 - t) + p1["y"] * t + arc_offset_y, 4),
+                                "z": round(p0["z"] * (1 - t) + p1["z"] * t, 4)
+                            })
+                    else:
+                        for p0, p1 in zip(s_pts, e_pts):
+                            frame_pts.append({
+                                "x": round(p0["x"] * (1 - t) + p1["x"] * t, 4),
+                                "y": round(p0["y"] * (1 - t) + p1["y"] * t, 4),
+                                "z": round(p0["z"] * (1 - t) + p1["z"] * t, 4)
+                            })
                     keyframes.append(frame_pts)
 
         result.append({

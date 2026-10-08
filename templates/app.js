@@ -100,10 +100,104 @@ let clientDisplayHistory = [];
 let clientSmoothedDisplayGesture = "—";
 let clientSmoothedConf = 0;
 
-// ── Dual-Host API Resolver ──────────────────────────────────────────────────
+// ── Dual-Host API Resolver & Engine Auto-Negotiation ────────────────────────
 const API_BASE_URL = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
     ? '' 
     : window.location.origin;
+
+let currentInferenceUrl = API_BASE_URL;
+let serverMode = localStorage.getItem("aslo_server_mode") || "auto";
+let isLocalAlive = false;
+
+async function checkLocalServerAlive() {
+    try {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 600);
+        const res = await fetch("http://127.0.0.1:5000/ping", {
+            method: "GET",
+            mode: "cors",
+            signal: controller.signal
+        });
+        clearTimeout(tid);
+        if (res.ok) {
+            const data = await res.json();
+            return Boolean(data && data.status === "online");
+        }
+    } catch (_) {}
+    return false;
+}
+
+async function updateServerNegotiation() {
+    isLocalAlive = await checkLocalServerAlive();
+    const select = document.getElementById("server-mode-select");
+    const pill = document.getElementById("server-status-pill");
+    const downloadLink = document.getElementById("local-engine-download-link");
+
+    if (select && select.value !== serverMode) {
+        select.value = serverMode;
+    }
+
+    if (serverMode === "local") {
+        if (isLocalAlive) {
+            currentInferenceUrl = "http://127.0.0.1:5000";
+            if (pill) {
+                pill.textContent = "Local (0ms Active)";
+                pill.style.background = "#10b981";
+                pill.style.color = "#fff";
+            }
+            if (downloadLink) downloadLink.style.display = "none";
+        } else {
+            currentInferenceUrl = API_BASE_URL;
+            if (pill) {
+                pill.textContent = "Local Offline (Cloud Fallback)";
+                pill.style.background = "#ef4444";
+                pill.style.color = "#fff";
+            }
+            if (downloadLink) downloadLink.style.display = "inline";
+        }
+    } else if (serverMode === "cloud") {
+        currentInferenceUrl = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? '' : window.location.origin;
+        if (pill) {
+            pill.textContent = "Cloud Active";
+            pill.style.background = "#0284c7";
+            pill.style.color = "#fff";
+        }
+        if (downloadLink) downloadLink.style.display = "none";
+    } else {
+        // "auto" mode
+        if (isLocalAlive) {
+            currentInferenceUrl = "http://127.0.0.1:5000";
+            if (pill) {
+                pill.textContent = "Auto: Local Engine (0ms)";
+                pill.style.background = "#10b981";
+                pill.style.color = "#fff";
+            }
+            if (downloadLink) downloadLink.style.display = "none";
+        } else {
+            currentInferenceUrl = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? '' : window.location.origin;
+            if (pill) {
+                pill.textContent = "Auto: Cloud Active";
+                pill.style.background = "#6366f1";
+                pill.style.color = "#fff";
+            }
+            if (downloadLink) downloadLink.style.display = "none";
+        }
+    }
+}
+
+function initServerNegotiator() {
+    const select = document.getElementById("server-mode-select");
+    if (select) {
+        select.value = serverMode;
+        select.addEventListener("change", (e) => {
+            serverMode = e.target.value;
+            localStorage.setItem("aslo_server_mode", serverMode);
+            updateServerNegotiation();
+        });
+    }
+    updateServerNegotiation();
+    setInterval(updateServerNegotiation, 10000);
+}
 
 // ── State Hysteresis & Latching Constants & State ──────────────────────────
 let activeSign = null;
@@ -239,8 +333,8 @@ function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
         if (c.scale > maxScale) maxScale = c.scale;
     }
 
-    // Discard all hands whose scale is < 70% of the largest hand
-    const valid = candidates.filter(c => c.scale >= 0.70 * maxScale);
+    // Discard all hands whose scale is < 65% of the largest hand
+    const valid = candidates.filter(c => c.scale >= 0.65 * maxScale);
     if (valid.length === 0) {
         return { hands: [], status: "aligning" };
     }
@@ -566,6 +660,10 @@ class SpatialHandTracker {
     resetTrack(t) {
         t.prevWrist = null;
         t.lastTime = 0;
+        t.prevLandmarks = null;
+        t.velocities = null;
+        t.coastFrames = 0;
+        t.lastLabel = null;
         for (let i = 0; i < 21; i++) {
             t.filters[i].x.reset();
             t.filters[i].y.reset();
@@ -588,7 +686,8 @@ class SpatialHandTracker {
     }
 
     filterLandmarks(track, rawLandmarks, timestamp) {
-        return rawLandmarks.map((p, i) => {
+        const dt = track.lastTime > 0 ? (timestamp - track.lastTime) : 16;
+        const smoothed = rawLandmarks.map((p, i) => {
             const rx = Number(p.x !== undefined ? p.x : p[0]);
             const ry = Number(p.y !== undefined ? p.y : p[1]);
             const rz = Number((p.z !== undefined ? p.z : p[2]) || 0);
@@ -599,6 +698,18 @@ class SpatialHandTracker {
 
             return { x: fx, y: fy, z: fz };
         });
+
+        if (track.prevLandmarks && dt > 4) {
+            const dtSec = Math.max(0.005, dt / 1000.0);
+            track.velocities = smoothed.map((p, i) => ({
+                vx: (p.x - track.prevLandmarks[i].x) / dtSec,
+                vy: (p.y - track.prevLandmarks[i].y) / dtSec,
+                vz: (p.z - track.prevLandmarks[i].z) / dtSec
+            }));
+        }
+        track.prevLandmarks = smoothed;
+        track.coastFrames = 0;
+        return smoothed;
     }
 
     filterHand(handKey, rawLandmarks, timestamp = performance.now()) {
@@ -608,10 +719,31 @@ class SpatialHandTracker {
 
     process(multiHandLandmarks, multiHandedness, timestamp = performance.now()) {
         if (!multiHandLandmarks || multiHandLandmarks.length === 0) {
+            const coastedResults = [];
             for (const t of this.tracks) {
-                if (timestamp - t.lastTime > 300) {
+                const elapsed = timestamp - t.lastTime;
+                // Temporal coasting for 1-2 dropped frames within 100ms
+                if (t.prevLandmarks && t.velocities && t.coastFrames < 2 && elapsed <= 100) {
+                    t.coastFrames++;
+                    const dtSec = Math.max(0.016, elapsed / 1000.0);
+                    const projected = t.prevLandmarks.map((p, i) => ({
+                        x: p.x + (t.velocities[i].vx || 0) * dtSec * 0.7,
+                        y: p.y + (t.velocities[i].vy || 0) * dtSec * 0.7,
+                        z: p.z + (t.velocities[i].vz || 0) * dtSec * 0.7
+                    }));
+                    t.prevLandmarks = projected;
+                    coastedResults.push({
+                        trackId: t.id,
+                        label: t.lastLabel || "Right",
+                        landmarks: projected,
+                        isCoasted: true
+                    });
+                } else if (elapsed > 100) {
                     this.resetTrack(t);
                 }
+            }
+            if (coastedResults.length > 0) {
+                return coastedResults;
             }
             return [];
         }
@@ -651,6 +783,7 @@ class SpatialHandTracker {
             chosenTrack.lastTime = timestamp;
 
             const handLabel = getActualPhysicalHand(hand.handedness);
+            chosenTrack.lastLabel = handLabel;
             results.push({
                 trackId: chosenTrack.id,
                 label: handLabel,
@@ -710,6 +843,9 @@ class SpatialHandTracker {
                 label1 = (label0 === "Right") ? "Left" : "Right";
             }
 
+            this.tracks[0].lastLabel = label0;
+            this.tracks[1].lastLabel = label1;
+
             results.push({ trackId: this.tracks[0].id, label: label0, landmarks: smoothed0 });
             results.push({ trackId: this.tracks[1].id, label: label1, landmarks: smoothed1 });
         }
@@ -717,6 +853,124 @@ class SpatialHandTracker {
         return results;
     }
 }
+
+/**
+ * Trajectory-Based State Machine for Dynamic "J"
+ * Tracks pinky tip (ID 20) over a sliding buffer (15-25 frames).
+ * 1. Trigger Phase: starting pose is "I" and downward vertical velocity vy > 0.
+ * 2. Active Motion Tracking: suppresses static single-frame predictions ("Y", "O", "You", "I") from updating UI.
+ * 3. Path Verification: downward descent (dy >= 0.045) + upward recovery hook (dy >= 0.02) within 350ms-1000ms.
+ * 4. Commit: commits "J" with high confidence (1.0).
+ */
+class JTrajectoryTracker {
+    constructor() {
+        this.buffer = [];
+        this.state = "IDLE"; // "IDLE" | "SWOOPING"
+        this.startTime = 0;
+        this.lastTriggerTime = 0;
+        this.isMoving = false;
+    }
+
+    isStartingIPose(landmarks) {
+        if (!landmarks || landmarks.length < 21) return false;
+        const p20 = landmarks[20];
+        const p18 = landmarks[18];
+        const p17 = landmarks[17];
+        const w0 = landmarks[0];
+        const m9 = landmarks[9];
+        const scale = Math.hypot(w0.x - m9.x, w0.y - m9.y) + 1e-6;
+
+        const pinkyUp = (p20.y < p18.y) && (p20.y < p17.y - 0.03 * scale);
+        const fingersCurled = (landmarks[8].y > landmarks[6].y - 0.03) &&
+                              (landmarks[12].y > landmarks[10].y - 0.03) &&
+                              (landmarks[16].y > landmarks[14].y - 0.03);
+
+        const d45 = Math.hypot(landmarks[4].x - landmarks[5].x, landmarks[4].y - landmarks[5].y);
+        const flareRatio = d45 / scale;
+
+        return pinkyUp && (flareRatio < 0.38 || fingersCurled);
+    }
+
+    update(landmarks, timestamp = performance.now()) {
+        if (!landmarks || landmarks.length < 21) {
+            if (this.state === "SWOOPING" && timestamp - this.startTime > 1000) {
+                this.reset();
+            }
+            return { state: this.state, committed: false, suppressStatic: (this.state === "SWOOPING") };
+        }
+
+        const p20 = landmarks[20];
+        const isI = this.isStartingIPose(landmarks);
+
+        this.buffer.push({
+            x: p20.x,
+            y: p20.y,
+            z: p20.z || 0,
+            t: timestamp,
+            isI: isI
+        });
+
+        if (this.buffer.length > 25) {
+            this.buffer.shift();
+        }
+
+        if (this.buffer.length < 5) {
+            return { state: this.state, committed: false, suppressStatic: (this.state === "SWOOPING") };
+        }
+
+        const now = timestamp;
+        const cur = this.buffer[this.buffer.length - 1];
+        const prev5 = this.buffer[Math.max(0, this.buffer.length - 5)];
+        const dtSec = Math.max(0.01, (cur.t - prev5.t) / 1000.0);
+        const vy = (cur.y - prev5.y) / dtSec;
+
+        const recentI = this.buffer.slice(-6).some(b => b.isI);
+        if (this.state === "IDLE") {
+            if (recentI && vy > 0.12 && (now - this.lastTriggerTime > 1200)) {
+                this.state = "SWOOPING";
+                this.startTime = now;
+                this.isMoving = true;
+            }
+        }
+
+        if (this.state === "SWOOPING") {
+            const duration = now - this.startTime;
+            if (duration > 1100) {
+                this.reset();
+                return { state: "IDLE", committed: false, suppressStatic: false };
+            }
+
+            const motionFrames = this.buffer.filter(b => b.t >= this.startTime - 120);
+            if (motionFrames.length >= 7 && duration >= 300) {
+                const minY = Math.min(...motionFrames.map(b => b.y));
+                const maxY = Math.max(...motionFrames.map(b => b.y));
+                const lastY = motionFrames[motionFrames.length - 1].y;
+
+                const downwardTravel = maxY - minY;
+                const upwardRecovery = maxY - lastY;
+
+                if (downwardTravel >= 0.045 && upwardRecovery >= 0.02) {
+                    this.lastTriggerTime = now;
+                    this.reset();
+                    return { state: "COMMITTED", committed: true, suppressStatic: true, gesture: "J", confidence: 1.0 };
+                }
+            }
+
+            return { state: "SWOOPING", committed: false, suppressStatic: true };
+        }
+
+        return { state: "IDLE", committed: false, suppressStatic: false };
+    }
+
+    reset() {
+        this.state = "IDLE";
+        this.startTime = 0;
+        this.isMoving = false;
+        this.buffer = [];
+    }
+}
+
+const jTrajectoryTracker = new JTrajectoryTracker();
 
 const landmarkStabilizer = new SpatialHandTracker(1.2, 1.2, 1.0);
 let currentStabilizedHands = [];
@@ -801,6 +1055,8 @@ let mpHands = null;
 let mpCamera = null;
 let lastPredictTime = 0;
 const PREDICT_INTERVAL_MS = 70; // 12-15 Hz (every ~70 ms)
+let currentMinDetectionConfidence = 0.55;
+let droppedHandFramesCount = 0;
 
 function initClientMediaPipe() {
     if (mpHands) return mpHands;
@@ -814,14 +1070,13 @@ function initClientMediaPipe() {
             locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
         });
 
-        // Configure client-side Hands detector:
-        // Match collect_data.py confidence parameters (0.5 detection / 0.5 tracking)
-        // for continuous, uninterrupted tracking without frame-to-frame dropouts
+        // Decoupled Dual-Threshold Confidence:
+        // Detection 0.55 / Tracking 0.65 for adverse angle & low-light stability
         mpHands.setOptions({
             maxNumHands: 2,
             modelComplexity: 1,
-            minDetectionConfidence: 0.6,
-            minTrackingConfidence: 0.6
+            minDetectionConfidence: 0.55,
+            minTrackingConfidence: 0.65
         });
 
         const outputCanvas = dom.outputCanvas || dom.landmarkCanvas;
@@ -829,6 +1084,22 @@ function initClientMediaPipe() {
 
         mpHands.onResults((results) => {
             if (!outputCanvas || !canvasCtx) return;
+
+            // Tracking Fallback: if drops for > 4 frames, drop detection confidence to 0.45 for rapid re-acquisition
+            const hasRawHands = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+            if (!hasRawHands) {
+                droppedHandFramesCount++;
+                if (droppedHandFramesCount > 4 && currentMinDetectionConfidence !== 0.45) {
+                    currentMinDetectionConfidence = 0.45;
+                    mpHands.setOptions({ minDetectionConfidence: 0.45, minTrackingConfidence: 0.65 });
+                }
+            } else {
+                droppedHandFramesCount = 0;
+                if (currentMinDetectionConfidence !== 0.55) {
+                    currentMinDetectionConfidence = 0.55;
+                    mpHands.setOptions({ minDetectionConfidence: 0.55, minTrackingConfidence: 0.65 });
+                }
+            }
 
             // 1. Single-person hand isolation before skeleton rendering and inference
             const isolation = isolatePrimaryUserHands(results.multiHandLandmarks, results.multiHandedness);
@@ -863,8 +1134,40 @@ function initClientMediaPipe() {
                 currentStabilizedHands = stabilizedList;
             }
 
-            // 3. Throttled backend inference (~14 Hz, non-blocking lock)
+            // Trajectory-Based State Machine for Dynamic "J"
             const now = performance.now();
+            if (currentStabilizedHands.length === 1 && isolation.hands.length === 1 && isolation.hands[0].physicalHand === "Right") {
+                const jResult = jTrajectoryTracker.update(currentStabilizedHands[0].landmarks, now);
+                if (jResult.committed) {
+                    activeSign = "J";
+                    lastConfirmedGesture = "J";
+                    lockUntil = Date.now() + HYSTERESIS_LOCK_MS;
+                    updatePipelineStatusUI("Stable");
+                    if (isGestureRecordingActive) {
+                        appendSignToClientSentence("J");
+                    }
+                    addRecentSign("J");
+                    showToast("Dynamic Sign: J", "success");
+                    applyTelemetry({
+                        ok: true,
+                        prediction: "J",
+                        live_gesture: "J",
+                        live_conf: 1.0,
+                        confidence: 1.0,
+                        detected_hand: "right",
+                        status: "running"
+                    });
+                    return;
+                }
+                if (jResult.suppressStatic) {
+                    updatePipelineStatusUI("DYNAMIC: J (IN MOTION)");
+                    return; // Suppress static single-frame inference updates during J swoop
+                }
+            } else if (currentStabilizedHands.length === 0) {
+                jTrajectoryTracker.reset();
+            }
+
+            // 3. Throttled backend inference (~14 Hz, non-blocking lock)
             if (now - lastPredictTime >= PREDICT_INTERVAL_MS) {
                 if (isRequestPending || isPredicting) return;
                 lastPredictTime = now;
@@ -1094,14 +1397,14 @@ async function sendInferenceRequest(payload, seqId) {
 
     let response = null;
     try {
-        response = await fetch(`${API_BASE_URL}/predict_landmarks`, {
+        response = await fetch(`${currentInferenceUrl}/predict_landmarks`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
             signal: controller.signal
         });
         if (!response.ok && response.status === 404) {
-            response = await fetch(`${API_BASE_URL}/predict`, {
+            response = await fetch(`${currentInferenceUrl}/predict`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)
@@ -1139,12 +1442,14 @@ async function startClientWebcam(deviceId = null) {
 
         // Direct high-definition camera stream request
         // Preserves full native sensor resolution without lowering video dimensions
+        // Request continuous auto exposure for rapid lighting adaptation
         const highResConstraints = {
             video: deviceId ? { deviceId: { exact: deviceId } } : {
                 facingMode: "user",
                 width: { ideal: 1920, min: 1280 },
                 height: { ideal: 1080, min: 720 },
-                frameRate: { ideal: 60, min: 30 }
+                frameRate: { ideal: 60, min: 30 },
+                advanced: [{ exposureMode: "continuous" }]
             },
             audio: false
         };
@@ -1162,10 +1467,46 @@ async function startClientWebcam(deviceId = null) {
         videoElement.srcObject = webcamStream;
         await videoElement.play();
 
+        // Low-light luminance dynamic range preprocessor
+        let lumSamplingCanvas = null;
+        let lumSamplingCtx = null;
+        let lastLumCheckTime = 0;
+
+        function evaluateLowLightAndEnhance(videoEl) {
+            if (!videoEl || videoEl.videoWidth === 0) return;
+            const now = performance.now();
+            if (now - lastLumCheckTime < 250) return;
+            lastLumCheckTime = now;
+
+            if (!lumSamplingCanvas) {
+                lumSamplingCanvas = document.createElement("canvas");
+                lumSamplingCanvas.width = 40;
+                lumSamplingCanvas.height = 30;
+                lumSamplingCtx = lumSamplingCanvas.getContext("2d", { willReadFrequently: true });
+            }
+
+            try {
+                lumSamplingCtx.drawImage(videoEl, 0, 0, 40, 30);
+                const data = lumSamplingCtx.getImageData(0, 0, 40, 30).data;
+                let sumY = 0;
+                const total = 40 * 30;
+                for (let i = 0; i < data.length; i += 4) {
+                    sumY += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+                }
+                const avgLuminance = sumY / total;
+                if (avgLuminance < 45) {
+                    videoEl.style.filter = "brightness(1.25) contrast(1.15)";
+                } else {
+                    videoEl.style.filter = "none";
+                }
+            } catch (e) {}
+        }
+
         // Mutex guard prevents concurrent mpHands.send calls from corrupting MediaPipe WASM memory
         let isProcessingFrame = false;
         const frameLoop = async () => {
             if (!isWebcamActive) return;
+            evaluateLowLightAndEnhance(videoElement);
             if (mpHands && !isProcessingFrame && videoElement.readyState >= 2 && !videoElement.paused) {
                 isProcessingFrame = true;
                 try {
@@ -2235,6 +2576,49 @@ function filterDictionaryList(query) {
     });
 }
 
+const FINGER_PLACEMENT_BADGES = {
+    "A": "Thumb: Lateral Side (Upright)",
+    "B": "Fingers: 4 Flat Upright",
+    "C": "Hand: Curved 'C' Silhouette",
+    "D": "Index: Pointing Up, Loop Closed",
+    "E": "Fingertips: Curled into Palm Base",
+    "F": "Index + Thumb: Circle, 3 Up",
+    "G": "Index + Thumb: Pointing Sideways",
+    "H": "Index + Middle: Pointing Sideways",
+    "I": "Pinky: Upright, Fist Closed",
+    "J": "Pinky: Downward Swoop Hook",
+    "K": "Index: Up, Middle Forward",
+    "L": "Index + Thumb: 90° 'L' Shape",
+    "M": "Thumb: Under 3 Fingers",
+    "N": "Thumb: Under 2 Fingers",
+    "O": "All Tips: Closed Oval Loop",
+    "P": "K-Shape: Pointing Downward",
+    "Q": "G-Shape: Pointing Downward",
+    "R": "Index + Middle: Crossed",
+    "S": "Thumb: Across Front Knuckles",
+    "T": "Thumb: Tucked Between Index/Mid",
+    "U": "Index + Middle: Touching Up",
+    "V": "Index + Middle: 'V' Spread",
+    "W": "3 Fingers: 'W' Spread Up",
+    "X": "Index: Bent Hook",
+    "Y": "Thumb + Pinky: Spread Wide",
+    "Z": "Index: 'Z' Zigzag In Air",
+    "HELLO": "Flat Hand: Temple Wave",
+    "THANK YOU": "Flat Hand: Chin to Receiver",
+    "I LOVE YOU": "Thumb + Index + Pinky Up",
+    "LOVE": "Both Arms: Crossed Over Chest",
+    "FINE": "5-Hand: Thumbs on Chest",
+    "ME": "Index: Pointing to Chest",
+    "YOU": "Index: Pointing Forward",
+    "HOW ARE YOU": "Cupped Hands: Flip Palms Up",
+    "NICE TO MEET YOU": "Slide Palm + Meet Index",
+    "START": "Both Hands: Open Facing Cam",
+    "STOP": "Both Hands: Vertical Halt",
+    "SPACE": "Both Hands: Move Outward",
+    "BACKSPACE": "Both Hands: Flick Backward",
+    "NEUTRAL": "Both Hands: Relaxed at Rest"
+};
+
 function selectDictionarySign(signId) {
     let sign = dictionaryMap[signId];
     if (!sign) {
@@ -2279,6 +2663,12 @@ function selectDictionarySign(signId) {
         handBadge.textContent = isBoth ? '🙌 BOTH HANDS' : '✋ RIGHT HAND';
     }
 
+    const placementBadge = document.getElementById('dict-placement-badge');
+    if (placementBadge) {
+        const desc = FINGER_PLACEMENT_BADGES[sign.id.toUpperCase()] || "Finger alignment verified";
+        placementBadge.textContent = desc;
+    }
+
     const descEl = document.getElementById('dict-sign-desc');
     if (descEl) descEl.textContent = sign.description || "Canonical gesture posture.";
 
@@ -2314,8 +2704,8 @@ function startDictAnimationLoop() {
         if (!dictLastFrameTimestamp) dictLastFrameTimestamp = timestamp;
         const elapsed = timestamp - dictLastFrameTimestamp;
 
-        // Base frame interval: 100ms per keyframe (~10 fps) adjusted by speed
-        const frameInterval = 100 / dictAnimSpeed;
+        // 12-15 FPS smooth keyframe loop (~75ms per frame)
+        const frameInterval = 75 / dictAnimSpeed;
         if (dictAnimRunning && elapsed >= frameInterval) {
             dictLastFrameTimestamp = timestamp;
             if (currentDictSign && currentDictSign.keyframes && currentDictSign.keyframes.length > 0) {
@@ -2332,6 +2722,13 @@ function startDictAnimationLoop() {
     dictAnimReqId = requestAnimationFrame(loop);
 }
 
+/**
+ * Dual-View Skeleton Visualizer (#dictionary-canvas)
+ * Left Panel (Upper Body Context): Demonstrates head, shoulders, torso, and arm angle posture
+ * Right Panel (Zoomed Hand Detail): Enlarges 21-point hand skeleton with distinct joint colors:
+ *   Thumb: Orange (#FF9800), Index: Cyan (#00E5FF), Middle: Green (#00E676),
+ *   Ring: Yellow (#FFEA00), Pinky: Pink (#FF4081), Wrist: White (#FFFFFF).
+ */
 function renderDictionaryCanvas() {
     const canvas = document.getElementById('dictionary-canvas');
     if (!canvas) return;
@@ -2339,84 +2736,77 @@ function renderDictionaryCanvas() {
     const W = canvas.width;
     const H = canvas.height;
 
-    // 1. Dark Cybernetic Background
+    // 1. Dark Futuristic Cybernetic Background
     ctx.clearRect(0, 0, W, H);
     const bgGrad = ctx.createRadialGradient(W / 2, H / 2, 20, W / 2, H / 2, W * 0.7);
-    bgGrad.addColorStop(0, '#0f172a');
+    bgGrad.addColorStop(0, '#0d1527');
     bgGrad.addColorStop(1, '#050811');
     ctx.fillStyle = bgGrad;
     ctx.fillRect(0, 0, W, H);
 
-    // Subtle Grid Backdrop
+    // Subtle Sci-Fi Grid Backdrop
     ctx.strokeStyle = 'rgba(0, 240, 255, 0.05)';
     ctx.lineWidth = 1;
-    for (let x = 30; x < W; x += 35) {
+    for (let x = 20; x < W; x += 30) {
         ctx.beginPath();
         ctx.moveTo(x, 0);
         ctx.lineTo(x, H);
         ctx.stroke();
     }
-    for (let y = 30; y < H; y += 35) {
+    for (let y = 20; y < H; y += 30) {
         ctx.beginPath();
         ctx.moveTo(0, y);
         ctx.lineTo(W, y);
         ctx.stroke();
     }
 
-    // Determine current hand pose points
-    let rHandPoints = null;
-    let lHandPoints = null;
+    const splitX = Math.floor(W * 0.38);
 
-    if (currentDictSign) {
-        if (currentDictSign.category === 'dynamic' && currentDictSign.keyframes && currentDictSign.keyframes.length > 0) {
-            rHandPoints = currentDictSign.keyframes[dictCurrentKeyframeIndex] || currentDictSign.landmarks;
-        } else {
-            rHandPoints = currentDictSign.landmarks;
-        }
-        lHandPoints = currentDictSign.landmarks_secondary;
-    }
+    // ── LEFT PANEL: UPPER BODY POSTURE CONTEXT ─────────────────────────────
+    ctx.save();
+    // Panel Header Tag
+    ctx.font = '600 10px "JetBrains Mono", monospace';
+    ctx.fillStyle = 'rgba(0, 240, 255, 0.8)';
+    ctx.textAlign = 'center';
+    ctx.fillText('UPPER BODY CONTEXT', splitX / 2, 18);
 
-    // 2. Anatomical Stick Figure Skeleton
-    // Center alignment coordinates
-    const headX = W / 2;
-    const headY = 48;
-    const neckY = 72;
-    const chestY = 88;
-    const spineBottomY = 175;
+    const cx = splitX / 2;
+    const headY = 44;
+    const neckY = 64;
+    const shoulderY = 76;
+    const spineBottomY = 158;
 
-    const shoulderLX = headX - 52;
-    const shoulderRX = headX + 52;
-    const shoulderY = chestY;
+    const shoulderLX = cx - 36;
+    const shoulderRX = cx + 36;
 
     // Head Visor & Outline
-    ctx.save();
     ctx.strokeStyle = '#38bdf8';
-    ctx.lineWidth = 2.5;
-    ctx.fillStyle = 'rgba(14, 165, 233, 0.15)';
+    ctx.lineWidth = 2.2;
+    ctx.fillStyle = 'rgba(14, 165, 233, 0.18)';
     ctx.beginPath();
-    ctx.arc(headX, headY, 18, 0, Math.PI * 2);
+    ctx.arc(cx, headY, 15, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 
-    // Futuristic Sleek Visor
+    // Cyan Visor
     ctx.strokeStyle = '#00f0ff';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(headX - 10, headY - 1);
-    ctx.lineTo(headX + 10, headY - 1);
+    ctx.moveTo(cx - 8, headY);
+    ctx.lineTo(cx + 8, headY);
     ctx.stroke();
 
     // Neck
     ctx.strokeStyle = '#64748b';
-    ctx.lineWidth = 3;
+    ctx.lineWidth = 2.6;
     ctx.beginPath();
-    ctx.moveTo(headX, headY + 18);
-    ctx.lineTo(headX, neckY);
+    ctx.moveTo(cx, headY + 15);
+    ctx.lineTo(cx, neckY);
     ctx.stroke();
 
     // Shoulder Crossbar
     ctx.strokeStyle = '#94a3b8';
-    ctx.lineWidth = 3.5;
+    ctx.lineWidth = 3.2;
     ctx.beginPath();
     ctx.moveTo(shoulderLX, shoulderY);
     ctx.lineTo(shoulderRX, shoulderY);
@@ -2424,61 +2814,57 @@ function renderDictionaryCanvas() {
 
     // Spine & Torso
     ctx.strokeStyle = '#475569';
-    ctx.lineWidth = 3;
+    ctx.lineWidth = 2.8;
     ctx.beginPath();
-    ctx.moveTo(headX, neckY);
-    ctx.lineTo(headX, spineBottomY);
+    ctx.moveTo(cx, neckY);
+    ctx.lineTo(cx, spineBottomY);
     ctx.stroke();
 
-    // Hips / Waist Bar
+    // Hips Bar
     ctx.strokeStyle = '#64748b';
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 2.2;
     ctx.beginPath();
-    ctx.moveTo(headX - 30, spineBottomY);
-    ctx.lineTo(headX + 30, spineBottomY);
+    ctx.moveTo(cx - 22, spineBottomY);
+    ctx.lineTo(cx + 22, spineBottomY);
     ctx.stroke();
 
-    // 3. Dynamic Arm & Hand Placement
-    const isBoth = (currentDictSign && (currentDictSign.handedness === 'both' || (lHandPoints && lHandPoints.length > 0)));
+    const isBoth = (currentDictSign && (currentDictSign.handedness === 'both' || (currentDictSign.landmarks_secondary && currentDictSign.landmarks_secondary.length > 0)));
 
-    // Right Arm: Dominant Hand
-    let rElbowX = shoulderRX + 26;
-    let rElbowY = shoulderY + 48;
-    let rWristX = shoulderRX + 12;
-    let rWristY = shoulderY + 98;
+    // Right Arm: Dominant Signing Hand
+    let rElbowX = shoulderRX + 20;
+    let rElbowY = shoulderY + 38;
+    let rWristX = shoulderRX + 10;
+    let rWristY = shoulderY + 76;
 
-    // If dynamic, add subtle rhythmic motion offset to right arm
     if (currentDictSign && currentDictSign.category === 'dynamic') {
-        const dynOffset = Math.sin((dictCurrentKeyframeIndex / 12) * Math.PI * 2) * 8;
+        const dynOffset = Math.sin((dictCurrentKeyframeIndex / 12) * Math.PI * 2) * 6;
         rWristX += dynOffset;
     }
 
-    // Draw Right Arm Bones (Upper arm & Forearm)
-    ctx.strokeStyle = '#0284c7';
-    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#00E5FF';
+    ctx.lineWidth = 2.8;
     ctx.beginPath();
     ctx.moveTo(shoulderRX, shoulderY);
     ctx.lineTo(rElbowX, rElbowY);
     ctx.lineTo(rWristX, rWristY);
     ctx.stroke();
 
-    // Draw Right Arm Joints
     ctx.fillStyle = '#38bdf8';
     ctx.beginPath();
-    ctx.arc(shoulderRX, shoulderY, 4, 0, Math.PI * 2);
-    ctx.arc(rElbowX, rElbowY, 3.5, 0, Math.PI * 2);
-    ctx.arc(rWristX, rWristY, 4.5, 0, Math.PI * 2);
+    ctx.arc(shoulderRX, shoulderY, 3.5, 0, Math.PI * 2);
+    ctx.arc(rElbowX, rElbowY, 3, 0, Math.PI * 2);
+    ctx.arc(rWristX, rWristY, 4, 0, Math.PI * 2);
     ctx.fill();
 
     // Left Arm
     if (isBoth) {
-        let lElbowX = shoulderLX - 26;
-        let lElbowY = shoulderY + 48;
-        let lWristX = shoulderLX - 12;
-        let lWristY = shoulderY + 98;
+        let lElbowX = shoulderLX - 20;
+        let lElbowY = shoulderY + 38;
+        let lWristX = shoulderLX - 10;
+        let lWristY = shoulderY + 76;
 
         ctx.strokeStyle = '#c026d3';
-        ctx.lineWidth = 3;
+        ctx.lineWidth = 2.8;
         ctx.beginPath();
         ctx.moveTo(shoulderLX, shoulderY);
         ctx.lineTo(lElbowX, lElbowY);
@@ -2487,24 +2873,18 @@ function renderDictionaryCanvas() {
 
         ctx.fillStyle = '#e879f9';
         ctx.beginPath();
-        ctx.arc(shoulderLX, shoulderY, 4, 0, Math.PI * 2);
-        ctx.arc(lElbowX, lElbowY, 3.5, 0, Math.PI * 2);
-        ctx.arc(lWristX, lWristY, 4.5, 0, Math.PI * 2);
+        ctx.arc(shoulderLX, shoulderY, 3.5, 0, Math.PI * 2);
+        ctx.arc(lElbowX, lElbowY, 3, 0, Math.PI * 2);
+        ctx.arc(lWristX, lWristY, 4, 0, Math.PI * 2);
         ctx.fill();
-
-        // Draw Left Hand 21 Landmarks
-        if (lHandPoints && lHandPoints.length >= 21) {
-            drawHandSkeleton(ctx, lWristX, lWristY, lHandPoints, '#e879f9', '#a21caf', 56);
-        }
     } else {
-        // Resting Left Arm at side
-        const lElbowX = shoulderLX - 10;
-        const lElbowY = shoulderY + 46;
+        const lElbowX = shoulderLX - 8;
+        const lElbowY = shoulderY + 38;
         const lHandX = shoulderLX - 6;
-        const lHandY = shoulderY + 92;
+        const lHandY = shoulderY + 78;
 
         ctx.strokeStyle = '#334155';
-        ctx.lineWidth = 2.5;
+        ctx.lineWidth = 2.4;
         ctx.beginPath();
         ctx.moveTo(shoulderLX, shoulderY);
         ctx.lineTo(lElbowX, lElbowY);
@@ -2513,76 +2893,184 @@ function renderDictionaryCanvas() {
 
         ctx.fillStyle = '#475569';
         ctx.beginPath();
-        ctx.arc(lElbowX, lElbowY, 3, 0, Math.PI * 2);
-        ctx.arc(lHandX, lHandY, 3.5, 0, Math.PI * 2);
+        ctx.arc(lElbowX, lElbowY, 2.5, 0, Math.PI * 2);
+        ctx.arc(lHandX, lHandY, 3, 0, Math.PI * 2);
         ctx.fill();
     }
+    ctx.restore();
 
-    // Draw Right Hand 21 Landmarks
-    if (rHandPoints && rHandPoints.length >= 21) {
-        drawHandSkeleton(ctx, rWristX, rWristY, rHandPoints, '#00f0ff', '#10b981', 58);
+    // ── TWO-PANEL VERTICAL DIVIDER ─────────────────────────────────────────
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.25)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(splitX, 12);
+    ctx.lineTo(splitX, H - 12);
+    ctx.stroke();
+    ctx.restore();
+
+    // ── RIGHT PANEL: ZOOMED HAND SKELETON (21 JOINTS) ─────────────────────
+    ctx.save();
+    const rightCenterX = splitX + (W - splitX) / 2;
+    ctx.font = '600 10px "JetBrains Mono", monospace';
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.textAlign = 'center';
+    ctx.fillText('ZOOMED HAND SKELETON (21 JOINTS)', rightCenterX, 18);
+
+    // Extract current landmarks
+    let rHandPoints = null;
+    if (currentDictSign) {
+        if (currentDictSign.category === 'dynamic' && currentDictSign.keyframes && currentDictSign.keyframes.length > 0) {
+            rHandPoints = currentDictSign.keyframes[dictCurrentKeyframeIndex] || currentDictSign.landmarks;
+        } else {
+            rHandPoints = currentDictSign.landmarks;
+        }
     }
 
-    // Motion indicator for dynamic signs
-    if (currentDictSign && currentDictSign.category === 'dynamic') {
-        ctx.fillStyle = 'rgba(0, 240, 255, 0.85)';
-        ctx.font = '10px Inter, sans-serif';
+    if (rHandPoints && rHandPoints.length >= 21) {
+        renderEnlargedHandSkeleton(ctx, splitX + 15, 30, W - 20, H - 35, rHandPoints);
+    } else {
+        ctx.font = '12px "Plus Jakarta Sans", sans-serif';
+        ctx.fillStyle = '#64748b';
         ctx.textAlign = 'center';
+        ctx.fillText('No hand landmark data available', rightCenterX, H / 2);
+    }
+
+    // Dynamic Keyframe Telemetry Bar
+    if (currentDictSign && currentDictSign.category === 'dynamic') {
         const totalKf = (currentDictSign.keyframes && currentDictSign.keyframes.length) || 12;
-        ctx.fillText(`KEYFRAME ${dictCurrentKeyframeIndex + 1} / ${totalKf}`, W / 2, H - 12);
+        ctx.font = '500 10px "JetBrains Mono", monospace';
+        ctx.fillStyle = '#00E5FF';
+        ctx.textAlign = 'center';
+        ctx.fillText(`KEYFRAME ${dictCurrentKeyframeIndex + 1} / ${totalKf}`, rightCenterX, H - 12);
+    } else {
+        // Finger Color Legend beneath the hand
+        ctx.font = '500 9px "JetBrains Mono", monospace';
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+        ctx.textAlign = 'center';
+        ctx.fillText('Thumb: 🟠  Index: 🔷  Mid: 🟢  Ring: 🟡  Pinky: 🌸', rightCenterX, H - 12);
     }
     ctx.restore();
 }
 
-function drawHandSkeleton(ctx, wristX, wristY, landmarks, boneColor, tipColor, scale) {
+/**
+ * Enlarges the 21-point hand skeleton inside the specified bounding box
+ * with distinct joint colors:
+ * Thumb: Orange (#FF9800), Index: Cyan (#00E5FF), Middle: Green (#00E676),
+ * Ring: Yellow (#FFEA00), Pinky: Pink (#FF4081), Wrist: White (#FFFFFF).
+ */
+function renderEnlargedHandSkeleton(ctx, boxLeft, boxTop, boxRight, boxBottom, landmarks) {
     if (!landmarks || landmarks.length < 21) return;
 
+    // Joint color mapping
+    const JOINT_COLORS = {
+        0: '#FFFFFF', // Wrist: White
+        1: '#FF9800', 2: '#FF9800', 3: '#FF9800', 4: '#FF9800', // Thumb: Orange
+        5: '#00E5FF', 6: '#00E5FF', 7: '#00E5FF', 8: '#00E5FF', // Index: Cyan
+        9: '#00E676', 10: '#00E676', 11: '#00E676', 12: '#00E676', // Middle: Green
+        13: '#FFEA00', 14: '#FFEA00', 15: '#FFEA00', 16: '#FFEA00', // Ring: Yellow
+        17: '#FF4081', 18: '#FF4081', 19: '#FF4081', 20: '#FF4081'  // Pinky: Pink
+    };
+
+    // Calculate bounding box of hand landmarks
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+
+    for (let i = 0; i < 21; i++) {
+        const p = landmarks[i];
+        const px = Number(p.x !== undefined ? p.x : p[0]);
+        const py = Number(p.y !== undefined ? p.y : p[1]);
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+    }
+
+    const spanX = Math.max(0.01, maxX - minX);
+    const spanY = Math.max(0.01, maxY - minY);
+
+    const availW = (boxRight - boxLeft);
+    const availH = (boxBottom - boxTop);
+
+    // Maintain aspect ratio while zooming to fill panel
+    const scale = Math.min(availW / spanX, availH / spanY) * 0.82;
+    const centerNormX = (minX + maxX) / 2;
+    const centerNormY = (minY + maxY) / 2;
+
+    const targetCenterX = boxLeft + availW / 2;
+    const targetCenterY = boxTop + availH / 2;
+
+    const screenPoints = landmarks.map(p => {
+        const px = Number(p.x !== undefined ? p.x : p[0]);
+        const py = Number(p.y !== undefined ? p.y : p[1]);
+        return {
+            x: targetCenterX + (px - centerNormX) * scale,
+            y: targetCenterY + (py - centerNormY) * scale
+        };
+    });
+
     // 1. Draw Bones
-    ctx.strokeStyle = boneColor;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 2.4;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
     for (const [i, j] of HAND_CONNECTIONS) {
-        const p0 = landmarks[i];
-        const p1 = landmarks[j];
+        const p0 = screenPoints[i];
+        const p1 = screenPoints[j];
         if (!p0 || !p1) continue;
 
-        const x0 = wristX + p0.x * scale;
-        const y0 = wristY + p0.y * scale;
-        const x1 = wristX + p1.x * scale;
-        const y1 = wristY + p1.y * scale;
+        // Bone color matching finger
+        let boneColor = 'rgba(255, 255, 255, 0.45)';
+        if (i >= 1 && j <= 4) boneColor = 'rgba(255, 152, 0, 0.75)';
+        else if (i >= 5 && j <= 8) boneColor = 'rgba(0, 229, 255, 0.75)';
+        else if (i >= 9 && j <= 12) boneColor = 'rgba(0, 230, 118, 0.75)';
+        else if (i >= 13 && j <= 16) boneColor = 'rgba(255, 234, 0, 0.75)';
+        else if (i >= 17 && j <= 20) boneColor = 'rgba(255, 64, 129, 0.75)';
 
+        ctx.strokeStyle = boneColor;
         ctx.beginPath();
-        ctx.moveTo(x0, y0);
-        ctx.lineTo(x1, y1);
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
         ctx.stroke();
     }
 
-    // 2. Draw Joints and Fingertips
+    // 2. Draw 21 Joints with Distinct Specific Colors
     const fingertips = new Set([4, 8, 12, 16, 20]);
     for (let k = 0; k < 21; k++) {
-        const p = landmarks[k];
-        if (!p) continue;
+        const sp = screenPoints[k];
+        if (!sp) continue;
 
-        const px = wristX + p.x * scale;
-        const py = wristY + p.y * scale;
+        const color = JOINT_COLORS[k] || '#FFFFFF';
 
-        ctx.beginPath();
         if (fingertips.has(k)) {
-            // Highlighted Fingertip Node
-            ctx.fillStyle = tipColor;
-            ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+            // Enlarged Fingertip Node with Outer Halo Glow
+            ctx.beginPath();
+            ctx.arc(sp.x, sp.y, 6.2, 0, Math.PI * 2);
+            ctx.fillStyle = color;
             ctx.fill();
 
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 1;
+            ctx.lineWidth = 1.8;
+            ctx.strokeStyle = '#FFFFFF';
+            ctx.stroke();
+        } else if (k === 0) {
+            // Wrist Node: Pure White with Glowing Core
+            ctx.beginPath();
+            ctx.arc(sp.x, sp.y, 4.8, 0, Math.PI * 2);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fill();
+            ctx.lineWidth = 1.2;
+            ctx.strokeStyle = 'rgba(0, 229, 255, 0.8)';
             ctx.stroke();
         } else {
             // Knuckle / Joint Node
-            ctx.fillStyle = boneColor;
-            ctx.arc(px, py, 2.2, 0, Math.PI * 2);
+            ctx.beginPath();
+            ctx.arc(sp.x, sp.y, 3.4, 0, Math.PI * 2);
+            ctx.fillStyle = color;
             ctx.fill();
+            ctx.lineWidth = 1.0;
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+            ctx.stroke();
         }
     }
 }
@@ -3185,4 +3673,5 @@ window.addEventListener("keydown", (e) => {
 // ── Initialize Client Webcam & Isolated UI ──────────────────────────────────
 updateSentenceDOM();
 updateVoiceDOM();
+initServerNegotiator();
 startClientWebcam();

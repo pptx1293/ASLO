@@ -73,10 +73,104 @@ let mobileDisplayHistory = [];
 let mobileSmoothedDisplaySign = "—";
 let mobileSmoothedConf = 0;
 
-// ── Dual-Host API Resolver ──────────────────────────────────────────────────
+// ── Dual-Host API Resolver & Engine Auto-Negotiation ────────────────────────
 const API_BASE_URL = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
     ? '' 
     : window.location.origin;
+
+let currentInferenceUrl = API_BASE_URL;
+let serverMode = localStorage.getItem("aslo_server_mode") || "auto";
+let isLocalAlive = false;
+
+async function checkLocalServerAlive() {
+    try {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 600);
+        const res = await fetch("http://127.0.0.1:5000/ping", {
+            method: "GET",
+            mode: "cors",
+            signal: controller.signal
+        });
+        clearTimeout(tid);
+        if (res.ok) {
+            const data = await res.json();
+            return Boolean(data && data.status === "online");
+        }
+    } catch (_) {}
+    return false;
+}
+
+async function updateMobileServerNegotiation() {
+    isLocalAlive = await checkLocalServerAlive();
+    const select = document.getElementById("server-mode-select");
+    const pill = document.getElementById("server-status-pill");
+    const downloadLink = document.getElementById("local-engine-download-link");
+
+    if (select && select.value !== serverMode) {
+        select.value = serverMode;
+    }
+
+    if (serverMode === "local") {
+        if (isLocalAlive) {
+            currentInferenceUrl = "http://127.0.0.1:5000";
+            if (pill) {
+                pill.textContent = "Local (0ms)";
+                pill.style.background = "#10b981";
+                pill.style.color = "#fff";
+            }
+            if (downloadLink) downloadLink.style.display = "none";
+        } else {
+            currentInferenceUrl = API_BASE_URL;
+            if (pill) {
+                pill.textContent = "Offline (Cloud)";
+                pill.style.background = "#ef4444";
+                pill.style.color = "#fff";
+            }
+            if (downloadLink) downloadLink.style.display = "inline";
+        }
+    } else if (serverMode === "cloud") {
+        currentInferenceUrl = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? '' : window.location.origin;
+        if (pill) {
+            pill.textContent = "Cloud";
+            pill.style.background = "#0284c7";
+            pill.style.color = "#fff";
+        }
+        if (downloadLink) downloadLink.style.display = "none";
+    } else {
+        // "auto" mode
+        if (isLocalAlive) {
+            currentInferenceUrl = "http://127.0.0.1:5000";
+            if (pill) {
+                pill.textContent = "Auto: Local (0ms)";
+                pill.style.background = "#10b981";
+                pill.style.color = "#fff";
+            }
+            if (downloadLink) downloadLink.style.display = "none";
+        } else {
+            currentInferenceUrl = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? '' : window.location.origin;
+            if (pill) {
+                pill.textContent = "Auto: Cloud";
+                pill.style.background = "#6366f1";
+                pill.style.color = "#fff";
+            }
+            if (downloadLink) downloadLink.style.display = "none";
+        }
+    }
+}
+
+function initMobileServerNegotiator() {
+    const select = document.getElementById("server-mode-select");
+    if (select) {
+        select.value = serverMode;
+        select.addEventListener("change", (e) => {
+            serverMode = e.target.value;
+            localStorage.setItem("aslo_server_mode", serverMode);
+            updateMobileServerNegotiation();
+        });
+    }
+    updateMobileServerNegotiation();
+    setInterval(updateMobileServerNegotiation, 10000);
+}
 
 // ── State Hysteresis & Latching Constants & State ──────────────────────────
 let activeSign = null;
@@ -386,8 +480,8 @@ function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
         if (c.scale > maxScale) maxScale = c.scale;
     }
 
-    // Discard all hands whose scale is < 70% of the largest hand
-    const valid = candidates.filter(c => c.scale >= 0.70 * maxScale);
+    // Discard all hands whose scale is < 65% of the largest hand
+    const valid = candidates.filter(c => c.scale >= 0.65 * maxScale);
     if (valid.length === 0) {
         return { hands: [], status: "aligning" };
     }
@@ -556,6 +650,10 @@ class MobileSpatialHandTracker {
     resetTrack(t) {
         t.prevWrist = null;
         t.lastTime = 0;
+        t.prevLandmarks = null;
+        t.velocities = null;
+        t.coastFrames = 0;
+        t.lastLabel = null;
         for (let i = 0; i < 21; i++) {
             t.filters[i].x.reset();
             t.filters[i].y.reset();
@@ -577,7 +675,8 @@ class MobileSpatialHandTracker {
     }
 
     filterLandmarks(track, rawLandmarks, timestamp) {
-        return rawLandmarks.map((p, i) => {
+        const dt = track.lastTime > 0 ? (timestamp - track.lastTime) : 16;
+        const smoothed = rawLandmarks.map((p, i) => {
             const rx = Number(p.x !== undefined ? p.x : p[0]);
             const ry = Number(p.y !== undefined ? p.y : p[1]);
             const rz = Number((p.z !== undefined ? p.z : p[2]) || 0);
@@ -588,6 +687,18 @@ class MobileSpatialHandTracker {
 
             return { x: fx, y: fy, z: fz };
         });
+
+        if (track.prevLandmarks && dt > 4) {
+            const dtSec = Math.max(0.005, dt / 1000.0);
+            track.velocities = smoothed.map((p, i) => ({
+                vx: (p.x - track.prevLandmarks[i].x) / dtSec,
+                vy: (p.y - track.prevLandmarks[i].y) / dtSec,
+                vz: (p.z - track.prevLandmarks[i].z) / dtSec
+            }));
+        }
+        track.prevLandmarks = smoothed;
+        track.coastFrames = 0;
+        return smoothed;
     }
 
     filterHand(handKey, rawLandmarks, timestamp = performance.now()) {
@@ -597,10 +708,30 @@ class MobileSpatialHandTracker {
 
     process(multiHandLandmarks, multiHandedness, timestamp = performance.now()) {
         if (!multiHandLandmarks || multiHandLandmarks.length === 0) {
+            const coastedResults = [];
             for (const t of this.tracks) {
-                if (timestamp - t.lastTime > 300) {
+                const elapsed = timestamp - t.lastTime;
+                if (t.prevLandmarks && t.velocities && t.coastFrames < 2 && elapsed <= 100) {
+                    t.coastFrames++;
+                    const dtSec = Math.max(0.016, elapsed / 1000.0);
+                    const projected = t.prevLandmarks.map((p, i) => ({
+                        x: p.x + (t.velocities[i].vx || 0) * dtSec * 0.7,
+                        y: p.y + (t.velocities[i].vy || 0) * dtSec * 0.7,
+                        z: p.z + (t.velocities[i].vz || 0) * dtSec * 0.7
+                    }));
+                    t.prevLandmarks = projected;
+                    coastedResults.push({
+                        trackId: t.id,
+                        label: t.lastLabel || "Right",
+                        landmarks: projected,
+                        isCoasted: true
+                    });
+                } else if (elapsed > 100) {
                     this.resetTrack(t);
                 }
+            }
+            if (coastedResults.length > 0) {
+                return coastedResults;
             }
             return [];
         }
@@ -640,6 +771,7 @@ class MobileSpatialHandTracker {
             chosenTrack.lastTime = timestamp;
 
             const handLabel = getActualPhysicalHand(hand.handedness);
+            chosenTrack.lastLabel = handLabel;
             results.push({
                 trackId: chosenTrack.id,
                 label: handLabel,
@@ -695,6 +827,9 @@ class MobileSpatialHandTracker {
                 label1 = (label0 === "Right") ? "Left" : "Right";
             }
 
+            this.tracks[0].lastLabel = label0;
+            this.tracks[1].lastLabel = label1;
+
             results.push({ trackId: this.tracks[0].id, label: label0, landmarks: smoothed0 });
             results.push({ trackId: this.tracks[1].id, label: label1, landmarks: smoothed1 });
         }
@@ -702,6 +837,119 @@ class MobileSpatialHandTracker {
         return results;
     }
 }
+
+/**
+ * Mobile Trajectory-Based State Machine for Dynamic "J"
+ */
+class MobileJTrajectoryTracker {
+    constructor() {
+        this.buffer = [];
+        this.state = "IDLE";
+        this.startTime = 0;
+        this.lastTriggerTime = 0;
+        this.isMoving = false;
+    }
+
+    isStartingIPose(landmarks) {
+        if (!landmarks || landmarks.length < 21) return false;
+        const p20 = landmarks[20];
+        const p18 = landmarks[18];
+        const p17 = landmarks[17];
+        const w0 = landmarks[0];
+        const m9 = landmarks[9];
+        const scale = Math.hypot(w0.x - m9.x, w0.y - m9.y) + 1e-6;
+
+        const pinkyUp = (p20.y < p18.y) && (p20.y < p17.y - 0.03 * scale);
+        const fingersCurled = (landmarks[8].y > landmarks[6].y - 0.03) &&
+                              (landmarks[12].y > landmarks[10].y - 0.03) &&
+                              (landmarks[16].y > landmarks[14].y - 0.03);
+
+        const d45 = Math.hypot(landmarks[4].x - landmarks[5].x, landmarks[4].y - landmarks[5].y);
+        const flareRatio = d45 / scale;
+
+        return pinkyUp && (flareRatio < 0.38 || fingersCurled);
+    }
+
+    update(landmarks, timestamp = performance.now()) {
+        if (!landmarks || landmarks.length < 21) {
+            if (this.state === "SWOOPING" && timestamp - this.startTime > 1000) {
+                this.reset();
+            }
+            return { state: this.state, committed: false, suppressStatic: (this.state === "SWOOPING") };
+        }
+
+        const p20 = landmarks[20];
+        const isI = this.isStartingIPose(landmarks);
+
+        this.buffer.push({
+            x: p20.x,
+            y: p20.y,
+            z: p20.z || 0,
+            t: timestamp,
+            isI: isI
+        });
+
+        if (this.buffer.length > 25) {
+            this.buffer.shift();
+        }
+
+        if (this.buffer.length < 5) {
+            return { state: this.state, committed: false, suppressStatic: (this.state === "SWOOPING") };
+        }
+
+        const now = timestamp;
+        const cur = this.buffer[this.buffer.length - 1];
+        const prev5 = this.buffer[Math.max(0, this.buffer.length - 5)];
+        const dtSec = Math.max(0.01, (cur.t - prev5.t) / 1000.0);
+        const vy = (cur.y - prev5.y) / dtSec;
+
+        const recentI = this.buffer.slice(-6).some(b => b.isI);
+        if (this.state === "IDLE") {
+            if (recentI && vy > 0.12 && (now - this.lastTriggerTime > 1200)) {
+                this.state = "SWOOPING";
+                this.startTime = now;
+                this.isMoving = true;
+            }
+        }
+
+        if (this.state === "SWOOPING") {
+            const duration = now - this.startTime;
+            if (duration > 1100) {
+                this.reset();
+                return { state: "IDLE", committed: false, suppressStatic: false };
+            }
+
+            const motionFrames = this.buffer.filter(b => b.t >= this.startTime - 120);
+            if (motionFrames.length >= 7 && duration >= 300) {
+                const minY = Math.min(...motionFrames.map(b => b.y));
+                const maxY = Math.max(...motionFrames.map(b => b.y));
+                const lastY = motionFrames[motionFrames.length - 1].y;
+
+                const downwardTravel = maxY - minY;
+                const upwardRecovery = maxY - lastY;
+
+                if (downwardTravel >= 0.045 && upwardRecovery >= 0.02) {
+                    this.lastTriggerTime = now;
+                    this.reset();
+                    return { state: "COMMITTED", committed: true, suppressStatic: true, gesture: "J", confidence: 1.0 };
+                }
+            }
+
+            return { state: "SWOOPING", committed: false, suppressStatic: true };
+        }
+
+        return { state: "IDLE", committed: false, suppressStatic: false };
+    }
+
+    reset() {
+        this.state = "IDLE";
+        this.startTime = 0;
+        this.isMoving = false;
+        this.buffer = [];
+    }
+}
+
+const mobileJTrajectoryTracker = new MobileJTrajectoryTracker();
 
 const mobileStabilizer = new MobileSpatialHandTracker(1.0, 0.05, 1.0);
 let currentMobileStabilizedHands = [];
@@ -725,6 +973,8 @@ let mobileHands = null;
 let mobileCamera = null;
 let lastMobilePredictTime = 0;
 const MOBILE_PREDICT_INTERVAL = 70; // 12-15 Hz (every ~70 ms)
+let currentMobileMinDetectionConfidence = 0.55;
+let mobileDroppedFramesCount = 0;
 
 function initMobileMediaPipe() {
     if (mobileHands) return mobileHands;
@@ -735,11 +985,12 @@ function initMobileMediaPipe() {
             locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
         });
 
+        // Decoupled Dual-Threshold Confidence
         mobileHands.setOptions({
             maxNumHands: 2,
             modelComplexity: 1,
-            minDetectionConfidence: 0.6,
-            minTrackingConfidence: 0.6
+            minDetectionConfidence: 0.55,
+            minTrackingConfidence: 0.65
         });
 
         mobileHands.onResults((results) => {
@@ -747,6 +998,22 @@ function initMobileMediaPipe() {
             if (!canvas) return;
             const ctx = canvas.getContext("2d");
             if (!ctx) return;
+
+            // Tracking fallback: if tracking drops > 4 frames, drop detection confidence to 0.45
+            const hasRawHands = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+            if (!hasRawHands) {
+                mobileDroppedFramesCount++;
+                if (mobileDroppedFramesCount > 4 && currentMobileMinDetectionConfidence !== 0.45) {
+                    currentMobileMinDetectionConfidence = 0.45;
+                    mobileHands.setOptions({ minDetectionConfidence: 0.45, minTrackingConfidence: 0.65 });
+                }
+            } else {
+                mobileDroppedFramesCount = 0;
+                if (currentMobileMinDetectionConfidence !== 0.55) {
+                    currentMobileMinDetectionConfidence = 0.55;
+                    mobileHands.setOptions({ minDetectionConfidence: 0.55, minTrackingConfidence: 0.65 });
+                }
+            }
 
             const rect = canvas.getBoundingClientRect();
             if (canvas.width !== rect.width || canvas.height !== rect.height) {
@@ -796,14 +1063,14 @@ function initMobileMediaPipe() {
 
                 if (typeof drawLandmarks === "function") {
                     drawLandmarks(ctx, smoothed, {
-                        color: "#FF0000",
-                        fillColor: "#FF0000",
+                        color: "#00E5FF",
+                        fillColor: "#00E5FF",
                         lineWidth: 1.0,
                         radius: 3.5
                     });
                 } else {
                     ctx.save();
-                    ctx.fillStyle = "#FF0000";
+                    ctx.fillStyle = "#00E5FF";
                     for (const pt of smoothed) {
                         if (pt) {
                             ctx.beginPath();
@@ -816,6 +1083,36 @@ function initMobileMediaPipe() {
             }
 
             currentMobileStabilizedHands = stabilizedList;
+
+            // Trajectory-Based State Machine for Dynamic "J" on Mobile
+            if (currentMobileStabilizedHands.length === 1 && isolation.hands.length === 1 && isolation.hands[0].physicalHand === "Right") {
+                const jResult = mobileJTrajectoryTracker.update(currentMobileStabilizedHands[0].landmarks, now);
+                if (jResult.committed) {
+                    activeSign = "J";
+                    lastConfirmedGesture = "J";
+                    lockUntil = Date.now() + HYSTERESIS_LOCK_MS;
+                    if (isRecording) {
+                        appendMobileSignToSentence("J");
+                    }
+                    showToast("Dynamic Sign: J");
+                    applyMobileTelemetry({
+                        ok: true,
+                        prediction: "J",
+                        live_gesture: "J",
+                        live_conf: 1.0,
+                        confidence: 1.0,
+                        detected_hand: "right",
+                        status: "running"
+                    });
+                    return;
+                }
+                if (jResult.suppressStatic) {
+                    updateMobilePipelineStatusUI("DYNAMIC: J (IN MOTION)");
+                    return; // Suppress static single-frame updates
+                }
+            } else if (currentMobileStabilizedHands.length === 0) {
+                mobileJTrajectoryTracker.reset();
+            }
 
             // 2. Throttled backend landmark prediction (non-blocking lock)
             const nowTime = performance.now();
@@ -1102,14 +1399,14 @@ async function sendMobileInferenceRequest(payload, seqId) {
 
     let response = null;
     try {
-        response = await fetch(`${API_BASE_URL}/predict_landmarks`, {
+        response = await fetch(`${currentInferenceUrl}/predict_landmarks`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
             signal: controller.signal
         });
         if (!response.ok && response.status === 404) {
-            response = await fetch(`${API_BASE_URL}/predict`, {
+            response = await fetch(`${currentInferenceUrl}/predict`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)
@@ -1163,11 +1460,13 @@ async function startMobileWebcam() {
 
         // 4. Request camera using exact facingMode on mobile, with ideal fallback
         // Native sensor resolution is preserved without lowering or constraining video dimensions
+        // Request continuous exposure mode for real-time sensor lighting compensation
         let stream = null;
         try {
             stream = await navigator.mediaDevices.getUserMedia({
                 video: {
-                    facingMode: { exact: currentFacingMode }
+                    facingMode: { exact: currentFacingMode },
+                    advanced: [{ exposureMode: "continuous" }]
                 },
                 audio: false
             });
@@ -1175,7 +1474,8 @@ async function startMobileWebcam() {
             console.warn("[Mobile] Exact facingMode failed, falling back to ideal:", exactErr);
             stream = await navigator.mediaDevices.getUserMedia({
                 video: {
-                    facingMode: { ideal: currentFacingMode }
+                    facingMode: { ideal: currentFacingMode },
+                    advanced: [{ exposureMode: "continuous" }]
                 },
                 audio: false
             });
@@ -1193,10 +1493,46 @@ async function startMobileWebcam() {
         updateCameraMirrorDisplay();
         if (dom.camFallback) dom.camFallback.style.display = "none";
 
+        // Mobile low-light luminance preprocessor
+        let lumMobileCanvas = null;
+        let lumMobileCtx = null;
+        let lastMobileLumTime = 0;
+
+        function evaluateMobileLowLight(videoEl) {
+            if (!videoEl || videoEl.videoWidth === 0) return;
+            const now = performance.now();
+            if (now - lastMobileLumTime < 300) return;
+            lastMobileLumTime = now;
+
+            if (!lumMobileCanvas) {
+                lumMobileCanvas = document.createElement("canvas");
+                lumMobileCanvas.width = 40;
+                lumMobileCanvas.height = 30;
+                lumMobileCtx = lumMobileCanvas.getContext("2d", { willReadFrequently: true });
+            }
+
+            try {
+                lumMobileCtx.drawImage(videoEl, 0, 0, 40, 30);
+                const data = lumMobileCtx.getImageData(0, 0, 40, 30).data;
+                let sumY = 0;
+                const total = 40 * 30;
+                for (let i = 0; i < data.length; i += 4) {
+                    sumY += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+                }
+                const avgLuminance = sumY / total;
+                if (avgLuminance < 45) {
+                    videoEl.style.filter = "brightness(1.25) contrast(1.15)";
+                } else {
+                    videoEl.style.filter = "none";
+                }
+            } catch (e) {}
+        }
+
         // 5. Continuous frame processing loop directly into MediaPipe Hands with WASM mutex lock
         let isProcessingMobileFrame = false;
         const onFrame = async () => {
             if (!isWebcamActive) return;
+            evaluateMobileLowLight(dom.webcam);
             if (mobileHands && !isProcessingMobileFrame && dom.webcam && dom.webcam.readyState >= 2 && !dom.webcam.paused) {
                 isProcessingMobileFrame = true;
                 try {
@@ -2043,7 +2379,77 @@ function reconnectCam() {
     startMobileWebcam();
 }
 
-// ── Dictionary Bottom Sheet & Filter ────────────────────────────────────────
+// ── Dictionary Bottom Sheet, Filter & Dual-View Skeleton Visualizer ─────────
+const MOBILE_FINGER_PLACEMENT_BADGES = {
+    "A": "Thumb: Lateral Side (Upright)",
+    "B": "Fingers: 4 Flat Upright",
+    "C": "Hand: Curved 'C' Silhouette",
+    "D": "Index: Pointing Up, Loop Closed",
+    "E": "Fingertips: Curled into Palm Base",
+    "F": "Index + Thumb: Circle, 3 Up",
+    "G": "Index + Thumb: Pointing Sideways",
+    "H": "Index + Middle: Pointing Sideways",
+    "I": "Pinky: Upright, Fist Closed",
+    "J": "Pinky: Downward Swoop Hook",
+    "K": "Index: Up, Middle Forward",
+    "L": "Index + Thumb: 90° 'L' Shape",
+    "M": "Thumb: Under 3 Fingers",
+    "N": "Thumb: Under 2 Fingers",
+    "O": "All Tips: Closed Oval Loop",
+    "P": "K-Shape: Pointing Downward",
+    "Q": "G-Shape: Pointing Downward",
+    "R": "Index + Middle: Crossed",
+    "S": "Thumb: Across Front Knuckles",
+    "T": "Thumb: Tucked Between Index/Mid",
+    "U": "Index + Middle: Touching Up",
+    "V": "Index + Middle: 'V' Spread",
+    "W": "3 Fingers: 'W' Spread Up",
+    "X": "Index: Bent Hook",
+    "Y": "Thumb + Pinky: Spread Wide",
+    "Z": "Index: 'Z' Zigzag In Air",
+    "HELLO": "Flat Hand: Temple Wave",
+    "THANK YOU": "Flat Hand: Chin to Receiver",
+    "I LOVE YOU": "Thumb + Index + Pinky Up",
+    "LOVE": "Both Arms: Crossed Over Chest",
+    "FINE": "5-Hand: Thumbs on Chest",
+    "ME": "Index: Pointing to Chest",
+    "YOU": "Index: Pointing Forward",
+    "HOW ARE YOU": "Cupped Hands: Flip Palms Up",
+    "NICE TO MEET YOU": "Slide Palm + Meet Index",
+    "START": "Both Hands: Open Facing Cam",
+    "STOP": "Both Hands: Vertical Halt",
+    "SPACE": "Both Hands: Move Outward",
+    "BACKSPACE": "Both Hands: Flick Backward",
+    "NEUTRAL": "Both Hands: Relaxed at Rest"
+};
+
+let mobileDictData = [];
+let mobileDictMap = {};
+let currentMobileDictSign = null;
+let mobileDictAnimRunning = true;
+let mobileDictAnimSpeed = 1.0;
+let mobileDictKeyframeIdx = 0;
+let mobileDictLastTimestamp = 0;
+let mobileDictAnimReqId = null;
+
+async function loadMobileDictionaryData() {
+    try {
+        const res = await fetch(`${API_BASE_URL}/api/dictionary`);
+        if (res.ok) {
+            const data = await res.json();
+            if (data.ok && data.dictionary) {
+                mobileDictData = data.dictionary;
+                mobileDictMap = {};
+                for (const item of mobileDictData) {
+                    mobileDictMap[item.id.toUpperCase()] = item;
+                }
+            }
+        }
+    } catch (e) {
+        console.warn("Could not load mobile dictionary:", e);
+    }
+}
+
 function openDictionary() {
     triggerHaptic(25);
     if (dom.dictModal) {
@@ -2053,10 +2459,308 @@ function openDictionary() {
             filterDictionary("");
         }
     }
+    if (mobileDictData.length === 0) {
+        loadMobileDictionaryData();
+    }
 }
 
 function closeDictionary() {
     if (dom.dictModal) dom.dictModal.classList.remove("show");
+    if (mobileDictAnimReqId) {
+        cancelAnimationFrame(mobileDictAnimReqId);
+        mobileDictAnimReqId = null;
+    }
+}
+
+function selectMobileDictSign(signName) {
+    if (!signName) return;
+    const clean = signName.toUpperCase().trim();
+    let sign = mobileDictMap[clean];
+    if (!sign) {
+        for (const k in mobileDictMap) {
+            if (k.includes(clean) || clean.includes(k)) {
+                sign = mobileDictMap[k];
+                break;
+            }
+        }
+    }
+    if (!sign) return;
+
+    currentMobileDictSign = sign;
+    mobileDictKeyframeIdx = 0;
+
+    const viewer = document.getElementById("m-dict-viewer");
+    if (viewer) viewer.style.display = "block";
+
+    const titleEl = document.getElementById("m-dict-title");
+    if (titleEl) titleEl.textContent = `Sign "${sign.name}"`;
+
+    const catBadge = document.getElementById("m-dict-cat-badge");
+    if (catBadge) {
+        const isDyn = (sign.category === "dynamic");
+        catBadge.textContent = isDyn ? "DYNAMIC" : "STATIC";
+        catBadge.style.color = isDyn ? "#ffb020" : "#10b981";
+    }
+
+    const placementBadge = document.getElementById("m-dict-placement-badge");
+    if (placementBadge) {
+        placementBadge.textContent = MOBILE_FINGER_PLACEMENT_BADGES[clean] || "Finger alignment verified";
+    }
+
+    const descEl = document.getElementById("m-dict-desc");
+    if (descEl) descEl.textContent = sign.description || "Canonical gesture posture.";
+
+    startMobileDictAnimLoop();
+    renderMobileDictionaryCanvas();
+}
+
+function toggleMobileDictAnim() {
+    mobileDictAnimRunning = !mobileDictAnimRunning;
+    const btn = document.getElementById("m-dict-play-pause");
+    if (btn) btn.textContent = mobileDictAnimRunning ? "⏸ Pause" : "▶ Play";
+}
+
+function toggleMobileDictSpeed() {
+    mobileDictAnimSpeed = (mobileDictAnimSpeed === 1.0) ? 0.5 : 1.0;
+    const btn = document.getElementById("m-dict-speed");
+    if (btn) btn.textContent = `⚡ Speed: ${mobileDictAnimSpeed}x`;
+}
+
+function restartMobileDictAnim() {
+    mobileDictKeyframeIdx = 0;
+    renderMobileDictionaryCanvas();
+}
+
+function startMobileDictAnimLoop() {
+    if (mobileDictAnimReqId) cancelAnimationFrame(mobileDictAnimReqId);
+
+    const loop = (timestamp) => {
+        if (!mobileDictLastTimestamp) mobileDictLastTimestamp = timestamp;
+        const elapsed = timestamp - mobileDictLastTimestamp;
+        const frameInterval = 75 / mobileDictAnimSpeed;
+
+        if (mobileDictAnimRunning && elapsed >= frameInterval) {
+            mobileDictLastTimestamp = timestamp;
+            if (currentMobileDictSign && currentMobileDictSign.keyframes && currentMobileDictSign.keyframes.length > 0) {
+                mobileDictKeyframeIdx = (mobileDictKeyframeIdx + 1) % currentMobileDictSign.keyframes.length;
+            }
+            renderMobileDictionaryCanvas();
+        } else if (!mobileDictAnimRunning) {
+            renderMobileDictionaryCanvas();
+        }
+
+        mobileDictAnimReqId = requestAnimationFrame(loop);
+    };
+
+    mobileDictAnimReqId = requestAnimationFrame(loop);
+}
+
+function renderMobileDictionaryCanvas() {
+    const canvas = document.getElementById("dictionary-canvas");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width;
+    const H = canvas.height;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#070b16";
+    ctx.fillRect(0, 0, W, H);
+
+    const splitX = Math.floor(W * 0.38);
+
+    // Left Panel: Upper Body Context
+    ctx.save();
+    ctx.font = '600 9px monospace';
+    ctx.fillStyle = 'rgba(0, 240, 255, 0.8)';
+    ctx.textAlign = 'center';
+    ctx.fillText('BODY CONTEXT', splitX / 2, 16);
+
+    const cx = splitX / 2;
+    const headY = 38;
+    const neckY = 54;
+    const shoulderY = 64;
+    const spineBottomY = 135;
+
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, headY, 13, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.strokeStyle = '#00f0ff';
+    ctx.beginPath();
+    ctx.moveTo(cx - 6, headY);
+    ctx.lineTo(cx + 6, headY);
+    ctx.stroke();
+
+    ctx.strokeStyle = '#64748b';
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    ctx.moveTo(cx, headY + 13);
+    ctx.lineTo(cx, neckY);
+    ctx.stroke();
+
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 2.8;
+    ctx.beginPath();
+    ctx.moveTo(cx - 30, shoulderY);
+    ctx.lineTo(cx + 30, shoulderY);
+    ctx.stroke();
+
+    ctx.strokeStyle = '#475569';
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    ctx.moveTo(cx, neckY);
+    ctx.lineTo(cx, spineBottomY);
+    ctx.stroke();
+
+    // Right Arm
+    let rElbowX = cx + 30 + 16;
+    let rElbowY = shoulderY + 30;
+    let rWristX = cx + 30 + 8;
+    let rWristY = shoulderY + 62;
+
+    if (currentMobileDictSign && currentMobileDictSign.category === 'dynamic') {
+        rWristX += Math.sin((mobileDictKeyframeIdx / 12) * Math.PI * 2) * 5;
+    }
+
+    ctx.strokeStyle = '#00E5FF';
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    ctx.moveTo(cx + 30, shoulderY);
+    ctx.lineTo(rElbowX, rElbowY);
+    ctx.lineTo(rWristX, rWristY);
+    ctx.stroke();
+
+    // Left Arm resting at side
+    ctx.strokeStyle = '#334155';
+    ctx.lineWidth = 2.0;
+    ctx.beginPath();
+    ctx.moveTo(cx - 30, shoulderY);
+    ctx.lineTo(cx - 36, shoulderY + 30);
+    ctx.lineTo(cx - 34, shoulderY + 62);
+    ctx.stroke();
+
+    ctx.restore();
+
+    // Divider
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.25)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(splitX, 8);
+    ctx.lineTo(splitX, H - 8);
+    ctx.stroke();
+    ctx.restore();
+
+    // Right Panel: Zoomed Hand Skeleton (21 Joints)
+    ctx.save();
+    const rightCenterX = splitX + (W - splitX) / 2;
+    ctx.font = '600 9px monospace';
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.textAlign = 'center';
+    ctx.fillText('HAND SKELETON (21 PTS)', rightCenterX, 16);
+
+    let points = null;
+    if (currentMobileDictSign) {
+        if (currentMobileDictSign.category === 'dynamic' && currentMobileDictSign.keyframes && currentMobileDictSign.keyframes.length > 0) {
+            points = currentMobileDictSign.keyframes[mobileDictKeyframeIdx] || currentMobileDictSign.landmarks;
+        } else {
+            points = currentMobileDictSign.landmarks;
+        }
+    }
+
+    if (points && points.length >= 21) {
+        const JOINT_COLORS = {
+            0: '#FFFFFF',
+            1: '#FF9800', 2: '#FF9800', 3: '#FF9800', 4: '#FF9800',
+            5: '#00E5FF', 6: '#00E5FF', 7: '#00E5FF', 8: '#00E5FF',
+            9: '#00E676', 10: '#00E676', 11: '#00E676', 12: '#00E676',
+            13: '#FFEA00', 14: '#FFEA00', 15: '#FFEA00', 16: '#FFEA00',
+            17: '#FF4081', 18: '#FF4081', 19: '#FF4081', 20: '#FF4081'
+        };
+
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        for (let i = 0; i < 21; i++) {
+            const px = Number(points[i].x !== undefined ? points[i].x : points[i][0]);
+            const py = Number(points[i].y !== undefined ? points[i].y : points[i][1]);
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+        }
+
+        const spanX = Math.max(0.01, maxX - minX);
+        const spanY = Math.max(0.01, maxY - minY);
+        const availW = W - splitX - 25;
+        const availH = H - 45;
+        const scale = Math.min(availW / spanX, availH / spanY) * 0.80;
+
+        const targetCenterX = splitX + (W - splitX) / 2;
+        const targetCenterY = 24 + availH / 2;
+        const centerNormX = (minX + maxX) / 2;
+        const centerNormY = (minY + maxY) / 2;
+
+        const screenPts = points.map(p => {
+            const px = Number(p.x !== undefined ? p.x : p[0]);
+            const py = Number(p.y !== undefined ? p.y : p[1]);
+            return {
+                x: targetCenterX + (px - centerNormX) * scale,
+                y: targetCenterY + (py - centerNormY) * scale
+            };
+        });
+
+        // Bones
+        ctx.lineWidth = 2.0;
+        ctx.lineCap = 'round';
+        for (const [i, j] of HAND_CONNECTIONS) {
+            const p0 = screenPts[i];
+            const p1 = screenPts[j];
+            if (!p0 || !p1) continue;
+
+            let boneColor = 'rgba(255, 255, 255, 0.4)';
+            if (i >= 1 && j <= 4) boneColor = 'rgba(255, 152, 0, 0.7)';
+            else if (i >= 5 && j <= 8) boneColor = 'rgba(0, 229, 255, 0.7)';
+            else if (i >= 9 && j <= 12) boneColor = 'rgba(0, 230, 118, 0.7)';
+            else if (i >= 13 && j <= 16) boneColor = 'rgba(255, 234, 0, 0.7)';
+            else if (i >= 17 && j <= 20) boneColor = 'rgba(255, 64, 129, 0.7)';
+
+            ctx.strokeStyle = boneColor;
+            ctx.beginPath();
+            ctx.moveTo(p0.x, p0.y);
+            ctx.lineTo(p1.x, p1.y);
+            ctx.stroke();
+        }
+
+        // Joints
+        const tips = new Set([4, 8, 12, 16, 20]);
+        for (let k = 0; k < 21; k++) {
+            const sp = screenPts[k];
+            if (!sp) continue;
+            const color = JOINT_COLORS[k] || '#FFFFFF';
+
+            ctx.beginPath();
+            if (tips.has(k)) {
+                ctx.arc(sp.x, sp.y, 5.0, 0, Math.PI * 2);
+                ctx.fillStyle = color;
+                ctx.fill();
+                ctx.strokeStyle = '#FFFFFF';
+                ctx.lineWidth = 1.2;
+                ctx.stroke();
+            } else if (k === 0) {
+                ctx.arc(sp.x, sp.y, 4.0, 0, Math.PI * 2);
+                ctx.fillStyle = '#FFFFFF';
+                ctx.fill();
+            } else {
+                ctx.arc(sp.x, sp.y, 2.8, 0, Math.PI * 2);
+                ctx.fillStyle = color;
+                ctx.fill();
+            }
+        }
+    }
+
+    ctx.restore();
 }
 
 function filterDictionary(query) {
@@ -2078,13 +2782,13 @@ function filterDictionary(query) {
     });
 }
 
-// Attach tap feedback to gesture chips
+// Attach tap feedback and dual-view selection to gesture chips
 document.addEventListener("DOMContentLoaded", () => {
     document.querySelectorAll(".m-gesture-chip").forEach(chip => {
         chip.addEventListener("click", () => {
             triggerHaptic(20);
             const name = chip.getAttribute("data-name") || chip.textContent;
-            showToast(`Sign: ${name.toUpperCase()}`);
+            selectMobileDictSign(name);
         });
     });
 });
@@ -2094,4 +2798,7 @@ updateCameraMirrorDisplay();
 updateRecordingUI();
 updateTranscriptDOM();
 updateMobileVoiceDOM();
+initMobileServerNegotiator();
 startMobileWebcam();
+loadMobileDictionaryData();
+

@@ -2324,11 +2324,16 @@ button:focus-visible {
     background: rgba(0, 240, 255, 0.15);
     color: var(--cyan);
     border: 1px solid rgba(0, 240, 255, 0.35);
+.dict-badge.finger {
+    background: rgba(255, 152, 0, 0.2);
+    color: #ff9800;
+    border: 1px solid rgba(255, 152, 0, 0.45);
 }
 
 #dictionary-canvas {
-    width: 350px;
-    height: 350px;
+    width: 100%;
+    max-width: 520px;
+    height: 290px;
     background: radial-gradient(circle at center, rgba(16, 24, 38, 0.95) 0%, rgba(5, 8, 14, 0.98) 100%);
     border: 1px solid rgba(0, 240, 255, 0.3);
     border-radius: var(--radius-md);
