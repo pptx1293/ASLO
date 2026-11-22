@@ -66,17 +66,15 @@
     <!-- ── Main Scrollable Content ──────────────────────────────────────── -->
     <main class="mobile-content">
 
-        <!-- Server Mode Negotiation Bar -->
-        <div class="server-mode-container" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 6px 12px; margin: 4px 10px 8px 10px; background: rgba(15,23,42,0.75); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px;">
+        <!-- Server Mode Bar -->
+        <div class="server-mode-container" style="display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 6px 12px; margin: 4px 10px 8px 10px; background: rgba(15,23,42,0.75); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px;">
           <div style="display: flex; align-items: center; gap: 6px;">
-            <label for="server-mode-select" style="font-weight: 600; font-size: 12px; color: #94a3b8;">Inference:</label>
+            <label for="server-mode-select" style="font-weight: 600; font-size: 12px; color: #94a3b8;">Engine:</label>
             <select id="server-mode-select" class="form-select" style="padding: 3px 6px; border-radius: 6px; font-size: 12px; background: #0f172a; color: #fff; border: 1px solid rgba(255,255,255,0.15);">
               <option value="auto">Auto-Detect</option>
               <option value="local">Local (0ms)</option>
               <option value="cloud">Cloud</option>
             </select>
-          </div>
-          <div style="display: flex; align-items: center; gap: 6px;">
             <span id="server-status-pill" class="badge" style="padding: 3px 8px; border-radius: 10px; font-size: 11px; background: #6c757d; color: #fff;">
               Checking...
             </span>
@@ -101,16 +99,6 @@
                     <span class="m-radar-ping"></span>
                     <span class="m-rec-dot" id="m-rec-dot"></span>
                     <span id="m-rec-status">STANDBY</span>
-                </div>
-
-                <!-- Dominant Hand Selector Quick-Switch -->
-                <div class="m-hand-switch" id="m-hand-switch" title="Dominant Signing Hand">
-                    <button class="m-hand-opt active" id="hand-opt-right" onclick="setDominantHand('right')">
-                        <span>✋</span> Right
-                    </button>
-                    <button class="m-hand-opt" id="hand-opt-left" onclick="setDominantHand('left')">
-                        <span>🤚</span> Left
-                    </button>
                 </div>
 
                 <!-- Camera Quick Actions (Switch & Mirror) -->
@@ -168,7 +156,7 @@
                 <div class="m-stability-cluster" id="m-stability-cluster" title="Sign Stability Confirmation">
                     <span class="m-stab-label">STABILITY</span>
                     <div class="m-stab-dots" id="m-stab-dots">
-                        <!-- Populated dynamically (8 segments) -->
+                        <!-- Populated dynamically (5 segments) -->
                     </div>
                 </div>
             </div>
@@ -189,7 +177,7 @@
                     <span class="m-conf-caption">CONFIDENCE</span>
                     <div class="m-conf-pill" id="m-conf-pill">0%</div>
                 </div>
-                <div class="m-hand-pill-box">
+                <div class="m-hand-pill-box" style="display:flex; gap:4px; align-items:center;">
                     <span class="m-hand-pill" id="m-hand-pill">💤 Standby</span>
                 </div>
             </div>
@@ -443,6 +431,7 @@
                         <div class="m-gesture-chip" data-name="f">F</div>
                         <div class="m-gesture-chip" data-name="g">G</div>
                         <div class="m-gesture-chip" data-name="h">H</div>
+                        <div class="m-gesture-chip" data-name="i">I</div>
                         <div class="m-gesture-chip" data-name="k">K</div>
                         <div class="m-gesture-chip" data-name="l">L</div>
                         <div class="m-gesture-chip" data-name="m">M</div>
@@ -470,7 +459,7 @@
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
 
     <!-- Mobile Controller Script -->
-    <script src="mobile.js?v=20261003_v9"></script>
+    <script src="mobile.js?v=20261122_v11"></script>
 </body>
 
 </html>

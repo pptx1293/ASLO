@@ -1,0 +1,118 @@
+{
+  "architecture": "100% Pure Keras MLP Separate-Training + OOD-Aware Meta-Router Ensemble",
+  "meta_dim": 265,
+  "models": {
+    "static_asl_stage1": {
+      "file": "asl_stage1_router_mlp.keras",
+      "input_dim": 124,
+      "classes": [
+        "CLUSTER_CURVE_PINCH",
+        "CLUSTER_FIST",
+        "CLUSTER_OPEN",
+        "CLUSTER_UPRIGHT",
+        "L",
+        "Y"
+      ]
+    },
+    "static_asl_specialists": {
+      "CLUSTER_FIST": {
+        "file": "asl_specialist_cluster_fist_mlp.keras",
+        "input_dim": 124,
+        "classes": [
+          "A",
+          "E",
+          "M",
+          "N",
+          "S",
+          "T"
+        ]
+      },
+      "CLUSTER_UPRIGHT": {
+        "file": "asl_specialist_cluster_upright_mlp.keras",
+        "input_dim": 124,
+        "classes": [
+          "D",
+          "H",
+          "K",
+          "R",
+          "U",
+          "V"
+        ]
+      },
+      "CLUSTER_CURVE_PINCH": {
+        "file": "asl_specialist_cluster_curve_pinch_mlp.keras",
+        "input_dim": 124,
+        "classes": [
+          "C",
+          "F",
+          "G",
+          "O",
+          "P",
+          "Q",
+          "X"
+        ]
+      },
+      "CLUSTER_OPEN": {
+        "file": "asl_specialist_cluster_open_mlp.keras",
+        "input_dim": 124,
+        "classes": [
+          "B",
+          "W"
+        ]
+      }
+    },
+    "static_words": {
+      "file": "words_static_mlp.keras",
+      "input_dim": 252,
+      "classes": [
+        "Fine",
+        "I love you",
+        "Love",
+        "ME",
+        "Thank you",
+        "YOU",
+        "backspace",
+        "hello",
+        "neutral",
+        "space",
+        "start",
+        "stop"
+      ]
+    },
+    "dynamic_trajectory": {
+      "file": "dynamic_mlp.keras",
+      "input_dim": 393,
+      "classes": [
+        "How are you",
+        "J",
+        "Nice to meet you",
+        "STATIC_HOLD",
+        "Z"
+      ]
+    },
+    "dynamic_keyframe": {
+      "file": "dynamic_keyframe_mlp.keras",
+      "input_dim": 252,
+      "classes": [
+        "How are you_END",
+        "How are you_START",
+        "J_END",
+        "J_START",
+        "Nice to meet you_END",
+        "Nice to meet you_START",
+        "Z_END",
+        "Z_START"
+      ]
+    },
+    "meta_router": {
+      "file": "meta_router_mlp.keras",
+      "input_dim": 265,
+      "classes": [
+        "dynamic_keyframe",
+        "static_asl",
+        "static_words"
+      ],
+      "val_acc": 0.9979156851768494
+    }
+  }
+}

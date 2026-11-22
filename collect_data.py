@@ -6,10 +6,15 @@ import mediapipe as mp
 import numpy as np
 import pandas as pd
 
-from aslo_features import extract_features
+from aslo_features import extract_features, extract_primary_hand_features
 from aslo_pipeline import LowLightEnhancer
 
 low_light_enhancer = LowLightEnhancer()
+
+TWO_HANDED_GESTURE_FOLDERS = {
+    "backspace", "space", "start", "stop", "neutral",
+    "love", "me", "how are you", "nice to meet you"
+}
 
 
 def natural_sort_key(s):
@@ -17,7 +22,7 @@ def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
 
-def process_frame(frame, hands):
+def process_frame(frame, hands, is_two_handed=False):
     """Process a single frame (BGR) with horizontal flip, adaptive lighting (anti-glare & low-light), and extract landmarks."""
     flipped = cv2.flip(frame, 1)
     enhanced, _, _ = low_light_enhancer.process(flipped)
@@ -27,7 +32,10 @@ def process_frame(frame, hands):
         raw_rgb = cv2.cvtColor(flipped, cv2.COLOR_BGR2RGB)
         results = hands.process(raw_rgb)
     if results and results.multi_hand_landmarks:
-        feats = extract_features(results)
+        if is_two_handed:
+            feats = extract_features(results)
+        else:
+            feats = extract_primary_hand_features(results, dominant_hand="right")
         return feats
     return None
 
@@ -77,6 +85,7 @@ def main():
         image_files = [f for f in all_entries if f.lower().endswith((".png", ".jpg", ".jpeg"))]
 
         is_dynamic = len(video_files) > 0 or len(seq_dirs) > 0
+        is_two_handed = label_name.lower().strip() in TWO_HANDED_GESTURE_FOLDERS
 
         # Case 1: Folder has video files (e.g., How are you, Nice to meet you, J)
         if video_files:
@@ -98,7 +107,7 @@ def main():
                     image_rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
                     results = hands.process(image_rgb)
                     if results.multi_hand_landmarks:
-                        feats = extract_features(results)
+                        feats = extract_features(results) if is_two_handed else extract_primary_hand_features(results, dominant_hand="right")
                         avg_wy = np.mean([lm.landmark[0].y for lm in results.multi_hand_landmarks])
                         valid_entries.append((feats, avg_wy))
 
@@ -154,7 +163,7 @@ def main():
                     image = cv2.imread(img_path)
                     if image is None:
                         continue
-                    feats = process_frame(image, hands)
+                    feats = process_frame(image, hands, is_two_handed=is_two_handed)
                     if feats is not None:
                         valid_feats.append(feats)
 
@@ -184,7 +193,7 @@ def main():
                 if image is None:
                     continue
 
-                feats = process_frame(image, hands)
+                feats = process_frame(image, hands, is_two_handed=is_two_handed)
                 if feats is not None:
                     data.append(feats)
                     labels.append(label_name)

@@ -47,7 +47,7 @@
             </button>
 
             <div class="server-mode-container" style="display: flex; align-items: center; gap: 8px;">
-              <label for="server-mode-select" style="font-weight: 600; font-size: 13px; color: var(--text-muted, #94a3b8);">Inference Mode:</label>
+              <label for="server-mode-select" style="font-weight: 600; font-size: 13px; color: var(--text-muted, #94a3b8);">Engine:</label>
               <select id="server-mode-select" class="form-select" style="padding: 4px 8px; border-radius: 6px; font-size: 13px; background: rgba(15,23,42,0.8); color: #fff; border: 1px solid rgba(255,255,255,0.15);">
                 <option value="auto">Auto-Detect (Smart)</option>
                 <option value="local">Local Server (0ms)</option>
@@ -153,9 +153,11 @@
                     <!-- Current Sign -->
                     <div class="gesture-hero-box">
                         <div class="gesture-primary">
-                            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+                            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; gap:6px;">
                                 <span class="gesture-primary-label">Current Sign</span>
-                                <span class="hand-badge hand-none" id="hand-badge">Standby</span>
+                                <div style="display:flex; align-items:center; gap:5px;">
+                                    <span class="hand-badge hand-none" id="hand-badge">Standby</span>
+                                </div>
                             </div>
                             <span id="gesture-label">—</span>
                         </div>
@@ -187,7 +189,7 @@
                     <div class="telemetry-row">
                         <div class="telemetry-label-row">
                             <span class="telemetry-name">STABILITY</span>
-                            <span class="telemetry-value" id="stab-text">0/15</span>
+                            <span class="telemetry-value" id="stab-text">0/5</span>
                         </div>
                         <div class="stab-segments" id="stab-segments"></div>
                     </div>
@@ -600,7 +602,7 @@
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
 
     <!-- ── Application Script ──────────────────────────────────────────── -->
-    <script src="app.js?v=20261003_v9"></script>
+    <script src="app.js?v=20261122_v11"></script>
 
 </body>
 

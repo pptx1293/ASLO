@@ -1,215 +1,94 @@
-import os
+"""
+ASLO Multi-MLP Master Training Orchestrator (`train_model.py`)
+==============================================================
+Runs the 3 completely separate standalone trainers and then merges all 3 model groups
+using the dedicated Meta-Router MLP (`merge_models.py`):
+  1. `train_asl_model.py`     -> Pure Static ASL (Stage-1 Router + 4 Stage-2 Specialists)
+  2. `train_words_model.py`   -> Pure Static Words & Control Gestures (`words_static_mlp.keras`)
+  3. `train_dynamic_model.py` -> Pure Dynamic Gestures (25-Frame `dynamic_mlp.keras` + `_START/_END` `dynamic_keyframe_mlp.keras`)
+  4. `merge_models.py`        -> Meta-Router MLP (`meta_router_mlp.keras`) + `merged_ensemble_manifest.json`
 
+Usage:
+  python train_model.py                 # Train all 3 models separately, then merge
+  python train_model.py --only asl      # Train ONLY Static ASL model group
+  python train_model.py --only words    # Train ONLY Static Words model group
+  python train_model.py --only dynamic  # Train ONLY Dynamic Gestures model group
+  python train_model.py --only merge    # Merge existing trained models via Meta-Router MLP
+"""
+
+import argparse
 import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import seaborn as sns
-from keras import callbacks, layers, models, regularizers
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.utils.class_weight import compute_class_weight
 
-from aslo_features import FEATURE_LEN, _fist_disambiguation_from_norm_coords
+import merge_models
+import train_asl_model
+import train_dynamic_model
+import train_words_model
 
 
 def main():
-    data_path = "gesture_data.csv"
-
-    if not os.path.exists(data_path):
-        if os.path.exists("gesture_data_original_backup.csv"):
-            print("gesture_data.csv not found; loading from 'gesture_data_original_backup.csv'...")
-            df = pd.read_csv("gesture_data_original_backup.csv")
-        else:
-            print(
-                f"Error: '{data_path}' and backup not found. Please run collect_data.py first to generate the dataset."
-            )
-            return
-    else:
-        print(f"Loading dataset from '{data_path}'...")
-        df = pd.read_csv(data_path)
-
-    if df.empty:
-        print("Dataset is empty. Please ensure images were properly processed.")
-        return
-
-    num_cols = df.shape[1]
-    # Check if dataset needs fist disambiguation feature enrichment (226 -> 272 features)
-    if num_cols == 227 or (num_cols != (FEATURE_LEN + 1) and os.path.exists("gesture_data_original_backup.csv")):
-        print(f"Enriching dataset with fist disambiguation feature geometry (226 -> {FEATURE_LEN} features)...")
-        if num_cols != 227 and os.path.exists("gesture_data_original_backup.csv"):
-            df = pd.read_csv("gesture_data_original_backup.csv")
-        base_features = df.iloc[:, :226].values
-        labels = df.iloc[:, -1].values
-
-        h0_coords = base_features[:, 0:63]
-        h1_coords = base_features[:, 63:126]
-
-        h0_fist = np.array([_fist_disambiguation_from_norm_coords(r) for r in h0_coords], dtype=np.float32)
-        h1_fist = np.array([_fist_disambiguation_from_norm_coords(r) for r in h1_coords], dtype=np.float32)
-
-        enriched_features = np.hstack([base_features, h0_fist, h1_fist])
-
-        if not os.path.exists("gesture_data_original_backup.csv"):
-            df.to_csv("gesture_data_original_backup.csv", index=False)
-
-        enriched_df = pd.DataFrame(enriched_features)
-        enriched_df["label"] = labels
-        enriched_df.to_csv(data_path, index=False)
-        print(f"Saved enriched dataset with shape {enriched_df.shape} to '{data_path}'")
-        X = enriched_features
-        y = labels
-    elif num_cols == FEATURE_LEN + 1:
-        print(f"Dataset already enriched with {FEATURE_LEN} features ({df.shape[0]} rows).")
-        X = df.iloc[:, :-1].values
-        y = df.iloc[:, -1].values
-    else:
-        X = df.iloc[:, :-1].values
-        y = df.iloc[:, -1].values
-
-    assert X.shape[1] == FEATURE_LEN, f"Expected {FEATURE_LEN} features, got {X.shape[1]}"
-
-    label_encoder = LabelEncoder()
-    y_encoded = label_encoder.fit_transform(y)
-    num_classes = len(label_encoder.classes_)
-
-    np.save("label_classes.npy", label_encoder.classes_)
-    print(f"Found {num_classes} classes: {label_encoder.classes_}")
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+    parser = argparse.ArgumentParser(description="ASLO Separate-Training & Merged Multi-MLP Pipeline")
+    parser.add_argument(
+        "--only",
+        choices=["all", "asl", "words", "dynamic", "merge"],
+        default="all",
+        help="Run a specific standalone trainer or the full separate-train + merge pipeline.",
     )
-    print(f"Training samples: {X_train.shape[0]}, Testing samples: {X_test.shape[0]}")
+    args = parser.parse_args()
 
-    # Compute balanced class weights to combat 'S' dominance over closed fists
-    classes = np.unique(y_train)
-    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
-    class_weights = dict(zip(classes, weights))
+    asl_res = None
+    words_res = None
+    dyn_res = None
+    merge_res = None
 
-    # Anti-'S' Dominance Penalization:
-    # Heavily penalize the model if it lazily predicts 'S' for 'A', 'E', 'M', 'N', or 'T'
-    fist_classes = {"A", "E", "M", "N", "T"}
-    for idx, cls_name in enumerate(label_encoder.classes_):
-        if cls_name in fist_classes and idx in class_weights:
-            class_weights[idx] *= 1.35
-        elif cls_name == "S" and idx in class_weights:
-            class_weights[idx] *= 0.85
+    if args.only in ("all", "asl"):
+        asl_res = train_asl_model.main()
+    if args.only in ("all", "words"):
+        words_res = train_words_model.main()
+    if args.only in ("all", "dynamic"):
+        dyn_res = train_dynamic_model.main()
+    if args.only in ("all", "merge"):
+        merge_res = merge_models.main()
 
-    inp = layers.Input(shape=(X_train.shape[1],))
-    x = layers.GaussianNoise(0.02)(inp)
+    if args.only == "all" and asl_res and words_res and dyn_res and merge_res:
+        print("\n" + "=" * 72)
+        print("SEPARATE-TRAINING + MERGED MULTI-MLP ARCHITECTURE SUMMARY")
+        print("=" * 72)
+        print(f"1. Static ASL Stage-1 Router MLP    : Val Acc = {asl_res['stage1']['val_acc']*100:6.2f}%")
+        for c_name, c_st in asl_res["specialists"].items():
+            print(f"   * Stage-2 {c_name:<22} : Val Acc = {c_st['val_acc']*100:6.2f}% ({c_st['classes']})")
+        print(f"2. Pure Static Words MLP            : Val Acc = {words_res['words']['val_acc']*100:6.2f}%")
+        print(f"3. Dynamic 25-Frame Trajectory MLP  : Val Acc = {dyn_res['dynamic_trajectory']['val_acc']*100:6.2f}%")
+        print(f"   * Dynamic Keyframes (_START/_END): Val Acc = {dyn_res['dynamic_keyframe']['val_acc']*100:6.2f}%")
+        print(f"4. Merged Meta-Router MLP           : Val Acc = {merge_res['meta_router']['val_acc']*100:6.2f}%")
+        print("=" * 72 + "\n")
 
-    x = layers.Dense(256, activation="relu", kernel_regularizer=regularizers.l2(0.0005))(
-        x
-    )
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.35)(x)
+        plt.figure(figsize=(16, 12))
+        if "CLUSTER_FIST" in asl_res["specialists"]:
+            st_f = asl_res["specialists"]["CLUSTER_FIST"]
+            plt.subplot(2, 2, 1)
+            sns.heatmap(st_f["cm"], annot=True, fmt="d", cmap="Blues", xticklabels=st_f["classes"], yticklabels=st_f["classes"])
+            plt.title(f"Model 1: ASL Fist Specialist ({st_f['val_acc']*100:.1f}%)")
 
-    x = layers.Dense(128, activation="relu", kernel_regularizer=regularizers.l2(0.0005))(
-        x
-    )
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.25)(x)
+        st_w = words_res["words"]
+        plt.subplot(2, 2, 2)
+        sns.heatmap(st_w["cm"], annot=True, fmt="d", cmap="Purples", xticklabels=st_w["classes"], yticklabels=st_w["classes"])
+        plt.title(f"Model 2: Pure Static Words ({st_w['val_acc']*100:.1f}%)")
 
-    x = layers.Dense(64, activation="relu", kernel_regularizer=regularizers.l2(0.0005))(
-        x
-    )
-    x = layers.BatchNormalization()(x)
+        st_d = dyn_res["dynamic_trajectory"]
+        plt.subplot(2, 2, 3)
+        sns.heatmap(st_d["cm"], annot=True, fmt="d", cmap="Greens", xticklabels=st_d["classes"], yticklabels=st_d["classes"])
+        plt.title(f"Model 3A: Dynamic 25-Frame ({st_d['val_acc']*100:.1f}%)")
 
-    out = layers.Dense(num_classes, activation="softmax")(x)
+        st_m = merge_res["meta_router"]
+        plt.subplot(2, 2, 4)
+        sns.heatmap(st_m["cm"], annot=True, fmt="d", cmap="Oranges", xticklabels=st_m["classes"], yticklabels=st_m["classes"])
+        plt.title(f"Merger: Meta-Router MLP ({st_m['val_acc']*100:.1f}%)")
 
-    model = models.Model(inp, out, name="GestureNet_v2_fist_stabilized")
-
-    model.compile(
-        optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"]
-    )
-
-    early_stopping = callbacks.EarlyStopping(
-        monitor="val_loss", patience=20, restore_best_weights=True, verbose=1
-    )
-
-    print("Starting model training with balanced class weighting...")
-    history = model.fit(
-        X_train,
-        y_train,
-        epochs=150,
-        batch_size=32,
-        validation_data=(X_test, y_test),
-        class_weight=class_weights,
-        callbacks=[early_stopping],
-    )
-
-    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-    print(
-        f"\nModel Evaluation - Test Accuracy: {test_acc:.4f}, Test Loss: {test_loss:.4f}"
-    )
-
-    model_path = "gesture_model.keras"
-    model.save(model_path)
-    print(f"Model saved successfully to '{model_path}'")
-
-    y_pred = np.argmax(model.predict(X_test, verbose=0), axis=1)
-
-    # Output detailed precision & recall report for closed-fist gestures
-    target_names = [str(c) for c in label_encoder.classes_]
-    report = classification_report(y_test, y_pred, target_names=target_names, output_dict=True)
-
-    print("\n" + "=" * 62)
-    print("FIST DISAMBIGUATION PRECISION / RECALL REPORT [A, E, M, N, S, T]")
-    print("=" * 62)
-    print(f"{'Class':<8} {'Precision':<12} {'Recall':<12} {'F1-Score':<12} {'Support':<10}")
-    print("-" * 56)
-    for cls in ["A", "E", "M", "N", "S", "T"]:
-        if cls in report:
-            r = report[cls]
-            print(f"{cls:<8} {r['precision']:<12.3f} {r['recall']:<12.3f} {r['f1-score']:<12.3f} {int(r['support']):<10}")
-    print("=" * 62 + "\n")
-
-    plt.figure(figsize=(14, 12))
-
-    plt.subplot(2, 2, 1)
-    plt.plot(history.history["accuracy"], label="Train Accuracy")
-    plt.plot(history.history["val_accuracy"], label="Validation Accuracy")
-    plt.title("Model Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
-
-    plt.subplot(2, 2, 2)
-    plt.plot(history.history["loss"], label="Train Loss")
-    plt.plot(history.history["val_loss"], label="Validation Loss")
-    plt.title("Model Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-
-    cm = confusion_matrix(y_test, y_pred)
-
-    plt.subplot(2, 1, 2)
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt="d",
-        cmap="Blues",
-        xticklabels=label_encoder.classes_,
-        yticklabels=label_encoder.classes_,
-    )
-    plt.title("Confusion Matrix")
-    plt.xlabel("Predicted Label")
-    plt.ylabel("True Label")
-
-    report_path = "training_report.png"
-    plt.tight_layout()
-    plt.savefig(report_path)
-    print(f"Training report saved to '{report_path}'")
-
-    cm_path = "confusion_matrix.png"
-    if os.path.exists(cm_path):
-        try:
-            os.remove(cm_path)
-        except OSError:
-            pass
-
-    print("Training complete! You can now run app.py for real-time detection.")
+        plt.tight_layout()
+        plt.savefig("training_report.png")
+        plt.close()
+        print("Saved multi-model confusion matrix report to 'training_report.png'.")
 
 
 if __name__ == "__main__":

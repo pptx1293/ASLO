@@ -101,9 +101,11 @@ let clientSmoothedDisplayGesture = "—";
 let clientSmoothedConf = 0;
 
 // ── Dual-Host API Resolver & Engine Auto-Negotiation ────────────────────────
-const API_BASE_URL = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
-    ? '' 
-    : window.location.origin;
+const CLOUD_BACKEND_URL = "https://aslo-1.onrender.com";
+const isLocalHost = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+const API_BASE_URL = isLocalHost
+    ? ''
+    : (window.location.hostname.includes('onrender.com') ? '' : CLOUD_BACKEND_URL);
 
 let currentInferenceUrl = API_BASE_URL;
 let serverMode = localStorage.getItem("aslo_server_mode") || "auto";
@@ -123,7 +125,7 @@ async function checkLocalServerAlive() {
             const data = await res.json();
             return Boolean(data && data.status === "online");
         }
-    } catch (_) {}
+    } catch (_) { }
     return false;
 }
 
@@ -137,9 +139,11 @@ async function updateServerNegotiation() {
         select.value = serverMode;
     }
 
+    const fallbackCloudUrl = (window.location.hostname.includes('onrender.com') || isLocalHost) ? '' : CLOUD_BACKEND_URL;
+
     if (serverMode === "local") {
-        if (isLocalAlive) {
-            currentInferenceUrl = "http://127.0.0.1:5000";
+        if (isLocalAlive || isLocalHost) {
+            currentInferenceUrl = isLocalHost ? "" : "http://127.0.0.1:5000";
             if (pill) {
                 pill.textContent = "Local (0ms Active)";
                 pill.style.background = "#10b981";
@@ -147,7 +151,7 @@ async function updateServerNegotiation() {
             }
             if (downloadLink) downloadLink.style.display = "none";
         } else {
-            currentInferenceUrl = API_BASE_URL;
+            currentInferenceUrl = fallbackCloudUrl || CLOUD_BACKEND_URL;
             if (pill) {
                 pill.textContent = "Local Offline (Cloud Fallback)";
                 pill.style.background = "#ef4444";
@@ -156,7 +160,7 @@ async function updateServerNegotiation() {
             if (downloadLink) downloadLink.style.display = "inline";
         }
     } else if (serverMode === "cloud") {
-        currentInferenceUrl = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? '' : window.location.origin;
+        currentInferenceUrl = isLocalHost ? CLOUD_BACKEND_URL : (window.location.hostname.includes('onrender.com') ? '' : CLOUD_BACKEND_URL);
         if (pill) {
             pill.textContent = "Cloud Active";
             pill.style.background = "#0284c7";
@@ -164,9 +168,9 @@ async function updateServerNegotiation() {
         }
         if (downloadLink) downloadLink.style.display = "none";
     } else {
-        // "auto" mode
-        if (isLocalAlive) {
-            currentInferenceUrl = "http://127.0.0.1:5000";
+        // "auto" mode: when served from localhost/127.0.0.1, ALWAYS use the local server (same origin)
+        if (isLocalHost || isLocalAlive) {
+            currentInferenceUrl = isLocalHost ? "" : "http://127.0.0.1:5000";
             if (pill) {
                 pill.textContent = "Auto: Local Engine (0ms)";
                 pill.style.background = "#10b981";
@@ -174,7 +178,7 @@ async function updateServerNegotiation() {
             }
             if (downloadLink) downloadLink.style.display = "none";
         } else {
-            currentInferenceUrl = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') ? '' : window.location.origin;
+            currentInferenceUrl = window.location.hostname.includes('onrender.com') ? '' : CLOUD_BACKEND_URL;
             if (pill) {
                 pill.textContent = "Auto: Cloud Active";
                 pill.style.background = "#6366f1";
@@ -203,11 +207,11 @@ function initServerNegotiator() {
 let activeSign = null;
 let candidateSign = null;
 let candidateCount = 0;
-const COMMIT_THRESHOLD = 3; // Must win >= 3 out of 4 consecutive frames
+const COMMIT_THRESHOLD = 3; // Fast 3-frame confirmation (~130ms)
 const CONFIRM_BUFFER_SIZE = 4;
 const CONFIRM_WIN_COUNT = 3;
 let confirmationBuffer = [];
-const HYSTERESIS_LOCK_MS = 350; // 350ms hysteresis lock against adjacent sign overriding
+const HYSTERESIS_LOCK_MS = 250; // Responsive 250ms hysteresis lock against adjacent sign overriding
 let lockUntil = 0; // Cooldown timestamp
 
 // Optional Local Edge Inference Fallback State
@@ -261,7 +265,7 @@ let clientDynamicCooldownUntil = 0;
 let dynamicReadyForStart = true;
 let clientLastDynamicCommitted = { gesture: "", time: 0 };
 const REPEAT_DELAY_MS = 140; // Sub-150ms repeat cooldown
-const STABILITY_REQUIRED_COUNT = 3; // 3 out of 5 frames
+const STABILITY_REQUIRED_COUNT = 5; // 5 frames
 const BUFFER_MAX_LEN = 5;
 let selectedSTTLanguage = "en-US";
 let audioCtx = null;
@@ -309,12 +313,24 @@ function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
         const mx = Number(m9.x !== undefined ? m9.x : m9[0]);
         const my = Number(m9.y !== undefined ? m9.y : m9[1]);
 
-        // scale = dist(wrist_0, middle_mcp_9)
-        const scale = Math.hypot(wx - mx, wy - my);
+        // scale = max(dist(wrist_0, middle_mcp_9), 0.45 * 2D_bbox_diagonal)
+        // Ensures foreshortened hands (e.g. thumbs-up fist facing camera in START) are never discarded
+        let minX = wx, maxX = wx, minY = wy, maxY = wy;
+        for (let k = 0; k < lms.length; k++) {
+            const pk = lms[k];
+            const px = Number(pk.x !== undefined ? pk.x : pk[0]);
+            const py = Number(pk.y !== undefined ? pk.y : pk[1]);
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+        }
+        const bboxDiag = Math.hypot(maxX - minX, maxY - minY);
+        const scale = Math.max(Math.hypot(wx - mx, wy - my), bboxDiag * 0.45);
         const rawH = multiHandedness && multiHandedness[idx];
         const physicalHand = getActualPhysicalHand(rawH);
         const distFromCenter = Math.abs(wx - 0.5);
-        const inCenterRegion = (wx >= 0.20 && wx <= 0.80);
+        const inCenterRegion = (wx >= 0.08 && wx <= 0.92);
 
         return {
             index: idx,
@@ -333,18 +349,21 @@ function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
         if (c.scale > maxScale) maxScale = c.scale;
     }
 
-    // Discard all hands whose scale is < 65% of the largest hand
-    const valid = candidates.filter(c => c.scale >= 0.65 * maxScale);
+    // Discard background hands far from the camera (< 45% of the closest hand's scale)
+    const valid = candidates.filter(c => c.scale >= 0.45 * maxScale);
     if (valid.length === 0) {
         return { hands: [], status: "aligning" };
     }
 
-    // Keep only hands in the central region (0.2 < x < 0.8) if available
-    const centerHands = valid.filter(c => c.inCenterRegion);
-    const pool = centerHands.length > 0 ? centerHands : valid;
+    const pool = [...valid];
 
-    // Pick hand closest to center
-    pool.sort((a, b) => a.distFromCenter - b.distFromCenter);
+    // Sort by CLOSEST TO CAMERA (largest hand scale = closest to lens), while preferring active raised hands over bottom resting hands
+    pool.sort((a, b) => {
+        const aRest = a.wrist.y >= 0.85 ? 1 : 0;
+        const bRest = b.wrist.y >= 0.85 ? 1 : 0;
+        if (aRest !== bRest) return aRest - bRest;
+        return b.scale - a.scale;
+    });
 
     const primary = pool[0];
 
@@ -356,7 +375,7 @@ function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
         };
     }
 
-    // Two or more hands: search for a valid pair belonging to the SAME primary user
+    // Two or more hands: pick the closest partner hand belonging to the SAME closest user (matching depth/scale)
     let pairedSecond = null;
     for (let j = 1; j < pool.length; j++) {
         const cand = pool[j];
@@ -365,7 +384,10 @@ function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
         const dx = Math.abs(primary.wrist.x - cand.wrist.x);
         const wristDist = Math.hypot(primary.wrist.x - cand.wrist.x, primary.wrist.y - cand.wrist.y);
 
-        if (dy >= 0.40 || dx >= 0.65) continue;
+        if (cand.scale < 0.50 * primary.scale) continue; // Reject background person's hand
+        if (dy >= 0.42 || dx >= 0.68) continue;
+        // Reject pairing a raised active signing hand with a passive resting hand at the bottom of the frame
+        if ((primary.wrist.y < 0.72 && cand.wrist.y >= 0.85) || (cand.wrist.y < 0.72 && primary.wrist.y >= 0.85)) continue;
         if ((primary.wrist.x < 0.15 && cand.wrist.x > 0.85) || (cand.wrist.x < 0.15 && primary.wrist.x > 0.85)) continue;
         if (wristDist < 0.04) continue; // Only discard exact identical duplicate detections
 
@@ -451,7 +473,7 @@ function showToast(message, type = "info", duration = 3500) {
 
     const toast = document.createElement("div");
     toast.className = `toast ${type}`;
-    
+
     // Icon mapping
     const icons = {
         info: "ℹ️",
@@ -629,6 +651,91 @@ const landmarkEMASmoother = new LandmarkEMASmoother(0.65);
 let predictSequenceId = 0;
 let lastHandledSequenceId = 0;
 
+// ── Client-Side 25-Frame Rolling Sequence Buffer & Unified 3-MLP Cooperative Mode ──
+const DYNAMIC_SEQ_LEN = 25;
+let clientSequenceBuffer = [];
+let clientMotionSpeed = 0.0;
+let clientPrevWristPos = null;
+let clientPrevWristTime = 0;
+let currentGestureRoutingMode = "auto";
+try { localStorage.removeItem("aslo_gesture_routing_mode"); } catch (_) {}
+
+function setGestureRoutingMode(mode) {
+    currentGestureRoutingMode = "auto";
+}
+
+function updateClientRollingSequence(landmarks, timestamp = performance.now()) {
+    if (!landmarks || landmarks.length < 21) {
+        clientSequenceBuffer = [];
+        clientMotionSpeed = 0.0;
+        clientPrevWristPos = null;
+        return;
+    }
+
+    // Throttle to ~26 FPS (every 35ms) so 25 frames always span ~0.95s of smooth trajectory motion
+    if (clientPrevWristTime > 0 && (timestamp - clientPrevWristTime) < 35 && clientSequenceBuffer.length >= 2) {
+        return;
+    }
+
+    const framePts = toLandmarkArray(landmarks);
+    clientSequenceBuffer.push(framePts);
+    if (clientSequenceBuffer.length > DYNAMIC_SEQ_LEN) {
+        clientSequenceBuffer.shift();
+    }
+
+    const w0 = framePts[0];
+    const m9 = framePts[9];
+    const i8 = framePts[8];
+    const p20 = framePts[20];
+    const scale = Math.max(0.05, Math.hypot(w0[0] - m9[0], w0[1] - m9[1]));
+
+    if (clientPrevWristPos && clientSequenceBuffer.length >= 2) {
+        const prevFrame = clientSequenceBuffer[clientSequenceBuffer.length - 2];
+        const dw = Math.hypot(w0[0] - prevFrame[0][0], w0[1] - prevFrame[0][1]) / scale;
+        const di = Math.hypot(i8[0] - prevFrame[8][0], i8[1] - prevFrame[8][1]) / scale;
+        const dp = Math.hypot(p20[0] - prevFrame[20][0], p20[1] - prevFrame[20][1]) / scale;
+        const instSpeed = Math.max(dw, di * 0.7, dp * 0.7);
+        clientMotionSpeed = 0.6 * instSpeed + 0.4 * clientMotionSpeed;
+    } else {
+        clientMotionSpeed = 0.0;
+    }
+
+    clientPrevWristPos = { x: w0[0], y: w0[1] };
+    clientPrevWristTime = timestamp;
+}
+
+function updateModelTypeBadgeUI(gestureType, modelSource = "", specialistUsed = "") {
+    const badge = document.getElementById("model-type-badge");
+    if (!badge) return;
+    const gType = String(gestureType || "").toLowerCase();
+    const spec = String(specialistUsed || "").trim();
+    if (gType === "dynamic") {
+        badge.textContent = "DYNAMIC";
+        badge.style.background = "rgba(245, 158, 11, 0.22)";
+        badge.style.color = "#fbbf24";
+        badge.style.borderColor = "rgba(245, 158, 11, 0.5)";
+    } else if (gType === "static_words") {
+        badge.textContent = "WORD";
+        badge.style.background = "rgba(168, 85, 247, 0.22)";
+        badge.style.color = "#c084fc";
+        badge.style.borderColor = "rgba(168, 85, 247, 0.5)";
+    } else if (gType === "static_asl") {
+        if (spec && spec !== "None" && spec !== "ASL Router") {
+            badge.textContent = `ASL • ${spec}`;
+        } else {
+            badge.textContent = modelSource.includes("fist") ? "ASL • Fist Specialist" : "ASL";
+        }
+        badge.style.background = "rgba(16, 185, 129, 0.22)";
+        badge.style.color = "#34d399";
+        badge.style.borderColor = "rgba(16, 185, 129, 0.5)";
+    } else {
+        badge.textContent = currentGestureRoutingMode.toUpperCase();
+        badge.style.background = "rgba(56, 189, 248, 0.18)";
+        badge.style.color = "#38bdf8";
+        badge.style.borderColor = "rgba(56, 189, 248, 0.4)";
+    }
+}
+
 /**
  * Persistent Spatial Hand Tracker
  * Resolves hands by spatial continuity (wrist Euclidean proximity) rather than noisy handedness classification.
@@ -802,9 +909,9 @@ class SpatialHandTracker {
             if (t0HasPrev && t1HasPrev) {
                 // Optimal 2x2 bipartite matching
                 const costNormal = Math.hypot(h0.wrist.x - this.tracks[0].prevWrist.x, h0.wrist.y - this.tracks[0].prevWrist.y) +
-                                   Math.hypot(h1.wrist.x - this.tracks[1].prevWrist.x, h1.wrist.y - this.tracks[1].prevWrist.y);
+                    Math.hypot(h1.wrist.x - this.tracks[1].prevWrist.x, h1.wrist.y - this.tracks[1].prevWrist.y);
                 const costSwap = Math.hypot(h1.wrist.x - this.tracks[0].prevWrist.x, h1.wrist.y - this.tracks[0].prevWrist.y) +
-                                 Math.hypot(h0.wrist.x - this.tracks[1].prevWrist.x, h0.wrist.y - this.tracks[1].prevWrist.y);
+                    Math.hypot(h0.wrist.x - this.tracks[1].prevWrist.x, h0.wrist.y - this.tracks[1].prevWrist.y);
                 if (costSwap < costNormal) {
                     pair0 = h1;
                     pair1 = h0;
@@ -880,15 +987,15 @@ class JTrajectoryTracker {
         const m9 = landmarks[9];
         const scale = Math.hypot(w0.x - m9.x, w0.y - m9.y) + 1e-6;
 
-        const pinkyUp = (p20.y < p18.y) && (p20.y < p17.y - 0.03 * scale);
+        const pinkyUp = (p20.y < p18.y) && (p20.y < p17.y - 0.02 * scale);
         const fingersCurled = (landmarks[8].y > landmarks[6].y - 0.03) &&
-                              (landmarks[12].y > landmarks[10].y - 0.03) &&
-                              (landmarks[16].y > landmarks[14].y - 0.03);
+            (landmarks[12].y > landmarks[10].y - 0.03) &&
+            (landmarks[16].y > landmarks[14].y - 0.03);
 
         const d45 = Math.hypot(landmarks[4].x - landmarks[5].x, landmarks[4].y - landmarks[5].y);
-        const flareRatio = d45 / scale;
+        const thumbFlare = d45 / scale;
 
-        return pinkyUp && (flareRatio < 0.38 || fingersCurled);
+        return pinkyUp && (thumbFlare < 0.35 || (thumbFlare < 0.38 && fingersCurled));
     }
 
     update(landmarks, timestamp = performance.now()) {
@@ -910,7 +1017,8 @@ class JTrajectoryTracker {
             isI: isI
         });
 
-        if (this.buffer.length > 25) {
+        // 20-frame FIFO sliding buffer
+        if (this.buffer.length > 20) {
             this.buffer.shift();
         }
 
@@ -926,7 +1034,7 @@ class JTrajectoryTracker {
 
         const recentI = this.buffer.slice(-6).some(b => b.isI);
         if (this.state === "IDLE") {
-            if (recentI && vy > 0.12 && (now - this.lastTriggerTime > 1200)) {
+            if (recentI && vy > 0.10 && (now - this.lastTriggerTime > 1000)) {
                 this.state = "SWOOPING";
                 this.startTime = now;
                 this.isMoving = true;
@@ -935,21 +1043,21 @@ class JTrajectoryTracker {
 
         if (this.state === "SWOOPING") {
             const duration = now - this.startTime;
-            if (duration > 1100) {
+            if (duration > 1000) {
                 this.reset();
                 return { state: "IDLE", committed: false, suppressStatic: false };
             }
 
             const motionFrames = this.buffer.filter(b => b.t >= this.startTime - 120);
-            if (motionFrames.length >= 7 && duration >= 300) {
+            if (motionFrames.length >= 6 && duration >= 350 && duration <= 1000) {
                 const minY = Math.min(...motionFrames.map(b => b.y));
                 const maxY = Math.max(...motionFrames.map(b => b.y));
                 const lastY = motionFrames[motionFrames.length - 1].y;
 
                 const downwardTravel = maxY - minY;
-                const upwardRecovery = maxY - lastY;
+                const upwardRecovery = maxY - lastY; // Delta y < 0 (curving back upward)
 
-                if (downwardTravel >= 0.045 && upwardRecovery >= 0.02) {
+                if (downwardTravel >= 0.040 && upwardRecovery >= 0.018) {
                     this.lastTriggerTime = now;
                     this.reset();
                     return { state: "COMMITTED", committed: true, suppressStatic: true, gesture: "J", confidence: 1.0 };
@@ -1054,7 +1162,7 @@ async function enumerateCameras() {
 let mpHands = null;
 let mpCamera = null;
 let lastPredictTime = 0;
-const PREDICT_INTERVAL_MS = 70; // 12-15 Hz (every ~70 ms)
+const PREDICT_INTERVAL_MS = 45; // ~22 Hz fast stream for ultra-low latency (every 45ms)
 let currentMinDetectionConfidence = 0.55;
 let droppedHandFramesCount = 0;
 
@@ -1073,7 +1181,7 @@ function initClientMediaPipe() {
         // Decoupled Dual-Threshold Confidence:
         // Detection 0.55 / Tracking 0.65 for adverse angle & low-light stability
         mpHands.setOptions({
-            maxNumHands: 2,
+            maxNumHands: 4,
             modelComplexity: 1,
             minDetectionConfidence: 0.55,
             minTrackingConfidence: 0.65
@@ -1134,8 +1242,17 @@ function initClientMediaPipe() {
                 currentStabilizedHands = stabilizedList;
             }
 
-            // Trajectory-Based State Machine for Dynamic "J"
+            // Continuously record 25-frame trajectory at ~26 FPS directly from MediaPipe onResults
+            // so dynamic gestures (How are you, Nice to meet you, J, Z) are captured smoothly regardless of network latency
             const now = performance.now();
+            if (currentStabilizedHands.length > 0) {
+                const rightStab = currentStabilizedHands.find(s => s.label === "Right") || currentStabilizedHands[0];
+                if (rightStab && rightStab.landmarks) {
+                    updateClientRollingSequence(rightStab.landmarks, now);
+                }
+            }
+
+            // Trajectory-Based State Machine for Dynamic "J"
             if (currentStabilizedHands.length === 1 && isolation.hands.length === 1 && isolation.hands[0].physicalHand === "Right") {
                 const jResult = jTrajectoryTracker.update(currentStabilizedHands[0].landmarks, now);
                 if (jResult.committed) {
@@ -1266,10 +1383,17 @@ async function sendLandmarksInference(results, stabilizedHands = [], precomputed
 
     const numHands = isolation.hands.length;
 
-    // Case 0: 0 hands detected -> idle / standby (cleanly reset filter state)
+    // Case 0: 0 hands detected -> idle / standby (cleanly reset filter & repeat-sign state)
     if (numHands === 0) {
         landmarkStabilizer.resetAll();
         landmarkEMASmoother.reset();
+        clientSequenceBuffer = [];
+        clientMotionSpeed = 0.0;
+        activeSign = null;
+        candidateSign = null;
+        candidateCount = 0;
+        confirmationBuffer = [];
+        clientLastWord = "";
         updateHandStatusUI("none");
         updatePipelineStatusUI("Detecting...");
         return;
@@ -1309,12 +1433,17 @@ async function sendLandmarksInference(results, stabilizedHands = [], precomputed
                 ? stabilizedHands[0].landmarks
                 : landmarkStabilizer.filterHand("Right", rawLandmarks);
             const emaSmoothed = landmarkEMASmoother.smooth("Right", smoothedOneEuro);
+            updateClientRollingSequence(emaSmoothed);
             const landmarks = toLandmarkArray(emaSmoothed);
+            const includeSeq = (clientSequenceBuffer.length >= 4);
 
             const payload = {
                 hand_type: "right",
                 handedness: "Right",
                 landmarks: landmarks,
+                sequence_buffer: includeSeq ? clientSequenceBuffer : [],
+                motion_speed: Number(clientMotionSpeed.toFixed(4)),
+                mode: currentGestureRoutingMode,
                 is_mirrored: isMirrored,
                 seq_id: currentSeq
             };
@@ -1342,14 +1471,19 @@ async function sendLandmarksInference(results, stabilizedHands = [], precomputed
             const rHandObj = (h0.physicalHand === "Right") ? h0 : h1;
             const lHandObj = (h0.physicalHand === "Left") ? h0 : h1;
 
-            const rSmoothedOneEuro = landmarkStabilizer.filterHand("Right", rHandObj.rawLandmarks);
-            const lSmoothedOneEuro = landmarkStabilizer.filterHand("Left", lHandObj.rawLandmarks);
+            // Reuse stabilizedHands from landmarkStabilizer.process() to prevent track-swapping velocity spikes
+            const stabRight = stabilizedHands && stabilizedHands.find(s => s.label === "Right");
+            const stabLeft = stabilizedHands && stabilizedHands.find(s => s.label === "Left");
+            const rSmoothedOneEuro = stabRight ? stabRight.landmarks : rHandObj.rawLandmarks;
+            const lSmoothedOneEuro = stabLeft ? stabLeft.landmarks : lHandObj.rawLandmarks;
 
             const rEma = landmarkEMASmoother.smooth("Right", rSmoothedOneEuro);
             const lEma = landmarkEMASmoother.smooth("Left", lSmoothedOneEuro);
+            updateClientRollingSequence(rEma);
 
             const rPts = toLandmarkArray(rEma);
             const lPts = toLandmarkArray(lEma);
+            const includeSeq = (clientSequenceBuffer.length >= 4);
 
             const handsList = [
                 { label: "Right", points: rPts },
@@ -1362,6 +1496,9 @@ async function sendLandmarksInference(results, stabilizedHands = [], precomputed
                 landmarks: rPts,
                 hands: handsList,
                 all_hands: handsList,
+                sequence_buffer: includeSeq ? clientSequenceBuffer : [],
+                motion_speed: Number(clientMotionSpeed.toFixed(4)),
+                mode: currentGestureRoutingMode,
                 is_mirrored: isMirrored,
                 seq_id: currentSeq
             };
@@ -1432,7 +1569,7 @@ async function startClientWebcam(deviceId = null) {
         if (!videoElement) return;
 
         if (mpCamera) {
-            try { await mpCamera.stop(); } catch (e) {}
+            try { await mpCamera.stop(); } catch (e) { }
             mpCamera = null;
         }
         if (webcamStream) {
@@ -1499,7 +1636,7 @@ async function startClientWebcam(deviceId = null) {
                 } else {
                     videoEl.style.filter = "none";
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // Mutex guard prevents concurrent mpHands.send calls from corrupting MediaPipe WASM memory
@@ -1820,7 +1957,7 @@ async function startVoiceRecording() {
 
         micSource.connect(analyserNode);
         analyserNode.connect(scriptProcessorNode);
-        
+
         // Prevent microphone audio from playing back through user speakers (anti-feedback)
         const silentGain = audioCtx.createGain();
         silentGain.gain.value = 0;
@@ -1871,7 +2008,7 @@ async function stopVoiceRecording() {
     }
 
     if (recognition) {
-        try { recognition.stop(); } catch (e) {}
+        try { recognition.stop(); } catch (e) { }
     }
 
     if (visualizerAnimId) {
@@ -1890,7 +2027,7 @@ async function stopVoiceRecording() {
 
     const inputSampleRate = audioCtx ? audioCtx.sampleRate : 44100;
     if (audioCtx && audioCtx.state !== 'closed') {
-        try { await audioCtx.close(); } catch (e) {}
+        try { await audioCtx.close(); } catch (e) { }
     }
 
     // Process recorded audio PCM chunks
@@ -1928,32 +2065,32 @@ async function stopVoiceRecording() {
         method: "POST",
         body: formData
     })
-    .then(r => r.json())
-    .then(data => {
-        if (data.ok && data.text) {
-            const transcript = data.text;
-            if (dom.sttLivePreview) {
-                dom.sttLivePreview.textContent = `Transcribed: "${transcript}"`;
-            }
-            addDialogueMessage("voice", transcript);
-            showToast(`Voice transcribed: "${transcript}"`, "success");
+        .then(r => r.json())
+        .then(data => {
+            if (data.ok && data.text) {
+                const transcript = data.text;
+                if (dom.sttLivePreview) {
+                    dom.sttLivePreview.textContent = `Transcribed: "${transcript}"`;
+                }
+                addDialogueMessage("voice", transcript);
+                showToast(`Voice transcribed: "${transcript}"`, "success");
 
-            appendVoiceTranscript(transcript);
-        } else {
-            const err = data.error || "Could not transcribe audio.";
-            if (dom.sttLivePreview) {
-                dom.sttLivePreview.textContent = err;
+                appendVoiceTranscript(transcript);
+            } else {
+                const err = data.error || "Could not transcribe audio.";
+                if (dom.sttLivePreview) {
+                    dom.sttLivePreview.textContent = err;
+                }
+                showToast(err, "warning");
             }
-            showToast(err, "warning");
-        }
-        stopVoiceRecordingLocally();
-    })
-    .catch(err => {
-        console.error("Transcription request failed:", err);
-        if (dom.sttLivePreview) dom.sttLivePreview.textContent = "Transcription connection error.";
-        showToast("Error communicating with transcription server", "error");
-        stopVoiceRecordingLocally();
-    });
+            stopVoiceRecordingLocally();
+        })
+        .catch(err => {
+            console.error("Transcription request failed:", err);
+            if (dom.sttLivePreview) dom.sttLivePreview.textContent = "Transcription connection error.";
+            showToast("Error communicating with transcription server", "error");
+            stopVoiceRecordingLocally();
+        });
 }
 
 function toggleVoiceRecording() {
@@ -2226,21 +2363,11 @@ function appendSignToClientSentence(sign) {
     const cleanUpper = clean.toUpperCase();
     const now = Date.now();
 
-    // Prevent duplicate consecutive multi-word phrases (e.g. "HOW ARE YOU HOW ARE YOU")
+    // Prevent duplicate consecutive multi-word phrases within 1.4s cooldown
     const isDynamicPhrase = cleanUpper.includes(" ") || cleanUpper === "HOW ARE YOU" || cleanUpper === "NICE TO MEET YOU";
     if (isDynamicPhrase) {
-        // Time-based lock: reject identical dynamic phrase if committed within last 4 seconds
-        if (cleanUpper === clientLastDynamicCommitted.gesture && (now - clientLastDynamicCommitted.time < 4000)) {
+        if (cleanUpper === clientLastDynamicCommitted.gesture && (now - clientLastDynamicCommitted.time < 1400)) {
             return;
-        }
-        // Sentence token check: reject if sentence already ends with this phrase
-        const tokens = trimmedUpper.split(/\s+/).filter(Boolean);
-        const cleanTokens = cleanUpper.split(/\s+/).filter(Boolean);
-        if (tokens.length >= cleanTokens.length) {
-            const lastNTokens = tokens.slice(-cleanTokens.length).join(" ");
-            if (lastNTokens === cleanTokens.join(" ")) {
-                return;
-            }
         }
         clientLastDynamicCommitted = { gesture: cleanUpper, time: now };
     }
@@ -2453,33 +2580,33 @@ function submitCorrection(customLabel = null) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ label: label })
     })
-    .then(r => r.json())
-    .then(data => {
-        if (data.ok) {
-            if (dom.correctStatus) {
-                dom.correctStatus.textContent = data.message;
-                dom.correctStatus.style.color = "var(--emerald)";
+        .then(r => r.json())
+        .then(data => {
+            if (data.ok) {
+                if (dom.correctStatus) {
+                    dom.correctStatus.textContent = data.message;
+                    dom.correctStatus.style.color = "var(--emerald)";
+                }
+                if (dom.correctInput) dom.correctInput.value = "";
+                showToast(data.message, "success", 4500);
+            } else {
+                if (dom.correctStatus) {
+                    dom.correctStatus.textContent = "Error: " + data.message;
+                    dom.correctStatus.style.color = "var(--ruby)";
+                }
+                showToast(data.message, "error", 4000);
             }
-            if (dom.correctInput) dom.correctInput.value = "";
-            showToast(data.message, "success", 4500);
-        } else {
+            setTimeout(() => {
+                if (dom.correctStatus) dom.correctStatus.style.display = "none";
+            }, 6000);
+        })
+        .catch(e => {
             if (dom.correctStatus) {
-                dom.correctStatus.textContent = "Error: " + data.message;
+                dom.correctStatus.textContent = "Request failed.";
                 dom.correctStatus.style.color = "var(--ruby)";
             }
-            showToast(data.message, "error", 4000);
-        }
-        setTimeout(() => {
-            if (dom.correctStatus) dom.correctStatus.style.display = "none";
-        }, 6000);
-    })
-    .catch(e => {
-        if (dom.correctStatus) {
-            dom.correctStatus.textContent = "Request failed.";
-            dom.correctStatus.style.color = "var(--ruby)";
-        }
-        showToast("Failed to connect to training worker", "error");
-    });
+            showToast("Failed to connect to training worker", "error");
+        });
 }
 
 function quickTeach(label) {
@@ -3082,15 +3209,15 @@ function setDominantHand(hand) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ hand: hand })
     })
-    .then(r => r.json())
-    .then(data => {
-        if (data.ok) {
-            updateDominantHandUI(data.dominant_hand);
-            const handNames = { right: "Right Hand (Default)", left: "Left Hand", auto: "Auto Detection" };
-            showToast(`Dominant hand set to ${handNames[data.dominant_hand] || data.dominant_hand}`, "info");
-        }
-    })
-    .catch(e => console.error("Error setting dominant hand:", e));
+        .then(r => r.json())
+        .then(data => {
+            if (data.ok) {
+                updateDominantHandUI(data.dominant_hand);
+                const handNames = { right: "Right Hand (Default)", left: "Left Hand", auto: "Auto Detection" };
+                showToast(`Dominant hand set to ${handNames[data.dominant_hand] || data.dominant_hand}`, "info");
+            }
+        })
+        .catch(e => console.error("Error setting dominant hand:", e));
 }
 
 function updateDominantHandUI(hand) {
@@ -3117,7 +3244,9 @@ function applyTelemetry(data) {
         setStatusBadge(data.status || "running", active ? "Recording" : "Standby");
     }
 
-    // Sync dominant hand UI
+    if (data.gesture_type || data.model_source || data.specialist_used) {
+        updateModelTypeBadgeUI(data.gesture_type, data.model_source, data.specialist_used);
+    }
     if (data.dominant_hand) {
         updateDominantHandUI(data.dominant_hand);
     }
@@ -3126,10 +3255,10 @@ function applyTelemetry(data) {
     const detectedHand = data.detected_hand || "none";
     const handMap = {
         right: { label: "✋ Hand: RIGHT", cls: "hand-right", hud: "✋ RIGHT HAND" },
-        left:  { label: "🤚 Hand: LEFT (IGNORED)", cls: "hand-warning", hud: "🤚 LEFT HAND (UNSUPPORTED)" },
+        left: { label: "🤚 Hand: LEFT (IGNORED)", cls: "hand-warning", hud: "🤚 LEFT HAND (UNSUPPORTED)" },
         left_ignored: { label: "🤚 Hand: LEFT (IGNORED)", cls: "hand-warning", hud: "🤚 LEFT HAND (UNSUPPORTED)" },
-        both:  { label: "🙌 Hand: BOTH", cls: "hand-both", hud: "🙌 BOTH HANDS" },
-        none:  { label: "Standby", cls: "hand-none", hud: "STANDBY" }
+        both: { label: "🙌 Hand: BOTH", cls: "hand-both", hud: "🙌 BOTH HANDS" },
+        none: { label: "Standby", cls: "hand-none", hud: "STANDBY" }
     };
     const hCfg = handMap[detectedHand] || handMap.none;
     const handBadge = document.getElementById("hand-badge");
@@ -3213,11 +3342,7 @@ function applyTelemetry(data) {
     if (CONTROL_SET.has(rawPredUpper) || CONTROL_SET.has(cleanPredUpper)) {
         const ctrl = CONTROL_SET.has(rawPredUpper) ? rawPredUpper : cleanPredUpper;
         const normCtrl = (ctrl === "BACK SPACE") ? "BACKSPACE" : ctrl;
-        if (TWO_HAND_REQUIRED.has(normCtrl) && data.detected_hand !== "both") {
-            displayGesture = "—";
-        } else {
-            displayGesture = normCtrl;
-        }
+        displayGesture = normCtrl;
     } else if (clientDynamicGesture) {
         displayGesture = `${clientDynamicGesture} (IN MOTION)`;
     } else if (rawPredUpper.endsWith("_END") || rawPredUpper.endsWith("_START") || DYNAMIC_GESTURES.has(cleanPredUpper)) {
@@ -3298,7 +3423,7 @@ function applyTelemetry(data) {
                     statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
                 }
                 clientStabilityBuffer = [];
-                renderStability(0, STABILITY_REQUIRED_COUNT, false);
+                renderStability(0, 5, false);
                 return;
             }
         } else {
@@ -3333,22 +3458,32 @@ function applyTelemetry(data) {
             const completedGesture = clientDynamicGesture;
             clientDynamicGesture = null;
             clientDynamicNeutralStart = 0;
-            clientDynamicCooldownUntil = now + REPEAT_DELAY_MS;
-            clientSuppressYouUntil = now + REPEAT_DELAY_MS;
+            clientDynamicCooldownUntil = now + 1000;
+            clientSuppressYouUntil = now + 1800;
+            activeSign = completedGesture;
+            lastConfirmedGesture = completedGesture;
+            confirmedGestureTime = performance.now();
+            lockUntil = now + 1100;
             clientLastWord = completedGesture;
             clientLastTriggerTime = now;
             if (dynBanner) dynBanner.style.display = "none";
             if (dynTelemetryRow) dynTelemetryRow.style.display = "none";
+            if (dom.gestureLabel) dom.gestureLabel.textContent = completedGesture;
+            const currentSignEl = document.getElementById("current-sign");
+            if (currentSignEl && currentSignEl !== dom.gestureLabel) {
+                currentSignEl.textContent = completedGesture;
+            }
             if (statePill) {
                 statePill.textContent = isGestureRecordingActive ? "RECORDING" : "STANDBY";
                 statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
             }
             if (isGestureRecordingActive) {
                 appendSignToClientSentence(completedGesture);
-                showToast(`Dynamic Sign: ${completedGesture}`, "success");
             }
+            addRecentSign(completedGesture);
+            showToast(`Dynamic Sign: ${completedGesture}`, "success");
             clientStabilityBuffer = [];
-            renderStability(0, STABILITY_REQUIRED_COUNT, false);
+            renderStability(5, 5, true);
             return;
         }
 
@@ -3363,7 +3498,7 @@ function applyTelemetry(data) {
                 statePill.className = "state-pill " + (isGestureRecordingActive ? "active" : "standby");
             }
             clientStabilityBuffer = [];
-            renderStability(0, STABILITY_REQUIRED_COUNT, false);
+            renderStability(0, 5, false);
             return;
         }
         return;
@@ -3402,7 +3537,7 @@ function applyTelemetry(data) {
     if (rawPredUpper.endsWith("_END") || rawPredUpper.endsWith("_START") || DYNAMIC_GESTURES.has(cleanPredUpper)) {
         predictionWindow.push("FRAGMENT");
         if (predictionWindow.length > PREDICTION_WINDOW_MAX) predictionWindow.shift();
-        renderStability(0, Math.ceil(predictionWindow.length * MAJORITY_VOTE_RATIO), false);
+        renderStability(0, 5, false);
         return;
     }
 
@@ -3418,13 +3553,12 @@ function applyTelemetry(data) {
 
     if (isNeutralOrIdle) {
         hasPassedThroughNeutral = true;
-        if (now >= lockUntil) {
-            activeSign = null;
-            candidateSign = null;
-            candidateCount = 0;
-            confirmationBuffer = [];
-            renderStability(0, CONFIRM_WIN_COUNT, false);
-        }
+        activeSign = null;
+        candidateSign = null;
+        candidateCount = 0;
+        confirmationBuffer = [];
+        clientLastWord = "";
+        renderStability(0, 5, false);
         if (clientDynamicGesture) {
             clientDynamicGesture = null;
             if (dynBanner) dynBanner.style.display = "none";
@@ -3457,14 +3591,10 @@ function applyTelemetry(data) {
         return;
     }
 
-    const FIST_SIGNS = new Set(["A", "S", "T", "N", "M", "E"]);
     const candUpper = (cleanPred || "").toUpperCase().trim();
     const predUpper = (data.prediction || "").toUpperCase().trim();
-    const isFistDisambiguationSwap = (
-        FIST_SIGNS.has(activeSign) && (FIST_SIGNS.has(candUpper) || FIST_SIGNS.has(predUpper))
-    );
 
-    if (now < lockUntil && activeSign !== null && !isFistDisambiguationSwap) {
+    if (now < lockUntil && activeSign !== null) {
         // Cooldown lockout: maintain current sign without volatile interim swapping
         if (dom.gestureLabel) dom.gestureLabel.textContent = activeSign;
         const currentSignEl = document.getElementById("current-sign");
@@ -3476,7 +3606,7 @@ function applyTelemetry(data) {
         handlePrediction(cleanPred, confVal, data.status);
         const displayWord = (activeSign !== null)
             ? activeSign
-            : ((lastConfirmedGesture && lastConfirmedGesture !== "—") ? lastConfirmedGesture : (cleanPred || "—"));
+            : (cleanPred || lastConfirmedGesture || "—");
         if (dom.gestureLabel) dom.gestureLabel.textContent = displayWord;
         const currentSignEl = document.getElementById("current-sign");
         if (currentSignEl && currentSignEl !== dom.gestureLabel) {
@@ -3499,7 +3629,7 @@ function commitSignToUI(sign) {
     lastConfirmedGesture = sign;
     confirmedGestureTime = performance.now();
     updatePipelineStatusUI("Stable");
-    renderStability(CONFIRM_WIN_COUNT, CONFIRM_WIN_COUNT, true);
+    renderStability(5, 5, true);
 
     const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "J", "Z"]);
     if (upper === "NEUTRAL" || upper === "IDLE") {
@@ -3565,14 +3695,14 @@ function handlePrediction(predictedLabel, confidence, status = "ok") {
     const now = Date.now();
     if (!predictedLabel || confidence < 0.50 || status === "ambiguous") return;
 
-    // 4-frame confirmation buffer:
-    // Push new inference label into the sliding window of size 4
+    // 6-frame confirmation buffer:
+    // Push new inference label into the sliding window of size 6
     confirmationBuffer.push(predictedLabel);
     if (confirmationBuffer.length > CONFIRM_BUFFER_SIZE) {
         confirmationBuffer.shift();
     }
 
-    // A gesture must win at least 3 out of 4 consecutive inference frames to become the active candidate
+    // A gesture must win at least 5 out of 6 consecutive inference frames to become the active candidate
     const counts = {};
     let winningCandidate = null;
     let maxWins = 0;
@@ -3586,26 +3716,29 @@ function handlePrediction(predictedLabel, confidence, status = "ok") {
         }
     }
 
-    renderStability(maxWins, CONFIRM_WIN_COUNT, !!winningCandidate);
+    // Scale progress across 5 visual HUD segments (0/5, 2/5, 4/5, 5/5):
+    const scaledFill = Math.min(5, Math.round((maxWins / CONFIRM_WIN_COUNT) * 5));
+    renderStability(scaledFill, 5, !!winningCandidate);
 
     if (!winningCandidate) {
-        return; // Did not meet 3-of-4 confirmation threshold yet
+        return; // Did not meet 5-of-6 confirmation threshold yet
     }
 
-    // 350ms hysteresis lock:
-    // Once a gesture commits to the UI, lock it from being replaced by an adjacent similar sign
-    // unless the new sign is held consistently past the lock duration (or it's a disambiguation tie-breaker)
-    const FIST_SIGNS = new Set(["A", "S", "T", "N", "M", "E"]);
-    const isFistDisambiguationSwap = (
-        FIST_SIGNS.has(activeSign) && FIST_SIGNS.has(winningCandidate)
-    );
-
+    // Allow repeating the exact same gesture (e.g., "U" -> "UU", "L" -> "LL", "BACKSPACE"):
+    // 1) Immediately after brief neutral/hand-drop (since activeSign is reset to null), OR
+    // 2) By holding the same gesture steadily past SAME_SIGN_REPEAT_MS (1100ms).
+    const SAME_SIGN_REPEAT_MS = 1100;
+    const candUp = (winningCandidate || "").toUpperCase().trim();
     if (activeSign !== null) {
         if (winningCandidate === activeSign) {
-            return;
-        }
-        if (now < lockUntil && !isFistDisambiguationSwap) {
-            // Locked: suppress rapid swap
+            const isStartStop = (candUp === "START" || candUp === "STOP");
+            if (isStartStop || (now - clientLastTriggerTime < SAME_SIGN_REPEAT_MS)) {
+                return;
+            }
+            // Repeat commit triggered: reset confirmation buffer so the next repeat requires a fresh confirmation window
+            confirmationBuffer = [];
+        } else if (now < lockUntil) {
+            // Locked: suppress rapid swap to a different sign
             return;
         }
     }
@@ -3642,7 +3775,7 @@ function stopServer() {
         dom.stopBtn.textContent = "Shutting down…";
     }
 
-    fetch(`${API_BASE_URL}/shutdown`, { method: "POST" }).catch(() => {});
+    fetch(`${API_BASE_URL}/shutdown`, { method: "POST" }).catch(() => { });
 
     if (pollTimer) clearInterval(pollTimer);
     if (dom.cameraFeed) dom.cameraFeed.src = "";

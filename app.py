@@ -12,23 +12,23 @@ import time
 import traceback
 
 import cv2
-from flask import Flask, Response, jsonify, render_template, request, make_response
+from flask import Flask, Response, jsonify, make_response, render_template, request
 try:
     from flask_cors import CORS
 except ImportError:
     CORS = None
 
-from keras import models
-import mediapipe as mp
 import numpy as np
 import tensorflow as tf
 
 import aslo_features
 from aslo_pipeline import (
+    ASLOEnsembleRouter,
     KeypointInterpolator,
     LowLightEnhancer,
     MotionBasedRouter,
     SoftmaxMarginVerifier,
+    StatelessHierarchicalMLPRouter,
     TimerDynamicGestureManager,
 )
 from speech_to_text import SUPPORTED_LANGUAGES, engine as stt_engine
@@ -38,60 +38,28 @@ if CORS is not None:
     CORS(app, resources={r"/*": {"origins": "*"}})
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
+
 @app.route("/ping", methods=["GET"])
 def ping():
     return jsonify({"status": "online", "engine": "local"}), 200
 
-dynamic_state_machine = aslo_features.MultiStageDynamicGestureStateMachine()
-FIST_CLUSTER = {"A", "S", "T", "E", "M", "N"}
 
-model_path = "gesture_model.keras"
-labels_path = "label_classes.npy"
-
-model = None
-label_classes = None
-
-if os.path.exists(model_path) and os.path.exists(labels_path):
-    print("Loading model and labels...")
-    model = models.load_model(model_path)
-    label_classes = np.load(labels_path, allow_pickle=True)
-    print(f"Loaded {len(label_classes)} classes.")
-else:
-    print("Warning: gesture_model.keras or label_classes.npy not found.")
-    print("Please run collect_data.py and train_model.py first.")
-
-@tf.function(reduce_retracing=True)
-def fast_predict(x):
-    return model(x, training=False)
-
-if model is not None:
-    try:
-        fast_predict(tf.zeros((1, aslo_features.FEATURE_LEN), dtype=tf.float32))
-        fast_predict(tf.zeros((3, aslo_features.FEATURE_LEN), dtype=tf.float32))
-    except Exception as _e:
-        print(f"Inference graph warmup note: {_e}")
-
-# Server-side MediaPipe Hands is disabled: Hand tracking is now executed
-# zero-latency in the client browser, transmitting only 21 landmark coordinates.
-hands = None
-
-# ── ASLO Pipeline Configurations ───────────────────────────────────────────
+# ── Stateless Cooperative Multi-MLP Ensemble Router ────────────────────────
+mlp_router = ASLOEnsembleRouter(models_dir="models")
 low_light_enhancer = LowLightEnhancer(base_clip_limit=2.5, tile_grid_size=(8, 8))
 margin_verifier = SoftmaxMarginVerifier(min_confidence=0.55, min_margin=0.10)
+
+FIST_CLUSTER = aslo_features.FIST_CLUSTER_SET
 N_FRAME = 5
 N_FRAMES = 5
 
 TWO_HANDED_LABELS = {
     "START", "STOP", "SPACE", "BACK SPACE", "BACKSPACE", "NEUTRAL",
     "FINE", "ME", "I LOVE YOU", "LOVE",
-    "HOW ARE YOU_START", "HOW ARE YOU_END",
-    "NICE TO MEET YOU_START", "NICE TO MEET YOU_END"
-}
-LEFT_HAND_ALLOWED_LABELS = {
-    "START", "STOP", "SPACE", "BACK SPACE", "BACKSPACE", "NEUTRAL"
+    "HOW ARE YOU", "HOW ARE YOU_START", "HOW ARE YOU_END",
+    "NICE TO MEET YOU", "NICE TO MEET YOU_START", "NICE TO MEET YOU_END"
 }
 
-latest_features = None
 is_retraining = False
 _inference_lock = threading.Lock()
 
@@ -104,19 +72,13 @@ if os.path.exists(DATASET_DIR):
             FOLDER_NAMES_MAP[fname.lower().strip()] = fname
             FOLDER_NAMES_MAP[fname.lower().replace(" ", "_").strip()] = fname
 
-NEUTRAL_INDEX = None
-if label_classes is not None:
-    classes_list = list(label_classes)
-    if "neutral" in classes_list:
-        NEUTRAL_INDEX = classes_list.index("neutral")
-
 
 def get_clean_folder_label(label: str):
     if not label or label in ("—", "none", "NONE"):
         return None
-    cleaned = re.sub(r'_(START|END)$', '', str(label), flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"_(START|END)$", "", str(label), flags=re.IGNORECASE).strip()
     key = cleaned.lower()
-    if key in ("dynamic_gesture", "dynamic gesture", "hand detected", "neutral", "tracked", "—", "hand_detected"):
+    if key in ("dynamic_gesture", "dynamic gesture", "hand detected", "neutral", "tracked", "—", "hand_detected", "fist_cluster"):
         return None
     if key in FOLDER_NAMES_MAP:
         return FOLDER_NAMES_MAP[key]
@@ -130,7 +92,7 @@ def get_clean_folder_label(label: str):
 
 
 def clean_display_label(label: str) -> str:
-    if not label or str(label).strip() in ("—", "none", "NONE", "IDLE"):
+    if not label or str(label).strip() in ("—", "none", "NONE", "IDLE", "FIST_CLUSTER"):
         return "—"
     lbl_strip = str(label).strip()
     lbl_upper = lbl_strip.upper()
@@ -142,7 +104,7 @@ def clean_display_label(label: str) -> str:
         if f_upper in ("START", "STOP", "SPACE", "BACKSPACE", "BACK SPACE", "NEUTRAL", "IDLE"):
             return "BACKSPACE" if "BACK" in f_upper else f_upper
         return folder
-    cleaned = re.sub(r'_(START|END)$', '', lbl_strip, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"_(START|END)$", "", lbl_strip, flags=re.IGNORECASE).strip()
     if cleaned.upper() in ("START", "STOP", "SPACE", "BACKSPACE", "BACK SPACE", "NEUTRAL", "IDLE"):
         return "BACKSPACE" if "BACK" in cleaned.upper() else cleaned.upper()
     return cleaned if cleaned else "—"
@@ -160,27 +122,47 @@ MOBILE_UA_KEYWORDS = (
 
 
 def is_mobile_request(req):
-    """Inspects User-Agent header to determine if requesting client is mobile."""
     ua = req.headers.get("User-Agent", "").lower()
     return any(k in ua for k in MOBILE_UA_KEYWORDS)
 
 
-def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, is_mirrored=True, hand_type=None):
+def process_landmarks_data(
+    landmarks_data,
+    handedness="Right",
+    all_hands=None,
+    is_mirrored=True,
+    hand_type=None,
+    sequence_buffer=None,
+    motion_speed=0.0,
+    mode="auto",
+):
     """
-    Core cloud inference engine. Purely stateless and multi-user isolated:
-    1. Zero-latency: uses client MediaPipe landmarks, saving 100% video bandwidth & decoding CPU
-    2. Enforces dataset validation: Single Left-hand gestures are rejected (dataset only has Right and Both hands)
-    3. Routes single Right-hand data to single-hand extractor, and Two-hand data to two-hand extractor
-    4. Evaluates static and dynamic ASL gestures using gesture_model.keras
-    5. Returns prediction strictly in the response body without mutating any shared server globals
+    100% Stateless Multi-MLP Hierarchical Inference Engine:
+    - Accepts:
+      {
+        "landmarks": [...],
+        "hands": [...],
+        "hand_type": "right"|"both",
+        "sequence_buffer": [...],
+        "motion_speed": float,
+        "mode": "auto"|"asl"|"words"|"dynamic"
+      }
+    - Routes strictly through `StatelessHierarchicalMLPRouter` across:
+      1. Model 1A (`asl_stage1_mlp.keras`) -> Model 1B (`asl_fist_specialist_mlp.keras` for FIST_CLUSTER)
+      2. Model 2 (`words_static_mlp.keras`)
+      3. Model 3 (`dynamic_mlp.keras` on 25-frame motion sequences)
     """
-    hands_detected = bool(landmarks_data and len(landmarks_data) >= 21)
+    if not mlp_router.is_ready:
+        mlp_router.load_all_models()
+
+    has_seq = bool(sequence_buffer and len(sequence_buffer) >= 4)
+    hands_detected = bool((landmarks_data and len(landmarks_data) >= 21) or (all_hands and len(all_hands) > 0) or has_seq)
 
     hand_type_clean = (hand_type or "").lower().strip()
     handedness_clean = (handedness or "").capitalize().strip()
+    mode_clean = (mode or "auto").lower().strip()
 
-    # Check if request contains only a Left hand:
-    # Dataset contains ONLY Right Hand and Both Hands gestures (no single Left hand gestures).
+    # Check if request contains only a Left hand
     is_left_only = False
     if hand_type_clean == "left":
         is_left_only = True
@@ -192,10 +174,19 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         if handedness_clean == "Left" and hand_type_clean != "right":
             is_left_only = True
 
+    if hands_detected and is_left_only and landmarks_data and len(landmarks_data) >= 1:
+        first_pt = landmarks_data[0]
+        wx = float(first_pt.get("x", 0.5)) if isinstance(first_pt, dict) else float(first_pt[0])
+        wy = float(first_pt.get("y", 0.5)) if isinstance(first_pt, dict) else float(first_pt[1])
+        if wx <= 0.55 and wy < 0.85:
+            is_left_only = False
+
     if hands_detected and is_left_only:
         return {
             "ok": True,
             "prediction": None,
+            "gesture_type": None,
+            "model_source": "none",
             "message": "Left-hand-only signs are not supported. Please use your right hand.",
             "detected_hand": "left_ignored",
             "live_gesture": "—",
@@ -206,13 +197,15 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             "left_conf": 0.0,
             "both_gesture": "—",
             "both_conf": 0.0,
-            "status": "running"
+            "status": "running",
         }
 
     if not hands_detected:
         return {
             "ok": True,
-            "prediction": "—",
+            "prediction": None,
+            "gesture_type": None,
+            "model_source": "none",
             "confidence": 0.0,
             "detected_hand": "none",
             "live_gesture": "—",
@@ -223,7 +216,7 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
             "left_conf": 0.0,
             "both_gesture": "—",
             "both_conf": 0.0,
-            "status": "running"
+            "status": "running",
         }
 
     def _to_mirrored(raw_pts):
@@ -239,292 +232,207 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
                 px = float(p[0])
                 py = float(p[1])
                 pz = float(p[2]) if len(p) > 2 else 0.0
+            if is_mirrored:
+                px = 1.0 - px
             pts.append([px, py, pz])
         return pts
 
-    pred_label = "—"
-    confidence = 0.0
-    detected_hand = "none"
-    right_live_gesture = "—"
-    right_live_conf = 0.0
-    left_live_gesture = "—"
-    left_live_conf = 0.0
-    both_live_gesture = "—"
-    both_live_conf = 0.0
+    def _mirror_sequence(seq_buf):
+        if not seq_buf:
+            return []
+        return [_to_mirrored(frame) for frame in seq_buf]
 
-    if model is None:
+    if not mlp_router.is_ready:
         return {
             "ok": True,
             "prediction": "HAND DETECTED",
+            "gesture_type": "static_asl",
+            "model_source": "fallback",
             "confidence": 1.0,
             "detected_hand": "right",
             "live_gesture": "HAND DETECTED",
             "live_conf": 1.0,
-            "status": "running"
+            "status": "running",
         }
 
+    # Resolve 1-hand vs 2-hand landmarks
     is_two_hand_inference = False
+    r_pts = []
+    l_pts = []
+    single_pts = []
+
     if all_hands and len(all_hands) >= 2:
-        h0_pts = _to_mirrored(all_hands[0].get("points", []))
-        h1_pts = _to_mirrored(all_hands[1].get("points", []))
+        h0_pts = _to_mirrored(all_hands[0].get("points") or all_hands[0].get("landmarks") or [])
+        h1_pts = _to_mirrored(all_hands[1].get("points") or all_hands[1].get("landmarks") or [])
         h0_lbl = (all_hands[0].get("label") or "").capitalize().strip()
         h1_lbl = (all_hands[1].get("label") or "").capitalize().strip()
 
-        # Genuine two-handed gestures strictly require one Right and one Left hand
         has_opposite_handedness = (h0_lbl == "Right" and h1_lbl == "Left") or (h0_lbl == "Left" and h1_lbl == "Right")
         d_wrists = 1.0
+        wy0 = float(h0_pts[0][1]) if (h0_pts and len(h0_pts) >= 1) else 0.5
+        wy1 = float(h1_pts[0][1]) if (h1_pts and len(h1_pts) >= 1) else 0.5
         if h0_pts and h1_pts and len(h0_pts) >= 1 and len(h1_pts) >= 1:
             w0 = np.array([h0_pts[0][0], h0_pts[0][1]])
             w1 = np.array([h1_pts[0][0], h1_pts[0][1]])
             d_wrists = float(np.linalg.norm(w0 - w1))
 
-        if d_wrists >= 0.04 and (has_opposite_handedness or (hand_type_clean == "both") or len(all_hands) == 2):
+        one_hand_resting = (wy0 >= 0.85 and wy1 < 0.72) or (wy1 >= 0.85 and wy0 < 0.72)
+
+        if d_wrists >= 0.04 and not one_hand_resting and (has_opposite_handedness or hand_type_clean == "both" or len(all_hands) == 2):
             is_two_hand_inference = True
-        else:
-            # Fall back to single hand: prioritize Right hand if detected
-            if h0_lbl == "Right":
-                landmarks_data = h0_pts
-            elif h1_lbl == "Right":
-                landmarks_data = h1_pts
-            else:
-                landmarks_data = h0_pts
-
-    if is_two_hand_inference:
-        h0_label = (all_hands[0].get("label") or "Right").capitalize().strip()
-        h1_label = (all_hands[1].get("label") or "Left").capitalize().strip()
-
-        if h0_label == "Right" and h1_label == "Left":
-            r_pts, l_pts = h0_pts, h1_pts
-        elif h0_label == "Left" and h1_label == "Right":
-            r_pts, l_pts = h1_pts, h0_pts
-        else:
-            avg_x0 = sum(p[0] for p in h0_pts) / len(h0_pts) if h0_pts else 0.5
-            avg_x1 = sum(p[0] for p in h1_pts) / len(h1_pts) if h1_pts else 0.5
-            if avg_x0 <= avg_x1:
+            if h0_lbl == "Right" and h1_lbl == "Left":
                 r_pts, l_pts = h0_pts, h1_pts
-            else:
+            elif h0_lbl == "Left" and h1_lbl == "Right":
                 r_pts, l_pts = h1_pts, h0_pts
+            else:
+                avg_x0 = sum(p[0] for p in h0_pts) / len(h0_pts) if h0_pts else 0.5
+                avg_x1 = sum(p[0] for p in h1_pts) / len(h1_pts) if h1_pts else 0.5
+                if avg_x0 <= avg_x1:
+                    r_pts, l_pts = h0_pts, h1_pts
+                else:
+                    r_pts, l_pts = h1_pts, h0_pts
+        else:
+            if h0_lbl == "Right" and not (wy0 >= 0.85 and wy1 < 0.72):
+                single_pts = h0_pts
+            elif h1_lbl == "Right" and not (wy1 >= 0.85 and wy0 < 0.72):
+                single_pts = h1_pts
+            else:
+                single_pts = h0_pts if wy0 <= wy1 else h1_pts
+    elif landmarks_data and len(landmarks_data) >= 21:
+        single_pts = _to_mirrored(landmarks_data)
+    elif all_hands and len(all_hands) == 1:
+        single_pts = _to_mirrored(all_hands[0].get("points") or all_hands[0].get("landmarks") or [])
 
+    # Build Canonical 3D Palm-Frame Feature Vectors for ASL (124-dim) and Static Words (252-dim)
+    asl_features = None
+    word_features = None
+    detected_hand = "both" if is_two_hand_inference else "right"
+    is_resting_single = False
+
+    single_wrist_y = None
+    if is_two_hand_inference:
         r_lms = aslo_features.HandLandmarks(r_pts)
         l_lms = aslo_features.HandLandmarks(l_pts)
-
-        feats_both = aslo_features.validate_feature_vector(aslo_features.extract_two_hand_features(r_lms, l_lms))
-        feats_r = aslo_features.validate_feature_vector(aslo_features.extract_single_hand_features(r_lms, is_left_hand=False))
-        feats_l = aslo_features.validate_feature_vector(aslo_features.extract_single_hand_features(l_lms, is_left_hand=True))
-
-        feats_batch = np.concatenate([feats_both, feats_r, feats_l], axis=0)
-        p_batch = fast_predict(tf.constant(feats_batch, dtype=tf.float32)).numpy()
-        p_both, p_r, p_l = p_batch[0], p_batch[1], p_batch[2]
-
-        verified_both, conf_both, status_both, telem_both = margin_verifier.verify(p_both, label_classes)
-        pred_status = status_both
-        margin_value = telem_both["margin"]
-        top_class_name = telem_both["top_label"]
-        second_class_name = telem_both["second_label"]
-        p_top_both = telem_both["p_top"]
-        p_second_both = telem_both["p_second"]
-
-        print(f"[PREDICT] Detected: {top_class_name} ({p_top_both:.2f}), Runner-up: {second_class_name} ({p_second_both:.2f}), Diff: {margin_value:.2f}")
-
-        # Check if two-hand inference is neutral
-        prob_both_neutral = float(p_both[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(p_both)) else 0.0
-        if (verified_both and verified_both.lower() == "neutral") or (prob_both_neutral >= 0.60 and conf_both < 0.30):
-            both_live_gesture = "NEUTRAL"
-            conf_both = max(prob_both_neutral, conf_both)
-            verified_both = "NEUTRAL"
-            pred_status = "valid"
-        else:
-            if top_class_name and str(top_class_name).lower() in ("start", "stop") and p_top_both >= 0.40:
-                verified_both = str(top_class_name).upper()
-                conf_both = p_top_both
-                pred_status = "valid"
-            both_live_gesture = (verified_both.upper() if verified_both else "—")
-            both_live_conf = conf_both
-
-        # Right single-hand inference
-        idx_r = int(np.argmax(p_r))
-        label_r = str(label_classes[idx_r])
-        conf_r = float(p_r[idx_r])
-        heur_r = aslo_features.apply_heuristics(r_lms, label_r, is_left_hand=False, confidence=conf_r)
-        right_live_gesture = heur_r
-        right_live_conf = conf_r
-
-        # Left single-hand inference
-        idx_l = int(np.argmax(p_l))
-        label_l = str(label_classes[idx_l])
-        conf_l = float(p_l[idx_l])
-        left_live_gesture = label_l
-        left_live_conf = conf_l
-
-        pred_label = verified_both
-        confidence = conf_both
-        detected_hand = "both"
-
-    # Case 2: Single Right hand detected
-    else:
-        single_pts = _to_mirrored(landmarks_data)
+        word_features = aslo_features.extract_static_word_features((r_lms, l_lms), hand_type="both")
+    elif single_pts and len(single_pts) >= 21:
         single_lms = aslo_features.HandLandmarks(single_pts)
-        feats_single = aslo_features.validate_feature_vector(
-            aslo_features.extract_single_hand_features(single_lms, is_left_hand=False)
-        )
-        probs = fast_predict(tf.constant(feats_single, dtype=tf.float32)).numpy()[0]
+        asl_features = aslo_features.extract_asl_features(single_lms)
+        word_features = aslo_features.extract_static_word_features(single_lms, hand_type="right")
+        single_wrist_y = float(single_lms.landmark[0].y)
+        is_resting_single = single_wrist_y > 0.90
 
-        wrist_y = single_lms.landmark[0].y
-        prob_neutral = float(probs[NEUTRAL_INDEX]) if (NEUTRAL_INDEX is not None and NEUTRAL_INDEX < len(probs)) else 0.0
-        is_resting = wrist_y > 0.90
+    mirrored_seq = _mirror_sequence(sequence_buffer) if sequence_buffer else None
+    effective_hand_type = "both" if is_two_hand_inference else "right"
 
-        verified_single, conf_single, status_single, telem_single = margin_verifier.verify(probs, label_classes)
-        pred_status = status_single
-        margin_value = telem_single["margin"]
-        top_class_name = telem_single["top_label"]
-        second_class_name = telem_single["second_label"]
-        p_top_single = telem_single["p_top"]
-        p_second_single = telem_single["p_second"]
+    # If single hand is resting below frame bottom (y > 0.90) and not in dynamic motion, return NEUTRAL
+    if is_resting_single and not is_two_hand_inference and float(motion_speed or 0.0) < mlp_router.MOTION_THRESHOLD:
+        return {
+            "ok": True,
+            "prediction": "NEUTRAL",
+            "raw_pred": "NEUTRAL",
+            "gesture_type": "static_words",
+            "model_source": "resting_gate",
+            "specialist_used": "Resting Gate",
+            "is_dynamic": False,
+            "confidence": 0.90,
+            "status": "valid",
+            "top_label": "NEUTRAL",
+            "second_label": "—",
+            "margin": 0.90,
+            "detected_hand": "right",
+            "dominant_hand": "right",
+            "live_gesture": "NEUTRAL",
+            "live_conf": 0.90,
+            "is_neutral": True,
+            "right_gesture": "NEUTRAL",
+            "right_conf": 0.90,
+            "left_gesture": "—",
+            "left_conf": 0.0,
+            "both_gesture": "—",
+            "both_conf": 0.0,
+        }
 
-        print(f"[PREDICT] Detected: {top_class_name} ({p_top_single:.2f}), Runner-up: {second_class_name} ({p_second_single:.2f}), Diff: {margin_value:.2f}")
+    # Route through the Soft Cooperative Multi-MLP Ensemble Router
+    route_res = mlp_router.route_and_predict(
+        asl_features_1d=asl_features,
+        word_features_1d=word_features,
+        hand_type=effective_hand_type,
+        mode=mode_clean,
+        sequence_buffer=mirrored_seq,
+        motion_speed=float(motion_speed or 0.0),
+        wrist_y=single_wrist_y,
+    )
 
-        # Explicit Post-Inference Deterministic Geometric Tie-Breakers for Fist Ambiguities (T, N, M, S)
-        raw_pts = np.array([aslo_features._coords(lm) for lm in single_lms.landmark], dtype=np.float32)
-        top_upper = str(top_class_name).upper().strip()
-        second_upper = str(second_class_name).upper().strip()
-        pair_set = {top_upper, second_upper}
-        fist_set = {"S", "T", "N", "M", "A", "E"}
+    raw_pred = route_res.get("prediction")
+    confidence = float(route_res.get("confidence") or 0.0)
+    pred_status = route_res.get("status") or "ambiguous"
+    telem = route_res.get("telemetry") or {}
+    gesture_type = route_res.get("gesture_type") or "static_asl"
+    model_source = route_res.get("model_source") or "none"
+    specialist_used = route_res.get("specialist_used") or "None"
+    routed_via_fist = bool(route_res.get("routed_via_fist_specialist", False))
 
-        if (bool(pair_set.intersection(fist_set)) and margin_value < 0.25) or (top_upper in fist_set and margin_value < 0.25):
-            sc = float(np.linalg.norm(raw_pts[9] - raw_pts[0])) + 1e-6
-            norm_pts = (raw_pts - raw_pts[0]) / sc
-            resolved_fist = aslo_features.resolve_fist_tie_breaker(norm_pts, top_class_name, second_class_name, margin_value)
-            if resolved_fist:
-                top_class_name = resolved_fist
-                verified_single = resolved_fist
-                p_top_single = max(p_top_single, 0.85)
-                conf_single = p_top_single
-                pred_status = "valid"
+    top_class_name = telem.get("top_label", "—")
+    second_class_name = telem.get("second_label", "—")
+    margin_value = float(telem.get("margin", 0.0))
 
-        if is_resting or (prob_neutral >= 0.60 and conf_single < 0.30):
-            heur = "NEUTRAL"
-            conf = max(prob_neutral, 0.75 if is_resting else conf_single)
-            pred_status = "valid"
-        elif (str(top_class_name).upper().strip() in FIST_CLUSTER and str(second_class_name).upper().strip() in FIST_CLUSTER and margin_value < 0.25):
-            # Deterministic geometric tie-breaker for fist cluster
-            sc = float(np.linalg.norm(raw_pts[9] - raw_pts[0])) + 1e-6
-            norm_pts = (raw_pts - raw_pts[0]) / sc
-            tb_sign = aslo_features.resolve_fist_tie_breaker(norm_pts, str(top_class_name).upper().strip(), str(second_class_name).upper().strip(), margin_value)
-            if tb_sign:
-                heur = tb_sign
-                conf = max(p_top_single, 0.85)
-                pred_status = "valid"
-            else:
-                heur = None
-                conf = p_top_single
-                pred_status = "ambiguous"
-        elif verified_single is None:
-            # Check if ambiguity is between known disambiguation pairs
-            pair_set = {str(top_class_name).upper().strip(), str(second_class_name).upper().strip()}
-            can_disambiguate = (
-                bool(pair_set.intersection({"U", "V", "R"})) or
-                bool(pair_set.intersection({"S", "O"})) or
-                bool(pair_set.intersection({"P", "Q", "Z", "Z_START", "Z_END"})) or
-                bool(pair_set.intersection({"Y", "YOU", "J_START"}))
-            )
-            if can_disambiguate and p_top_single >= 0.40:
-                resolved = aslo_features.apply_heuristics(single_lms, top_class_name, is_left_hand=False, confidence=p_top_single)
-                heur = resolved
-                conf = p_top_single
-                pred_status = "valid"
-            else:
-                heur = None
-                conf = conf_single
-        else:
-            if verified_single.lower() == "neutral":
-                heur = "NEUTRAL"
-                conf = conf_single
-            else:
-                heur = aslo_features.apply_heuristics(single_lms, verified_single, is_left_hand=False, confidence=conf_single)
-                cand_clean = clean_display_label(heur).lower()
-
-                # START and STOP strictly require both hands; never allow them from single-hand inference
-                if str(heur).upper() in ("START", "STOP") or cand_clean in ("start", "stop"):
-                    heur = None
-                    pred_status = "ambiguous"
-                conf = conf_single
-
-        # Mid-sweep "O" suppression & "J" protection:
-        # "O" requires closed loop between index and thumb (d48 < 0.32) and NO extended pinky
-        if heur and str(heur).upper().strip() == "O":
-            raw_pts = np.array([aslo_features._coords(lm) for lm in single_lms.landmark], dtype=np.float32)
-            sc = float(np.linalg.norm(raw_pts[9] - raw_pts[0])) + 1e-6
-            d_thumb_idx = float(np.linalg.norm(raw_pts[4] - raw_pts[8]) / sc)
-            is_pinky_up = bool(raw_pts[20, 1] < raw_pts[18, 1])
-            if d_thumb_idx > 0.32 or is_pinky_up:
-                if is_pinky_up:
-                    heur = "J_START"
-                else:
-                    heur = None
-                    pred_status = "ambiguous"
-
-        pred_label = heur
-        confidence = conf
-        detected_hand = "right"
-        right_live_gesture = heur if heur else "—"
-        right_live_conf = conf
-
-    clean_pred = clean_display_label(pred_label) if pred_label else None
+    clean_pred = clean_display_label(raw_pred) if raw_pred else None
     if clean_pred in ("—", "NONE", ""):
         clean_pred = None
 
-    clean_r = clean_display_label(right_live_gesture) if right_live_gesture != "TRACKED" else "TRACKED"
-    clean_l = clean_display_label(left_live_gesture) if left_live_gesture != "TRACKED" else "TRACKED"
-    clean_both = clean_display_label(both_live_gesture)
+    # Ensure Start, Stop, Space, Backspace are always tagged as 'static_words' (Word type gesture)
+    if clean_pred in ("START", "STOP", "SPACE", "BACKSPACE", "NEUTRAL"):
+        gesture_type = "static_words"
+        if model_source == "none":
+            model_source = "words_static_mlp"
+        if specialist_used in ("None", "Stage-1 Direct"):
+            specialist_used = "Static Words MLP"
 
-    # Dynamic sequence state machine evaluation:
-    # Evaluates motion trajectories concurrently without locking out static recognition
-    active_landmarks = r_pts if is_two_hand_inference else single_pts
-    is_dynamic_signal = False
-    dyn_eval = dynamic_state_machine.update(
-        landmarks=active_landmarks,
-        raw_pred=pred_label,
-        confidence=confidence
-    )
-    if dyn_eval.get("committed_sign"):
-        clean_pred = dyn_eval["committed_sign"]
-        pred_label = clean_pred
-        confidence = 0.95
-        pred_status = "valid"
-        is_dynamic_signal = True
-    elif dyn_eval.get("state") == "TRACKING":
-        is_dynamic_signal = True
+    # When Model 3 (`dynamic_mlp.keras`) confirms a completed 25-frame dynamic trajectory,
+    # expose `<GESTURE>_END` in `raw_pred` so the frontend's `_START` -> Countdown Timer -> `_END`
+    # state machine completes the active dynamic gesture cleanly (and ignores uninitiated fragments)!
+    raw_pred_out = raw_pred
+    if gesture_type == "dynamic" and raw_pred_out and not str(raw_pred_out).upper().endswith(("_START", "_END")):
+        raw_pred_out = f"{raw_pred_out}_END"
+
+    if raw_pred_out and str(raw_pred_out).upper().endswith(("_START", "_END")):
+        gesture_type = "dynamic"
 
     # Final safeguard: START, STOP, and two-handed dynamic phrases strictly require both hands!
     if detected_hand != "both":
-        two_hand_guards = ("START", "STOP", "HOW ARE YOU", "NICE TO MEET YOU")
-        if pred_label and any(str(pred_label).upper().startswith(g) for g in two_hand_guards):
-            pred_label = None
-            confidence = 0.0
-            pred_status = "ambiguous"
-        if clean_pred and any(str(clean_pred).upper().startswith(g) for g in two_hand_guards):
+        two_hand_guards = ("HOW ARE YOU", "NICE TO MEET YOU")
+        if raw_pred_out and any(str(raw_pred_out).upper().startswith(g) for g in two_hand_guards):
+            raw_pred_out = None
             clean_pred = None
             confidence = 0.0
             pred_status = "ambiguous"
-        if any(str(right_live_gesture).upper().startswith(g) for g in two_hand_guards):
-            right_live_gesture = "—"
-            right_live_conf = 0.0
 
-    is_neutral_signal = bool(clean_pred == "NEUTRAL" or pred_label == "NEUTRAL")
+    is_neutral_signal = bool(clean_pred == "NEUTRAL" or (raw_pred_out and str(raw_pred_out).upper() == "NEUTRAL"))
     is_dynamic_signal = bool(
-        is_dynamic_signal or (
-            pred_label and (
-                str(pred_label).upper().endswith("_START") or
-                str(pred_label).upper().endswith("_END") or
-                str(pred_label).upper() in ("HOW ARE YOU", "NICE TO MEET YOU")
+        gesture_type == "dynamic"
+        or (
+            raw_pred_out
+            and (
+                str(raw_pred_out).upper().endswith("_START")
+                or str(raw_pred_out).upper().endswith("_END")
+                or str(raw_pred_out).upper() in ("HOW ARE YOU", "NICE TO MEET YOU")
             )
         )
     )
+
+    right_live_gesture = clean_pred if (detected_hand == "right" and clean_pred) else "—"
+    right_live_conf = confidence if (detected_hand == "right" and clean_pred) else 0.0
+    both_live_gesture = clean_pred if (detected_hand == "both" and clean_pred) else "—"
+    both_live_conf = confidence if (detected_hand == "both" and clean_pred) else 0.0
 
     return {
         "ok": True,
         "prediction": clean_pred,
-        "raw_pred": pred_label,
+        "raw_pred": raw_pred_out,
+        "gesture_type": gesture_type,
+        "model_source": model_source,
+        "specialist_used": specialist_used,
+        "routed_via_fist_specialist": routed_via_fist,
         "is_dynamic": is_dynamic_signal,
         "confidence": float(round(confidence, 2)),
         "status": pred_status,
@@ -533,14 +441,14 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
         "margin": float(round(margin_value, 2)),
         "detected_hand": detected_hand,
         "dominant_hand": "right",
-        "live_gesture": clean_pred,
+        "live_gesture": clean_pred or "—",
         "live_conf": float(round(confidence, 2)),
         "is_neutral": is_neutral_signal,
-        "right_gesture": clean_r,
+        "right_gesture": right_live_gesture,
         "right_conf": float(round(right_live_conf, 2)),
-        "left_gesture": clean_l,
-        "left_conf": float(round(left_live_conf, 2)),
-        "both_gesture": clean_both,
+        "left_gesture": "—",
+        "left_conf": 0.0,
+        "both_gesture": both_live_gesture,
         "both_conf": float(round(both_live_conf, 2)),
     }
 
@@ -549,7 +457,6 @@ def process_landmarks_data(landmarks_data, handedness="Right", all_hands=None, i
 
 @app.route("/")
 def index():
-    """Root route with automatic mobile/desktop device detection and manual overrides."""
     view_pref = request.args.get("view") or request.cookies.get("view_pref")
     if view_pref == "mobile":
         resp = make_response(render_template("mobile.html"))
@@ -567,7 +474,6 @@ def index():
 
 @app.route("/mobile")
 def mobile():
-    """Explicit mobile view route with cookie preference persistence."""
     resp = make_response(render_template("mobile.html"))
     resp.set_cookie("view_pref", "mobile", max_age=86400 * 30)
     return resp
@@ -575,7 +481,6 @@ def mobile():
 
 @app.route("/desktop")
 def desktop():
-    """Explicit desktop view route with cookie preference persistence."""
     resp = make_response(render_template("index.html"))
     resp.set_cookie("view_pref", "desktop", max_age=86400 * 30)
     return resp
@@ -583,9 +488,18 @@ def desktop():
 
 @app.route("/predict_landmarks", methods=["POST"])
 def predict_landmarks():
-    """Client-side landmark inference endpoint.
-    Stateless and isolated per HTTP request: accepts lightweight 21-point
-    hand landmark coordinates JSON and returns predicted translation."""
+    """
+    100% Stateless Multi-MLP Landmark Inference Endpoint.
+    Accepts:
+      {
+        "landmarks": [...],
+        "hands": [...],
+        "hand_type": "right"|"both",
+        "sequence_buffer": [...],
+        "motion_speed": float,
+        "mode": "auto"|"asl"|"words"|"dynamic"
+      }
+    """
     try:
         data = request.get_json(silent=True) or {}
         landmarks = data.get("landmarks", [])
@@ -593,6 +507,9 @@ def predict_landmarks():
         all_hands = data.get("all_hands") or data.get("hands") or []
         is_mirrored = bool(data.get("is_mirrored", True))
         hand_type = data.get("hand_type")
+        sequence_buffer = data.get("sequence_buffer") or []
+        motion_speed = float(data.get("motion_speed", 0.0) or 0.0)
+        mode = data.get("mode", "auto")
 
         with _inference_lock:
             result = process_landmarks_data(
@@ -600,7 +517,10 @@ def predict_landmarks():
                 handedness=handedness,
                 all_hands=all_hands,
                 is_mirrored=is_mirrored,
-                hand_type=hand_type
+                hand_type=hand_type,
+                sequence_buffer=sequence_buffer,
+                motion_speed=motion_speed,
+                mode=mode,
             )
 
         return jsonify(result)
@@ -610,33 +530,19 @@ def predict_landmarks():
         return jsonify({
             "ok": False,
             "error": str(e),
-            "prediction": "—",
+            "prediction": None,
+            "status": "error",
             "live_gesture": "—",
-            "live_conf": 0.0
+            "live_conf": 0.0,
         }), 500
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Backwards-compatible inference endpoint for client landmarks or legacy requests."""
     try:
         data = request.get_json(silent=True) or {}
-        if "landmarks" in data:
-            landmarks = data.get("landmarks", [])
-            handedness = data.get("handedness", "Right")
-            all_hands = data.get("all_hands") or data.get("hands") or []
-            is_mirrored = bool(data.get("is_mirrored", True))
-            hand_type = data.get("hand_type")
-
-            with _inference_lock:
-                result = process_landmarks_data(
-                    landmarks_data=landmarks,
-                    handedness=handedness,
-                    all_hands=all_hands,
-                    is_mirrored=is_mirrored,
-                    hand_type=hand_type
-                )
-            return jsonify(result)
+        if "landmarks" in data or "sequence_buffer" in data or "hands" in data:
+            return predict_landmarks()
 
         return jsonify({
             "ok": True,
@@ -644,7 +550,7 @@ def predict():
             "confidence": 0.0,
             "live_gesture": "—",
             "live_conf": 0.0,
-            "message": "Client-side MediaPipe is active. Send landmarks to /predict_landmarks."
+            "message": "Client-side MediaPipe is active. Send landmarks to /predict_landmarks.",
         })
     except Exception as e:
         print(f"[Error] /predict exception: {e}")
@@ -654,22 +560,17 @@ def predict():
             "error": str(e),
             "prediction": "—",
             "live_gesture": "—",
-            "live_conf": 0.0
+            "live_conf": 0.0,
         }), 500
 
 
 @app.route("/gesture")
 def gesture_status():
-    """Stateless status endpoint."""
-    return jsonify({
-        "status": "running",
-        "ok": True
-    })
+    return jsonify({"status": "running", "ok": True})
 
 
 @app.route("/video_feed")
 def video_feed():
-    """Dummy endpoint for backwards compatibility."""
     return Response(b"", mimetype="text/plain")
 
 
@@ -722,18 +623,15 @@ def get_stt_languages():
     return jsonify({
         "ok": True,
         "languages": SUPPORTED_LANGUAGES,
-        "default": "en-US"
+        "default": "en-US",
     })
 
 
 @app.route("/api/stt/transcribe", methods=["POST"])
 def api_transcribe_audio():
     language = request.form.get("language") or request.args.get("language") or "en-US"
-
-    audio_bytes = None
     if "audio" in request.files:
-        audio_file = request.files["audio"]
-        audio_bytes = audio_file.read()
+        audio_bytes = request.files["audio"].read()
     else:
         audio_bytes = request.get_data()
 
@@ -745,15 +643,11 @@ def api_transcribe_audio():
 
 
 def _retrain_model_background():
-    global is_retraining, model, label_classes, NEUTRAL_INDEX
+    global is_retraining
     try:
         subprocess.run([sys.executable, "train_model.py"], check=True)
-        model = models.load_model(model_path)
-        label_classes = np.load(labels_path, allow_pickle=True)
-        if label_classes is not None:
-            classes_list = list(label_classes)
-            NEUTRAL_INDEX = classes_list.index("neutral") if "neutral" in classes_list else None
-        print(f"Model successfully retrained and reloaded. Now has {len(label_classes)} classes.")
+        mlp_router.load_all_models()
+        print("All 4 specialized MLP models successfully retrained and reloaded.")
     except Exception as e:
         print(f"Error during retraining: {e}")
     finally:
@@ -762,24 +656,15 @@ def _retrain_model_background():
 
 @app.route("/correct_gesture", methods=["POST"])
 def correct_gesture():
-    global latest_features, is_retraining
+    global is_retraining
     if is_retraining:
-        return jsonify({"ok": False, "message": "Model is currently retraining. Please wait."})
+        return jsonify({"ok": False, "message": "Models are currently retraining. Please wait."})
 
     data = request.get_json(silent=True) or {}
     if "label" not in data:
         return jsonify({"ok": False, "message": "No label provided."})
 
     correct_label = str(data["label"]).upper().strip()
-    if latest_features is None:
-        return jsonify({"ok": False, "message": "No gesture detected to correct."})
-
-    with open("gesture_data.csv", "a", newline="") as f:
-        writer = csv.writer(f)
-        row = list(latest_features) + [correct_label]
-        for _ in range(20):
-            writer.writerow(row)
-
     is_retraining = True
     threading.Thread(target=_retrain_model_background, daemon=True).start()
     return jsonify({"ok": True, "message": f'Learning "{correct_label}" in background...'})
@@ -787,13 +672,11 @@ def correct_gesture():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy", "service": "aslo-engine"})
+    return jsonify({"status": "healthy", "service": "aslo-engine", "models_ready": mlp_router.is_ready})
 
 
 @app.route("/api/dictionary", methods=["GET"])
 def api_dictionary():
-    """Returns complete sign dictionary catalogue with metadata, descriptions,
-    usage tips, and canonical keyframe landmarks for 2D stick-figure animation."""
     canonical_file = "canonical_landmarks.json"
     canonical_data = {}
     if os.path.exists(canonical_file):
@@ -834,16 +717,16 @@ def api_dictionary():
         "THANK YOU": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Flat open hand touches chin/lips and extends forward and outward toward receiver.", "tips": "Palm faces upward/inward as hand extends forward toward the person."},
         "I LOVE YOU": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Thumb, index, and pinky extended upright (combines I, L, Y); middle and ring curled.", "tips": "Universal ASL 'ILY' sign with palm facing forward."},
         "LOVE": {"category": "static", "type": "phrase", "handedness": "both", "desc": "Both hands crossed over chest in a gentle hug.", "tips": "Cross wrists over upper chest with hands resting against shoulders."},
-        "FINE": {"category": "static", "type": "phrase", "handedness": "both", "desc": "Open 5 hands with thumbs touching chest, fingers spread.", "tips": "Thumbs touch chest with fingers pointing upright and spread."},
-        "ME": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Index finger points directly to own chest.", "tips": "Point index finger cleanly at center of chest."},
+        "FINE": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Open 5 hand with thumb touching chest, fingers spread.", "tips": "Thumb touches chest with fingers pointing upright and spread."},
+        "ME": {"category": "static", "type": "phrase", "handedness": "both", "desc": "Thumbs point directly to own chest.", "tips": "Point thumbs cleanly toward chest."},
         "YOU": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Index finger points forward directly toward the conversational partner.", "tips": "Point index finger straight forward at chest height."},
         "HOW ARE YOU": {"category": "dynamic", "type": "phrase", "handedness": "both", "desc": "Both hands cupped facing chest, arcing outward and opening palms upward.", "tips": "Start with knuckles touching/facing chest, rotate hands forward opening palms up."},
         "NICE TO MEET YOU": {"category": "dynamic", "type": "phrase", "handedness": "both", "desc": "Right hand slides forward across left open palm, then indices meet pointing forward.", "tips": "Part 1: Slide right palm across left palm (Nice); Part 2: Hands come together pointing forward (Meet you)."},
-        "START": {"category": "static", "type": "control", "handedness": "both", "desc": "Two hands raised open with palms facing outward toward camera.", "tips": "Requires both hands in signing frame to initialize translation engine."},
-        "STOP": {"category": "static", "type": "control", "handedness": "both", "desc": "Two flat hands held upright facing camera (universal halt signal).", "tips": "Raise both open palms facing camera to pause recognition."},
-        "SPACE": {"category": "static", "type": "control", "handedness": "both", "desc": "Two hands move horizontally outward adding a word space to the sentence.", "tips": "Move both flat hands outward sideways in synchronization."},
-        "BACKSPACE": {"category": "static", "type": "control", "handedness": "both", "desc": "Swipe hands backward deleting the previous letter or sign.", "tips": "Quick flick backward deletes last character or word."},
-        "NEUTRAL": {"category": "static", "type": "control", "handedness": "both", "desc": "Hands resting comfortably at waist level or off-screen in relaxed posture.", "tips": "Return hands to resting position to clear candidate latches."}
+        "START": {"category": "static", "type": "control", "handedness": "both", "desc": "Two hands raised with thumbs up in signing frame.", "tips": "Requires both hands in signing frame to initialize translation engine."},
+        "STOP": {"category": "static", "type": "control", "handedness": "both", "desc": "Two hands pointing index fingers downward (halt signal).", "tips": "Use both hands to pause recognition."},
+        "SPACE": {"category": "static", "type": "control", "handedness": "both", "desc": "Two hands move horizontally outward adding a word space to the sentence.", "tips": "Point both hands outward sideways in synchronization."},
+        "BACKSPACE": {"category": "static", "type": "control", "handedness": "both", "desc": "Both hands point backward/left deleting the previous letter or sign.", "tips": "Point both hands to delete last character or word."},
+        "NEUTRAL": {"category": "static", "type": "control", "handedness": "both", "desc": "Hands resting comfortably at waist level or off-screen in relaxed posture.", "tips": "Return hands to resting position to clear candidate latches."},
     }
 
     canonical_lower = {k.lower(): v for k, v in canonical_data.items()}
@@ -873,23 +756,21 @@ def api_dictionary():
                 for step in range(12):
                     t = step / 11.0
                     frame_pts = []
-                    # For J, add a smooth arc swoop (downward stroke + inward curved hook)
                     if sign_key == "J":
-                        # Smooth curved hook offset: arc down then sweep up inward
                         arc_offset_x = -0.05 * math.sin(math.pi * t)
                         arc_offset_y = 0.08 * math.sin(math.pi * min(1.0, t * 1.3))
                         for p0, p1 in zip(s_pts, e_pts):
                             frame_pts.append({
                                 "x": round(p0["x"] * (1 - t) + p1["x"] * t + arc_offset_x, 4),
                                 "y": round(p0["y"] * (1 - t) + p1["y"] * t + arc_offset_y, 4),
-                                "z": round(p0["z"] * (1 - t) + p1["z"] * t, 4)
+                                "z": round(p0["z"] * (1 - t) + p1["z"] * t, 4),
                             })
                     else:
                         for p0, p1 in zip(s_pts, e_pts):
                             frame_pts.append({
                                 "x": round(p0["x"] * (1 - t) + p1["x"] * t, 4),
                                 "y": round(p0["y"] * (1 - t) + p1["y"] * t, 4),
-                                "z": round(p0["z"] * (1 - t) + p1["z"] * t, 4)
+                                "z": round(p0["z"] * (1 - t) + p1["z"] * t, 4),
                             })
                     keyframes.append(frame_pts)
 
@@ -903,7 +784,7 @@ def api_dictionary():
             "tips": meta["tips"],
             "landmarks": h0,
             "landmarks_secondary": h1,
-            "keyframes": keyframes
+            "keyframes": keyframes,
         })
 
     return jsonify({"ok": True, "dictionary": result, "count": len(result)})
