@@ -330,9 +330,15 @@ def _collect_meta_samples(df, registry: Dict) -> Tuple[np.ndarray, np.ndarray, n
             else:
                 _add_1h(r_base, "dynamic_keyframe", lbl_str)
 
-            for _ in range(3):
+            n_kf_meta = 5 if lbl_low == "hello_end" else 3
+            rz_kf = (-2.0, 14.0) if lbl_low == "hello_end" else ((-12.0, 2.0) if lbl_low == "hello_start" else (-14.0, 14.0))
+            for aug_k in range(n_kf_meta):
                 r_pts = r_base.copy()
                 l_pts = l_base.copy()
+                if lbl_low in ("hello_start", "hello_end") and (aug_k % 2 == 1):
+                    v_out = (r_pts[5] - r_pts[17]) * float(rng.uniform(0.35, 0.70)) + (r_pts[9] - r_pts[0]) * 0.25
+                    r_pts[3] = r_pts[2] + v_out * 0.55
+                    r_pts[4] = r_pts[2] + v_out * 1.10
                 r_pts[:, 2] *= float(rng.uniform(0.35, 1.60))
                 r_n = rng.normal(0.0, 0.026, size=r_pts.shape).astype(np.float32)
                 r_n[0] = 0.0
@@ -340,7 +346,7 @@ def _collect_meta_samples(df, registry: Dict) -> Tuple[np.ndarray, np.ndarray, n
                     r_pts + r_n,
                     float(rng.uniform(-14.0, 14.0)),
                     float(rng.uniform(-14.0, 14.0)),
-                    float(rng.uniform(-14.0, 14.0)),
+                    float(rng.uniform(rz_kf[0], rz_kf[1])),
                 )
                 r_pts[0] = 0.0
                 if has_l:

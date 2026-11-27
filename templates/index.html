@@ -12,8 +12,9 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
-    <!-- Stylesheet -->
-    <link rel="stylesheet" href="style.css">
+    <!-- Favicon & Stylesheet -->
+    <link rel="icon" type="image/jpeg" href="aslo_logo.jpg">
+    <link rel="stylesheet" href="style.css?v=20261127_v16">
 </head>
 
 <body>
@@ -22,7 +23,7 @@
     <!-- ── Topbar Navigation ───────────────────────────────────────────── -->
     <header class="topbar">
         <div class="brand-section">
-            <div class="brand-logo">🤟</div>
+            <div class="brand-logo"><img src="aslo_logo.jpg" alt="ASLO Logo" class="brand-logo-img"></div>
             <div class="brand-info">
                 <h1>ASLO <span>STUDIO</span></h1>
                 <span class="tagline">Sign Language → Neural Text & Speech Engine</span>
@@ -106,8 +107,8 @@
                 </div>
             </div>
 
-            <!-- HTML5 Client Webcam & Landmark Overlay Canvas -->
-            <video id="webcam" playsinline autoplay muted style="display:none;"></video>
+            <!-- HTML5 Client Webcam (Direct Zero-Lag Hardware Stream) & Transparent Skeleton Overlay -->
+            <video id="webcam" playsinline autoplay muted></video>
             <canvas id="output_canvas"></canvas>
             <canvas id="landmark-canvas" style="display:none;"></canvas>
 
@@ -515,6 +516,7 @@
                         <div class="dict-group-block" data-category="dynamic">
                             <div class="gesture-group-title">⚡ Dynamic Signs (Moving Sequences) — Traced Paths & Multi-Pose</div>
                             <div class="gesture-grid" id="dict-grid-dynamic">
+                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('HELLO')" data-label="HELLO" data-category="dynamic">⚡ HELLO</div>
                                 <div class="gesture-badge-item control-item" onclick="selectDictionarySign('HOW ARE YOU')" data-label="HOW ARE YOU" data-category="dynamic">⚡ HOW ARE YOU</div>
                                 <div class="gesture-badge-item control-item" onclick="selectDictionarySign('NICE TO MEET YOU')" data-label="NICE TO MEET YOU" data-category="dynamic">⚡ NICE TO MEET YOU</div>
                                 <div class="gesture-badge-item" onclick="selectDictionarySign('J')" data-label="J" data-category="dynamic">⚡ J</div>
@@ -526,7 +528,6 @@
                         <div class="dict-group-block" data-category="static">
                             <div class="gesture-group-title">Conversational Words & Phrases</div>
                             <div class="gesture-grid" id="dict-grid-phrases">
-                                <div class="gesture-badge-item control-item" onclick="selectDictionarySign('HELLO')" data-label="HELLO" data-category="static">HELLO</div>
                                 <div class="gesture-badge-item control-item" onclick="selectDictionarySign('THANK YOU')" data-label="THANK YOU" data-category="static">THANK YOU</div>
                                 <div class="gesture-badge-item control-item" onclick="selectDictionarySign('I LOVE YOU')" data-label="I LOVE YOU" data-category="static">I LOVE YOU</div>
                                 <div class="gesture-badge-item control-item" onclick="selectDictionarySign('LOVE')" data-label="LOVE" data-category="static">LOVE</div>
@@ -602,7 +603,7 @@
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
 
     <!-- ── Application Script ──────────────────────────────────────────── -->
-    <script src="app.js?v=20261122_v11"></script>
+    <script src="app.js?v=20261127_v25"></script>
 
 </body>
 

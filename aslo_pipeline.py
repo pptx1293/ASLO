@@ -389,17 +389,77 @@ class ASLOEnsembleRouter:
         self.EXPECTED_META_DIM = aslo_features.EXPECTED_WORD_DIM + 1 + 12  # 265
 
         self._loaded_mtime = 0.0
+        self._last_mtime_check = 0.0
         self.is_ready = False
         self.load_all_models()
 
+    class _FastNumpyResult:
+        __slots__ = ("_arr",)
+
+        def __init__(self, arr: np.ndarray):
+            self._arr = arr
+
+        def numpy(self) -> np.ndarray:
+            return self._arr
+
+        def __getitem__(self, item):
+            return self._arr[item]
+
+    class _FastNumpyMLP:
+        """
+        Zero-overhead pure-NumPy inference engine compiled directly from a trained Keras MLP
+        (`InputLayer`, `GaussianNoise`, `Dense`, `BatchNormalization`, `Dropout`).
+        Eliminates ~25ms/frame of TensorFlow Eager/Graph Python overhead (~0.04ms per model call)
+        while preserving exact float32 numerical parity (< 1e-6) with `keras_model(x, training=False)`.
+        """
+        def __init__(self, keras_model):
+            self.ops = []
+            for layer in keras_model.layers:
+                cname = layer.__class__.__name__
+                if cname == "Dense":
+                    w, b = layer.get_weights()
+                    act_cfg = layer.get_config().get("activation", "linear")
+                    self.ops.append(("dense", w.astype(np.float32), b.astype(np.float32), act_cfg))
+                elif cname == "BatchNormalization":
+                    weights = layer.get_weights()
+                    eps = float(layer.epsilon)
+                    if layer.scale and layer.center:
+                        gamma, beta, mean, var = weights
+                    elif layer.scale and not layer.center:
+                        gamma, mean, var = weights
+                        beta = np.zeros_like(gamma)
+                    elif not layer.scale and layer.center:
+                        beta, mean, var = weights
+                        gamma = np.ones_like(beta)
+                    else:
+                        mean, var = weights
+                        gamma = np.ones_like(mean)
+                        beta = np.zeros_like(mean)
+                    sc = (gamma / np.sqrt(var + eps)).astype(np.float32)
+                    off = (beta - mean * sc).astype(np.float32)
+                    self.ops.append(("bn", sc, off, None))
+
+        def __call__(self, x):
+            h = x.numpy() if hasattr(x, "numpy") else np.asarray(x, dtype=np.float32)
+            if h.dtype != np.float32:
+                h = h.astype(np.float32)
+            if h.ndim == 1:
+                h = np.expand_dims(h, axis=0)
+            for kind, p1, p2, act in self.ops:
+                if kind == "dense":
+                    h = h @ p1 + p2
+                    if act == "relu":
+                        h = np.maximum(h, 0.0)
+                    elif act == "softmax":
+                        e = np.exp(h - np.max(h, axis=-1, keepdims=True))
+                        h = e / np.sum(e, axis=-1, keepdims=True)
+                else:
+                    h = h * p1 + p2
+            return ASLOEnsembleRouter._FastNumpyResult(h)
+
     @staticmethod
     def _wrap_tf_predict(keras_model, input_dim: int):
-        @tf.function(reduce_retracing=True)
-        def _fn(x):
-            return keras_model(x, training=False)
-        # Warmup graph immediately
-        _fn(tf.zeros((1, input_dim), dtype=tf.float32))
-        return _fn
+        return ASLOEnsembleRouter._FastNumpyMLP(keras_model)
 
     def load_all_models(self) -> bool:
         """Loads registry, all Keras MLP models, label encoders, and StandardScalers."""
@@ -606,7 +666,7 @@ class ASLOEnsembleRouter:
             )
         else:
             s1_scaled = self.asl_stage1_scaler.transform(raw_asl)
-            s1_probs = self._fast_asl_stage1(tf.constant(s1_scaled, dtype=tf.float32)).numpy()[0].copy()
+            s1_probs = self._fast_asl_stage1(s1_scaled)[0].copy()
 
         # If ASL-only mode is requested (`allow_word_specialist=False`), zero out CLUSTER_WORD_1H and renormalize
         if not allow_word_specialist:
@@ -631,8 +691,8 @@ class ASLOEnsembleRouter:
         evaluated_specialists: List[str] = []
         ONE_HAND_WORDS_SET = {
             "fine", "i love you", "love", "thank you", "you",
-            "hello", "neutral", "start", "stop", "space", "backspace", "back space",
-            "j_start", "j_end", "z_start", "z_end"
+            "neutral", "start", "stop", "space", "backspace", "back space",
+            "hello_start", "hello_end", "j_start", "j_end", "z_start", "z_end"
         }
 
         for idx in top_candidates:
@@ -690,7 +750,7 @@ class ASLOEnsembleRouter:
                 spec = self.specialists[c_label]
                 evaluated_specialists.append(c_label)
                 c_scaled = spec["scaler"].transform(raw_asl)
-                p2_probs = spec["fast_fn"](tf.constant(c_scaled, dtype=tf.float32)).numpy()[0]
+                p2_probs = spec["fast_fn"](c_scaled)[0]
                 for s_idx, s_name in enumerate(spec["labels"]):
                     s_str = str(s_name)
                     p2_val = float(p2_probs[s_idx])
@@ -721,47 +781,81 @@ class ASLOEnsembleRouter:
                 "routed_via_fist_specialist": False,
             }
 
-        # Camera-frame orientation disambiguation for P vs Q vs X (prevents cross-override under webcam tilt):
-        # asl_features[115:118] = thumb tip(4), [118:121] = index tip(8), [121:124] = middle MCP(9), [70] = mid PIP angle
+        # 3D Rotation-Invariant U vs V vs R separation using canonical palm-frame spread/crossing invariants:
+        # raw_asl[0, 89] = lat_tip_ratio = (x8 - x12)/(x5 - x9)  -> R: [-0.53..+0.31], U: [+0.70..+0.89], V: [+1.92..+2.21]
+        # raw_asl[0, 91] = spread_tip_mcp_ratio = ||P8 - P12|| / ||P5 - P9|| -> R: [0.18..0.86], U: [0.89..1.18], V: [2.04..2.32]
+        # raw_asl[0, 92] = signed_cross_xy -> R: [-0.19..-0.08], U: [-0.05..-0.02], V: [+0.13..+0.17]
         if override_stage1_probs is None and final_scores:
-            y4_cam = float(raw_asl[0, 116])
-            y8_cam = float(raw_asl[0, 119])
-            mid_pip_ang = float(raw_asl[0, 70])
-            if y8_cam > 0.08 and y4_cam > 0.28 and mid_pip_ang < 2.05:
-                # Clearly downward-pointing Q (both index & thumb pointing down, middle curled)
-                for bad_lbl in ("X", "P"):
-                    if bad_lbl in final_scores:
-                        final_scores[bad_lbl] *= 0.08
-            elif y8_cam < -0.92 and y4_cam < -0.15 and mid_pip_ang < 1.65:
-                # Clearly upright hooked X (index up, middle tightly curled)
-                for bad_lbl in ("Q", "P"):
-                    if bad_lbl in final_scores:
-                        final_scores[bad_lbl] *= 0.08
-            elif -1.05 < y8_cam < 0.05 and y4_cam < 0.18 and mid_pip_ang >= 1.85:
-                # Clearly forward/downward P (middle extended, thumb not pointing straight down)
-                for bad_lbl in ("Q", "X"):
-                    if bad_lbl in final_scores:
-                        final_scores[bad_lbl] *= 0.08
-
-            # 3D Rotation-Invariant U vs V vs R separation using canonical palm-frame spread/crossing invariants:
-            # raw_asl[0, 89] = lat_tip_ratio = (x8 - x12)/(x5 - x9)
-            # raw_asl[0, 91] = spread_tip_mcp_ratio = ||P8 - P12|| / ||P5 - P9||
             top_prelim = max(final_scores, key=final_scores.get)
             if top_prelim in ("U", "V", "R"):
-                lat_tip = float(raw_asl[0, 89])
-                spread_r = float(raw_asl[0, 91])
-                if lat_tip < 0.42:
-                    for bad_lbl in ("U", "V"):
-                        if bad_lbl in final_scores:
-                            final_scores[bad_lbl] *= 0.15
-                elif lat_tip > 1.48 and spread_r > 1.50:
-                    for bad_lbl in ("U", "R"):
-                        if bad_lbl in final_scores:
-                            final_scores[bad_lbl] *= 0.15
-                elif 0.55 <= lat_tip <= 1.28 and spread_r <= 1.38:
-                    for bad_lbl in ("V", "R"):
-                        if bad_lbl in final_scores:
-                            final_scores[bad_lbl] *= 0.15
+                p_uvr = (
+                    float(final_scores.get("U", 0.0))
+                    + float(final_scores.get("V", 0.0))
+                    + float(final_scores.get("R", 0.0))
+                )
+                if p_uvr >= 0.45:
+                    lat_tip = float(raw_asl[0, 89])
+                    spread_r = float(raw_asl[0, 91])
+                    cross_xy = float(raw_asl[0, 92])
+                    if lat_tip <= 0.44 or (lat_tip <= 0.52 and cross_xy <= -0.08):
+                        final_scores["R"] = 0.92 * p_uvr
+                        final_scores["U"] = 0.06 * p_uvr
+                        final_scores["V"] = 0.02 * p_uvr
+                        sign_p2_map["R"] = max(sign_p2_map.get("R", 0.0), 0.92)
+                        sign_specialist_map["R"] = "Upright Specialist"
+                    elif lat_tip >= 1.42 or (spread_r >= 1.52 and cross_xy >= 0.06):
+                        final_scores["V"] = 0.92 * p_uvr
+                        final_scores["U"] = 0.06 * p_uvr
+                        final_scores["R"] = 0.02 * p_uvr
+                        sign_p2_map["V"] = max(sign_p2_map.get("V", 0.0), 0.92)
+                        sign_specialist_map["V"] = "Upright Specialist"
+                    elif 0.50 <= lat_tip <= 1.35 and spread_r <= 1.45:
+                        final_scores["U"] = 0.92 * p_uvr
+                        final_scores["V"] = 0.04 * p_uvr
+                        final_scores["R"] = 0.04 * p_uvr
+                        sign_p2_map["U"] = max(sign_p2_map.get("U", 0.0), 0.92)
+                        sign_specialist_map["U"] = "Upright Specialist"
+            elif top_prelim in ("P", "Q", "X"):
+                # 3D Anatomical P vs Q vs X separation using zero-overlap joint angles & thumb-middle distance:
+                # raw_asl[0, 67] = idx_PIP, [68] = idx_DIP, [70] = mid_PIP, [94] = d(4,12), [116] = y4_cam, [119] = y8_cam
+                # - X: hooked index (PIP<2.82 or DIP<2.75), curled middle (mid_PIP<1.35 or d4_12<0.30), upright (y8<-0.75)
+                # - Q: straight index (PIP>=2.78, DIP>=2.72), downward thumb & index (y4>+0.15, y8>+0.05), curled middle (mid_PIP<1.92)
+                # - P: straight index (PIP>=2.78, DIP>=2.72), extended middle (mid_PIP>=1.90), thumb not pointing straight down (y4<=+0.25)
+                p_pqx = (
+                    float(final_scores.get("P", 0.0))
+                    + float(final_scores.get("Q", 0.0))
+                    + float(final_scores.get("X", 0.0))
+                )
+                if p_pqx >= 0.40:
+                    idx_pip = float(raw_asl[0, 67])
+                    idx_dip = float(raw_asl[0, 68])
+                    mid_pip = float(raw_asl[0, 70])
+                    d4_12 = float(raw_asl[0, 94])
+                    y4_cam = float(raw_asl[0, 116])
+                    y8_cam = float(raw_asl[0, 119])
+
+                    is_x_geom = (idx_pip < 2.82 or idx_dip < 2.75) and (mid_pip < 1.38 or d4_12 < 0.30) and (y8_cam < -0.65)
+                    is_q_geom = (idx_pip >= 2.75 and idx_dip >= 2.70) and (y4_cam > 0.15 and y8_cam > 0.05) and (mid_pip < 1.92)
+                    is_p_geom = (idx_pip >= 2.75 and idx_dip >= 2.70) and (mid_pip >= 1.90) and (y4_cam <= 0.25)
+
+                    if is_x_geom:
+                        final_scores["X"] = 0.92 * p_pqx
+                        final_scores["P"] = 0.04 * p_pqx
+                        final_scores["Q"] = 0.04 * p_pqx
+                        sign_p2_map["X"] = max(sign_p2_map.get("X", 0.0), 0.92)
+                        sign_specialist_map["X"] = "Curve/Pinch Specialist"
+                    elif is_q_geom:
+                        final_scores["Q"] = 0.92 * p_pqx
+                        final_scores["P"] = 0.05 * p_pqx
+                        final_scores["X"] = 0.03 * p_pqx
+                        sign_p2_map["Q"] = max(sign_p2_map.get("Q", 0.0), 0.92)
+                        sign_specialist_map["Q"] = "Curve/Pinch Specialist"
+                    elif is_p_geom:
+                        final_scores["P"] = 0.92 * p_pqx
+                        final_scores["Q"] = 0.05 * p_pqx
+                        final_scores["X"] = 0.03 * p_pqx
+                        sign_p2_map["P"] = max(sign_p2_map.get("P", 0.0), 0.92)
+                        sign_specialist_map["P"] = "Curve/Pinch Specialist"
 
         ranked = sorted(final_scores.items(), key=lambda kv: kv[1], reverse=True)
         top_sign, p_top = ranked[0][0], float(ranked[0][1])
@@ -843,11 +937,11 @@ class ASLOEnsembleRouter:
         """
         raw_w = aslo_features.validate_word_feature_vector(word_features_1d)
         w_scaled = self.words_scaler.transform(raw_w)
-        probs_w = self._fast_words(tf.constant(w_scaled, dtype=tf.float32)).numpy()[0].copy()
+        probs_w = self._fast_words(w_scaled)[0].copy()
 
         has_first_hand = bool(np.any(np.abs(raw_w[0, 0:124]) > 1e-4))
         has_second_hand = bool(np.any(np.abs(raw_w[0, 124:248]) > 1e-4)) or force_two_hand
-        STRICT_ONE_HAND_WORDS = {"you", "fine", "i love you", "thank you", "hello", "j_start", "j_end", "z_start", "z_end"}
+        STRICT_ONE_HAND_WORDS = {"you", "fine", "i love you", "thank you", "hello_start", "hello_end", "j_start", "j_end", "z_start", "z_end"}
         STRICT_TWO_HAND_WORDS = {
             "me", "love", "start", "stop", "space", "backspace", "back space", "neutral",
             "how are you_start", "how are you_end", "nice to meet you_start", "nice to meet you_end",
@@ -900,6 +994,17 @@ class ASLOEnsembleRouter:
                     elif w_low == "start":
                         probs_w[i_w] = max(float(probs_w[i_w]), 0.65)
 
+            # 3. Single-hand 'YOU' strictly uses the INDEX finger, NEVER the little finger (pinky):
+            #    At the bottom scoop of dynamic 'J', the pinky points forward toward the camera (foreshortened).
+            #    Zero out 'you' whenever pinky extension exceeds index extension (`w_ext_pky > w_ext_idx + 0.04`).
+            if not has_second_hand:
+                w_ext_idx = float(raw_w[0, 79])
+                w_ext_pky = float(raw_w[0, 82])
+                if w_ext_pky > w_ext_idx + 0.04:
+                    for i_w, w_lbl in enumerate(self.words_labels):
+                        if str(w_lbl).strip().lower() == "you":
+                            probs_w[i_w] = 0.0
+
         s_w = float(np.sum(probs_w))
         if s_w > 1e-6:
             probs_w = probs_w / s_w
@@ -944,10 +1049,10 @@ class ASLOEnsembleRouter:
 
         raw_w = aslo_features.validate_word_feature_vector(word_features_1d)
         kf_scaled = self.dynamic_keyframe_scaler.transform(raw_w)
-        probs_kf = self._fast_dynamic_keyframe(tf.constant(kf_scaled, dtype=tf.float32)).numpy()[0].copy()
+        probs_kf = self._fast_dynamic_keyframe(kf_scaled)[0].copy()
 
         has_second_hand = bool(np.any(np.abs(raw_w[0, 124:248]) > 1e-4))
-        STRICT_1H_KF = {"j_start", "j_end", "z_start", "z_end"}
+        STRICT_1H_KF = {"hello_start", "hello_end", "j_start", "j_end", "z_start", "z_end"}
         STRICT_2H_KF = {
             "how are you_start", "how are you_end",
             "nice to meet you_start", "nice to meet you_end",
@@ -987,6 +1092,7 @@ class ASLOEnsembleRouter:
         hand_type: str = "right",
         motion_speed: float = 0.0,
         wrist_y: Optional[float] = None,
+        single_hand_word_features_1d: Optional[np.ndarray] = None,
     ) -> Dict:
         """
         Unified Merged Router (`meta_router_mlp.keras`):
@@ -1071,7 +1177,7 @@ class ASLOEnsembleRouter:
         def _cos_sim(embed_fn, scaler_obj, raw_vec, centroids):
             if embed_fn is None or scaler_obj is None or centroids is None:
                 return 0.0
-            emb = embed_fn(tf.constant(scaler_obj.transform(raw_vec), dtype=tf.float32)).numpy()[0]
+            emb = embed_fn(scaler_obj.transform(raw_vec))[0]
             norm_e = float(np.linalg.norm(emb))
             if norm_e < 1e-7:
                 return 0.0
@@ -1105,7 +1211,7 @@ class ASLOEnsembleRouter:
             ]
         ).astype(np.float32)
         meta_scaled = self.meta_router_scaler.transform(meta_vec)
-        meta_probs = self._fast_meta_router(tf.constant(meta_scaled, dtype=tf.float32)).numpy()[0].copy()
+        meta_probs = self._fast_meta_router(meta_scaled)[0].copy()
 
         # Structural constraint: 2-hand inputs can never be static_asl
         if effective_two_hand or res_asl is None:
@@ -1142,32 +1248,181 @@ class ASLOEnsembleRouter:
             words_pred_l = str(res_words.get("prediction") or (res_words.get("telemetry") or {}).get("top_label") or "").strip().lower()
             kf_pred_u = str(res_kf.get("prediction") or (res_kf.get("telemetry") or {}).get("top_label") or "").strip().upper()
 
-            if asl_pred_u == "B" and words_pred_l == "hello":
-                palm_x9 = float(raw_asl_chk[0, 121])
-                palm_y9 = float(raw_asl_chk[0, 122])
-                roll_deg = abs(float(np.degrees(np.arctan2(palm_x9, -palm_y9))))
-                # hello is signed high near forehead (wrist_y <= 0.36) OR tilted sideways (|roll| >= 10 deg);
-                # B is signed straight vertical (|roll| < 10 deg) at chest height (wrist_y > 0.36).
-                is_hello_geom = (wrist_y is not None and wrist_y <= 0.36) or (roll_deg >= 10.0)
-                if is_hello_geom and float(res_words.get("confidence") or 0.0) >= 0.55:
+            words_second_l = str((res_words.get("telemetry") or {}).get("second_label") or "").strip().lower()
+            ext_thumb = float(raw_asl_chk[0, 78])
+            ext_idx = float(raw_asl_chk[0, 79])
+            ext_mid = float(raw_asl_chk[0, 80])
+            ext_rng = float(raw_asl_chk[0, 81])
+            ext_pky = float(raw_asl_chk[0, 82])
+            min_4f = min(ext_idx, ext_mid, ext_rng, ext_pky)
+            th_ip = float(raw_asl_chk[0, 65])
+            d4_8 = float(raw_asl_chk[0, 93])
+            p4_dx5 = float(raw_asl_chk[0, 97])
+            d_4_9 = float(np.linalg.norm(raw_asl_chk[0, 103:106]))
+            min_pip_4f = float(np.min(raw_asl_chk[0, [67, 70, 73, 76]]))
+            palm_x9 = float(raw_asl_chk[0, 121])
+            palm_y9 = float(raw_asl_chk[0, 122])
+            roll_signed = float(np.degrees(np.arctan2(palm_x9, -palm_y9)))
+            roll_deg = abs(roll_signed)
+
+            # (a) Dynamic HELLO (hello_START / hello_END) vs Static ASL & Static Words:
+            #     - Strictly requires all 4 fingers straight & flat (min_4f >= 1.56, min_pip_4f >= 2.80, d4_8 >= 0.45)
+            #       so C (min_pip<=2.68), W (min_pip<=1.56), F (min_pip<=2.48), Thank you, Fine, I love you, YOU NEVER trigger HELLO!
+            #     - Upright flat palm (-14.0 < roll_signed < +8.5 deg) routes strictly to Static ASL 'B'.
+            is_other_valid_word = (
+                best_domain == "static_words"
+                and words_pred_l in ("thank you", "fine", "i love you", "you")
+                and res_words.get("status") == "valid"
+            )
+            is_flat_open_b_shape = (
+                min_4f >= 1.56
+                and min_pip_4f >= 2.80
+                and d4_8 >= 0.58
+                and (not is_other_valid_word)
+            )
+
+            if best_domain == "dynamic_keyframe" and kf_pred_u in ("HELLO_START", "HELLO_END"):
+                if is_other_valid_word:
                     best_domain = "static_words"
                     meta_conf = max(meta_conf, 0.88)
                     meta_margin = max(meta_margin, 0.45)
-                elif (not is_hello_geom) and float(res_asl.get("confidence") or 0.0) >= 0.55:
-                    best_domain = "static_asl"
-                    meta_conf = max(meta_conf, 0.88)
-                    meta_margin = max(meta_margin, 0.45)
+                elif (not is_flat_open_b_shape) or (-14.0 < roll_signed < 8.5):
+                    if float(res_asl.get("confidence") or 0.0) >= 0.52:
+                        best_domain = "static_asl"
+                        meta_conf = max(meta_conf, 0.90)
+                        meta_margin = max(meta_margin, 0.50)
+            elif is_flat_open_b_shape:
+                if roll_signed <= -16.5:
+                    res_kf = dict(res_kf)
+                    res_kf["prediction"] = "hello_START"
+                    res_kf["status"] = "valid"
+                    res_kf["confidence"] = max(float(res_kf.get("confidence") or 0.0), 0.88)
+                    best_domain = "dynamic_keyframe"
+                    meta_conf = max(meta_conf, 0.90)
+                    meta_margin = max(meta_margin, 0.50)
+                elif roll_signed >= 9.5:
+                    res_kf = dict(res_kf)
+                    res_kf["prediction"] = "hello_END"
+                    res_kf["status"] = "valid"
+                    res_kf["confidence"] = max(float(res_kf.get("confidence") or 0.0), 0.88)
+                    best_domain = "dynamic_keyframe"
+                    meta_conf = max(meta_conf, 0.90)
+                    meta_margin = max(meta_margin, 0.50)
 
+            # (b) Stationary static ASL P/Q/X/D vs Z_START:
+            #     Never override Z_END (the user slows down to hold Z_END at the end of Z; uninitiated Z_END
+            #     is already ignored by the frontend). Only prefer static ASL over Z_START when completely still
+            #     and static ASL is overwhelmingly confident (>= 0.88).
             if (
                 best_domain == "dynamic_keyframe"
-                and kf_pred_u in ("Z_START", "Z_END")
-                and motion_speed < 0.025
+                and kf_pred_u == "Z_START"
+                and motion_speed < 0.010
                 and asl_pred_u in ("P", "Q", "X", "D")
-                and float(res_asl.get("confidence") or 0.0) >= 0.65
+                and float(res_asl.get("confidence") or 0.0) >= 0.88
             ):
                 best_domain = "static_asl"
                 meta_conf = max(meta_conf, 0.85)
                 meta_margin = max(meta_margin, 0.40)
+
+            # (b2) N vs T (both CLUSTER_FIST): thumb-tip lateral offset from the middle-finger PIP joint
+            #      in the rotation-invariant palm frame (feature 106) separates them with zero overlap:
+            #        N (thumb under index + middle, tip between middle & ring): f106 98th pct = 0.013
+            #        T (thumb tucked between index & middle):                  f106 min      = 0.019
+            #      A dead zone keeps the MLP's own decision for borderline frames; flipping to T also requires
+            #      the thumb to sit index-side of the ring MCP (f109), pinky MCP (f112) and a tight T pinch (f84).
+            asl_valid_pred_u = str(res_asl.get("prediction") or "").strip().upper()
+            if best_domain == "static_asl" and asl_valid_pred_u in ("N", "T"):
+                f_th_mid = float(raw_asl_chk[0, 106])
+                is_t_thumb = (
+                    f_th_mid >= 0.030
+                    and float(raw_asl_chk[0, 109]) >= 0.076
+                    and float(raw_asl_chk[0, 112]) >= 0.20
+                    and 0.125 <= float(raw_asl_chk[0, 84]) <= 0.19
+                )
+                new_nt = "N" if f_th_mid <= 0.005 else ("T" if is_t_thumb else None)
+                if new_nt is not None:
+                    res_asl = dict(res_asl)
+                    res_asl["prediction"] = new_nt
+                    res_asl["top_label"] = new_nt
+                    res_asl["status"] = "valid"
+                    res_asl["confidence"] = max(float(res_asl.get("confidence") or 0.0), 0.80)
+                    meta_conf = max(meta_conf, 0.85)
+                    meta_margin = max(meta_margin, 0.40)
+
+            # (c) 3D Anatomical 'Y' (flared thumb 🤙) vs Dynamic 'J' ('J_START' / 'J_END', tucked thumb):
+            #     Static ASL has no 'I' class, so `asl_stage1_router_mlp` predicts "Y" on any pinky-extended
+            #     pose, while `meta_router_mlp` can confuse tilted 'Y' (🤙) with 'J_END'.
+            #     In 3D palm-aligned coordinates, thumb-to-index-tip distance `d4_8`, lateral thumb flare `p4_dx5`,
+            #     and thumb IP straightness `th_ip` cleanly separate flared-thumb 'Y' from tucked-thumb 'J':
+            #       - 'Y' (🤙): d4_8 >= 0.38 (5%=0.528), th_ip >= 2.68 (min=2.691), ext_thumb >= 1.65 (2%=1.660)
+            #       - 'J_START' ('I' upright): d4_8 <= 0.239, p4_dx5 <= 0.080, th_ip <= 2.635
+            #       - 'J_END' ('J' bottom hook, inward or outward): d4_8 <= 0.347, ext_thumb <= 1.643, roll_deg >= 20°
+            max_imr = max(ext_idx, ext_mid, ext_rng)
+            idx_pip = float(raw_asl_chk[0, 67])
+            pky_pip = float(raw_asl_chk[0, 76])
+            is_protected_1h_word = (
+                best_domain == "static_words"
+                and res_words.get("status") == "valid"
+                and (
+                    (words_pred_l == "me" and ext_pky < 1.70)
+                    or (
+                        words_pred_l in ("you", "i love you", "fine", "thank you")
+                        and ext_idx >= 1.35
+                        and ext_idx >= ext_pky - 0.04
+                    )
+                )
+            )
+            is_pinky_only_pose = (
+                ext_pky >= 1.50
+                and pky_pip >= 2.35
+                and max_imr < 1.68
+                and (ext_pky - ext_idx) >= 0.35
+                and (ext_pky - max(ext_mid, ext_rng)) >= 0.30
+                and (not is_protected_1h_word)
+            )
+            if is_pinky_only_pose:
+                is_flared_y_thumb = (
+                    max_imr < 1.32
+                    and (idx_pip < 1.15 or d4_8 >= 0.48 or p4_dx5 <= 0.22)
+                    and (
+                        (th_ip >= 2.68 and ext_thumb >= 1.65)
+                        or (th_ip >= 2.68 and d4_8 >= 0.36 and idx_pip < 1.15)
+                        or (th_ip >= 2.68 and p4_dx5 <= 0.22)
+                    )
+                )
+                if is_flared_y_thumb:
+                    res_asl = dict(res_asl)
+                    res_asl["prediction"] = "Y"
+                    res_asl["top_label"] = "Y"
+                    res_asl["status"] = "valid"
+                    res_asl["confidence"] = max(float(res_asl.get("confidence") or 0.0), 0.88)
+                    best_domain = "static_asl"
+                    meta_conf = max(meta_conf, 0.90)
+                    meta_margin = max(meta_margin, 0.50)
+                else:
+                    # Non-'Y' pinky-dominant pose: scooped/tilted/foreshortened -> J_END, crisp upright 'I' -> J_START
+                    is_j_end_scoop = (
+                        roll_deg >= 20.0
+                        or idx_pip >= 1.18
+                        or max_imr >= 1.15
+                        or ext_pky < 1.75
+                        or kf_pred_u == "J_END"
+                    )
+                    res_kf = dict(res_kf)
+                    res_kf["prediction"] = "J_END" if is_j_end_scoop else "J_START"
+                    res_kf["status"] = "valid"
+                    res_kf["confidence"] = max(float(res_kf.get("confidence") or 0.0), 0.88)
+                    best_domain = "dynamic_keyframe"
+                    meta_conf = max(meta_conf, 0.90)
+                    meta_margin = max(meta_margin, 0.50)
+
+            # (d) Guard Static ASL 'Y' against cupped 1-hand occluded HOW ARE YOU hands:
+            #     Genuine 'Y' has a straight pinky clearly separated from the curled ring finger.
+            if best_domain == "static_asl" and str(res_asl.get("prediction") or "").strip().upper() == "Y":
+                if not (ext_pky >= 1.35 and (ext_pky - ext_rng) >= 0.38 and pky_pip >= 2.25):
+                    res_asl = dict(res_asl)
+                    res_asl["prediction"] = None
+                    res_asl["status"] = "ambiguous"
 
         if best_domain == "static_asl" and res_asl is not None:
             winner = res_asl
@@ -1186,10 +1441,41 @@ class ASLOEnsembleRouter:
         winner["telemetry"] = winner_telem
 
         # Strict Meta-Router Gate: never let an uncertain cross-domain guess override another model!
-        req_meta_conf = 0.72 if (best_domain == "dynamic_keyframe" and not has_second_hand) else 0.65
+        req_meta_conf = 0.72 if (best_domain == "dynamic_keyframe" and not effective_two_hand) else 0.65
         if meta_conf < req_meta_conf or meta_margin < 0.18:
             winner["prediction"] = None
             winner["status"] = "ambiguous"
+
+        # Smart 2-Hand vs Passive-Left-Hand Fallback:
+        # When both hands are visible in the camera frame (`effective_two_hand == True`) AND the user
+        # is actually performing a 1-hand gesture with their Right hand while their Left hand is just
+        # passively in view, the combined 2-hand pose will be OUT-OF-DISTRIBUTION (`w_cos < 0.78` and
+        # `kf_cos < 0.75`) or `ambiguous`. Automatically fall back to Right-hand 1-hand inference!
+        if effective_two_hand and (asl_features_1d is not None) and (single_hand_word_features_1d is not None):
+            pred_2h_low = str(winner.get("prediction") or "").strip().lower()
+            active_2h_cos = w_cos if best_domain == "static_words" else kf_cos
+            if pred_2h_low in ("how are you_start", "how are you_end", "nice to meet you_start", "nice to meet you_end") and float(winner.get("confidence") or 0.0) >= 0.72:
+                min_2h_cos = 0.50
+            else:
+                min_2h_cos = 0.78 if best_domain == "static_words" else 0.75
+            is_genuine_2h = (
+                winner.get("status") == "valid"
+                and winner.get("prediction") is not None
+                and active_2h_cos >= min_2h_cos
+                and pred_2h_low != "neutral"
+            )
+            if not is_genuine_2h:
+                res_1h_fallback = self.predict_merged_auto(
+                    asl_features_1d=asl_features_1d,
+                    word_features_1d=single_hand_word_features_1d,
+                    hand_type="right",
+                    motion_speed=motion_speed,
+                    wrist_y=wrist_y,
+                    single_hand_word_features_1d=None,
+                )
+                if res_1h_fallback.get("status") == "valid" and res_1h_fallback.get("prediction") is not None:
+                    return res_1h_fallback
+
         return winner
 
     def _evaluate_single_dynamic_window(
@@ -1202,7 +1488,7 @@ class ASLOEnsembleRouter:
             aslo_features.extract_dynamic_mlp_features(window_frames)
         )
         d_scaled = self.dynamic_scaler.transform(raw_d)
-        probs_d = self._fast_dynamic(tf.constant(d_scaled, dtype=tf.float32)).numpy()[0].copy()
+        probs_d = self._fast_dynamic(d_scaled)[0].copy()
 
         total_len = float(raw_d[0, 389])
         bw = float(raw_d[0, 390])
@@ -1230,16 +1516,30 @@ class ASLOEnsembleRouter:
                 lbl_up = str(lbl_d).strip().upper()
 
                 # 1. Global active dynamic trajectory & continuous mid->end morphing envelope:
-                #    All 4 dynamic signs have total_len >= 0.90, max(bw, bh) >= 0.44, shape_change >= 0.80,
-                #    and sh_mid_end >= 0.30 (whereas moving into a static sign and holding it has sh_mid_end < 0.28).
-                if total_len < 0.88 or max(bw, bh) < 0.42 or shape_change < 0.78 or sh_mid_end < 0.28:
+                min_sh_change = 0.12 if lbl_up in ("J", "HELLO") else 0.78
+                min_sh_mid_end = 0.08 if lbl_up in ("J", "HELLO") else 0.28
+                min_total_len = 0.68 if lbl_up == "HELLO" else 0.88
+                if total_len < min_total_len or max(bw, bh) < 0.35 or shape_change < min_sh_change or sh_mid_end < min_sh_mid_end:
                     lbl_d = None
                     status_d = "static_hold"
+                elif lbl_up == "HELLO":
+                    # HELLO keeps 4 fingers extended while sweeping horizontally outward
+                    min_4f_s = float(np.min(ext_s[1:5]))
+                    min_4f_e = float(np.min(ext_e[1:5]))
+                    if min_4f_s < 1.42 or min_4f_e < 1.42 or bw < 0.38 or total_len < 0.68:
+                        lbl_d = None
+                        status_d = "static_hold"
                 elif lbl_up == "J":
-                    # J requires the Pinky finger (index 4) to be extended and dominant over Index (index 1)
+                    # J keeps a pinky-extended shape with thumb tucked (reject moving flared-thumb 'Y' 🤙!)
                     max_pinky = max(float(ext_s[4]), float(ext_m[4]), float(ext_e[4]))
                     pinky_adv = max(float(ext_s[4] - ext_s[1]), float(ext_m[4] - ext_m[1]))
-                    if max_pinky < 1.55 or pinky_adv < 0.35 or total_len < 1.25 or bh < 0.40 or shape_change < 1.05 or sh_mid_end < 0.45:
+                    d4_8_s, p4_dx5_s, th_ip_s = float(raw_d[0, 93]), float(raw_d[0, 97]), float(raw_d[0, 65])
+                    d4_8_m, p4_dx5_m, th_ip_m = float(raw_d[0, 208]), float(raw_d[0, 212]), float(raw_d[0, 180])
+                    is_moving_y_hand = (
+                        d4_8_s >= 0.42 and p4_dx5_s >= 0.25 and th_ip_s >= 2.68
+                        and d4_8_m >= 0.42 and p4_dx5_m >= 0.25 and th_ip_m >= 2.68
+                    )
+                    if is_moving_y_hand or max_pinky < 1.45 or pinky_adv < 0.30 or total_len < 0.90 or bh < 0.32:
                         lbl_d = None
                         status_d = "static_hold"
                 elif lbl_up == "Z":
@@ -1288,8 +1588,8 @@ class ASLOEnsembleRouter:
         best_res = self._evaluate_single_dynamic_window(sequence_buffer, req_conf, enforce_motion_envelope)
 
         n_frames = len(sequence_buffer) if sequence_buffer is not None else 0
-        if enforce_motion_envelope and n_frames >= 14:
-            for tail_len in (12, 16, 20):
+        if enforce_motion_envelope and n_frames >= 18:
+            for tail_len in (18, 22):
                 if n_frames > tail_len:
                     sub_res = self._evaluate_single_dynamic_window(
                         sequence_buffer[-tail_len:], req_conf, enforce_motion_envelope
@@ -1310,6 +1610,7 @@ class ASLOEnsembleRouter:
         motion_speed: float = 0.0,
         static_features_1d: Optional[np.ndarray] = None,
         wrist_y: Optional[float] = None,
+        single_hand_word_features_1d: Optional[np.ndarray] = None,
     ) -> Dict:
         """
         PART 3.2: 3-Type Cooperative Routing (`static_asl`, `static_words`, `dynamic_gestures`):
@@ -1328,20 +1629,23 @@ class ASLOEnsembleRouter:
         hand_type_clean = (hand_type or "right").lower().strip()
         seq_len = len(sequence_buffer) if sequence_buffer is not None else 0
 
-        # Auto hot-reload if any model on disk was retrained or merged
-        try:
-            check_files = [
-                os.path.join(self.models_dir, "asl_stage1_router_mlp.keras"),
-                os.path.join(self.models_dir, "words_static_mlp.keras"),
-                os.path.join(self.models_dir, "dynamic_mlp.keras"),
-                os.path.join(self.models_dir, "dynamic_keyframe_mlp.keras"),
-                os.path.join(self.models_dir, "meta_router_mlp.keras"),
-            ]
-            existing_mtimes = [os.path.getmtime(p) for p in check_files if os.path.exists(p)]
-            if existing_mtimes and max(existing_mtimes) > self._loaded_mtime + 0.5:
-                self.load_all_models()
-        except Exception:
-            pass
+        # Auto hot-reload check throttled to once every 3.0s (avoids 5 disk stat() calls per frame)
+        now_t = time.monotonic()
+        if now_t - self._last_mtime_check >= 3.0:
+            self._last_mtime_check = now_t
+            try:
+                check_files = [
+                    os.path.join(self.models_dir, "asl_stage1_router_mlp.keras"),
+                    os.path.join(self.models_dir, "words_static_mlp.keras"),
+                    os.path.join(self.models_dir, "dynamic_mlp.keras"),
+                    os.path.join(self.models_dir, "dynamic_keyframe_mlp.keras"),
+                    os.path.join(self.models_dir, "meta_router_mlp.keras"),
+                ]
+                existing_mtimes = [os.path.getmtime(p) for p in check_files if os.path.exists(p)]
+                if existing_mtimes and max(existing_mtimes) > self._loaded_mtime + 0.5:
+                    self.load_all_models()
+            except Exception:
+                pass
 
         # Legacy 310-dim row support if passed via static_features_1d
         if static_features_1d is not None:
@@ -1400,6 +1704,7 @@ class ASLOEnsembleRouter:
                 hand_type=hand_type_clean,
                 motion_speed=float(motion_speed or 0.0),
                 wrist_y=wrist_y,
+                single_hand_word_features_1d=single_hand_word_features_1d,
             )
             pred_ctrl_low = str(precomputed_merged_res.get("prediction") or "").strip().lower()
             conf_ctrl = float(precomputed_merged_res.get("confidence") or 0.0)
@@ -1450,12 +1755,11 @@ class ASLOEnsembleRouter:
                 sh_mid_end_est = 0.0
 
             # Require active ongoing motion (`motion_speed >= 0.032` or `recent_tail_disp >= 0.35`)
-            # AND substantial trajectory travel (`window_disp >= 0.65`) AND continuous mid->end shape change (`sh_mid_end_est >= 0.30`)
+            # AND substantial trajectory travel (`window_disp >= 0.65`) AND continuous shape/wrist motion
             should_check_dyn = (
                 (motion_speed >= 0.032 or recent_tail_disp >= 0.35)
                 and window_disp >= 0.65
-                and window_shape_change >= 0.80
-                and sh_mid_end_est >= 0.28
+                and (window_shape_change >= 0.80 or (window_disp >= 0.90 and recent_tail_disp >= 0.35))
             )
             if should_check_dyn:
                 res_dyn = self.predict_dynamic_sequence(
@@ -1543,6 +1847,7 @@ class ASLOEnsembleRouter:
                 hand_type=hand_type_clean,
                 motion_speed=float(motion_speed or 0.0),
                 wrist_y=wrist_y,
+                single_hand_word_features_1d=single_hand_word_features_1d,
             )
         )
 

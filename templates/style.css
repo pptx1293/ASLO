@@ -126,14 +126,22 @@ button:focus-visible {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 38px;
-    height: 38px;
+    width: 40px;
+    height: 40px;
     border-radius: var(--radius-sm);
     background: linear-gradient(135deg, rgba(0, 240, 255, 0.15), rgba(168, 85, 247, 0.15));
-    border: 1px solid rgba(0, 240, 255, 0.3);
-    color: var(--cyan);
-    font-size: 1.3rem;
-    box-shadow: 0 0 15px rgba(0, 240, 255, 0.2);
+    border: 1px solid rgba(0, 240, 255, 0.4);
+    overflow: hidden;
+    padding: 0;
+    flex-shrink: 0;
+    box-shadow: 0 0 15px rgba(0, 240, 255, 0.25);
+}
+
+.brand-logo-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
 }
 
 .brand-info h1 {
@@ -275,8 +283,7 @@ button:focus-visible {
 }
 
 #camera-feed,
-#webcam,
-#output_canvas {
+#webcam {
     width: 100%;
     height: 100%;
     object-fit: cover;
@@ -284,6 +291,22 @@ button:focus-visible {
     display: block;
     background: #030508;
     transform: scaleX(-1); /* Mirrored for natural user signing intuition */
+    transition: transform 0.25s ease;
+}
+
+#output_canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center;
+    display: block;
+    background: transparent !important;
+    pointer-events: none;
+    z-index: 4;
+    transform: scaleX(-1); /* Synchronized mirror with #webcam */
     transition: transform 0.25s ease;
 }
 
@@ -332,8 +355,7 @@ button:focus-visible {
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
-    background: rgba(7, 9, 14, 0.75);
-    backdrop-filter: blur(8px);
+    background: rgba(7, 9, 14, 0.90);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: var(--radius-pill);
     font-family: var(--font-mono);
@@ -414,8 +436,7 @@ button:focus-visible {
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(14, 18, 26, 0.75);
-    backdrop-filter: blur(10px);
+    background: rgba(14, 18, 26, 0.90);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-sm);
     color: var(--text-secondary);
@@ -478,9 +499,7 @@ button:focus-visible {
     left: 16px;
     width: 200px;
     max-width: calc(100% - 32px);
-    background: rgba(9, 13, 22, 0.90);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
+    background: rgba(9, 13, 22, 0.94);
     border: 1px solid rgba(0, 240, 255, 0.22);
     border-radius: var(--radius-sm);
     box-shadow: 0 8px 30px rgba(0, 0, 0, 0.65), 0 0 15px rgba(0, 240, 255, 0.1);
@@ -2324,6 +2343,8 @@ button:focus-visible {
     background: rgba(0, 240, 255, 0.15);
     color: var(--cyan);
     border: 1px solid rgba(0, 240, 255, 0.35);
+}
+
 .dict-badge.finger {
     background: rgba(255, 152, 0, 0.2);
     color: #ff9800;

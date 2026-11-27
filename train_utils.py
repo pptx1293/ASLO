@@ -37,23 +37,27 @@ DYN_KEYFRAME_LABELS = {
     "how are you_end",
     "nice to meet you_start",
     "nice to meet you_end",
+    "hello_start",
+    "hello_end",
     "j_start",
     "j_end",
     "z_start",
     "z_end",
 }
 
-STRICT_ONE_HAND_WORDS = {"fine", "i love you", "thank you", "you", "hello"}
+STRICT_ONE_HAND_WORDS = {"fine", "i love you", "thank you", "you"}
 SINGLE_HAND_VIEW_CONTROL_SET = set()  # Control words are strictly 2-handed so they NEVER override 1-hand ASL letters!
 STRICT_TWO_HAND_WORDS = {"me", "love", "start", "stop", "space", "backspace", "back space", "neutral"}
 
-STRICT_ONE_HAND_DYN_KEYFRAMES = {"j_start", "j_end", "z_start", "z_end"}
+STRICT_ONE_HAND_DYN_KEYFRAMES = {"hello_start", "hello_end", "j_start", "j_end", "z_start", "z_end"}
 STRICT_TWO_HAND_DYN_KEYFRAMES = {
     "how are you_start",
     "how are you_end",
     "nice to meet you_start",
     "nice to meet you_end",
 }
+
+EXPLICIT_DYNAMIC_GESTURES = {"hello", "j", "z", "how are you", "nice to meet you"}
 
 
 def natural_sort_key(s: str):
@@ -140,7 +144,7 @@ def auto_categorize_dataset(dataset_dir: str, df: pd.DataFrame) -> Dict:
             )
 
             clean_name = folder_name.strip()
-            if has_video or has_seq_dir:
+            if has_video or has_seq_dir or clean_name.lower() in EXPLICIT_DYNAMIC_GESTURES:
                 dynamic_folders.add(clean_name)
             elif len(clean_name) == 1 and clean_name.isalnum():
                 static_asl_folders.add(clean_name.upper())
@@ -149,7 +153,7 @@ def auto_categorize_dataset(dataset_dir: str, df: pd.DataFrame) -> Dict:
 
     csv_labels = sorted(df["label"].unique()) if (df is not None and not df.empty) else []
     label_to_type = {}
-    dynamic_base_upper = {d.upper() for d in dynamic_folders}
+    dynamic_base_upper = {d.upper() for d in dynamic_folders} | {d.upper() for d in EXPLICIT_DYNAMIC_GESTURES}
     dynamic_keyframes = set()
 
     for lbl in csv_labels:
@@ -286,6 +290,7 @@ def train_and_evaluate_mlp_with_scaler(
         verbose=0,
     )
 
+    train_loss, train_acc = model.evaluate(X_train_scaled, y_train, verbose=0)
     val_loss, val_acc = model.evaluate(X_test_scaled, y_test, verbose=0)
     model_path = os.path.join(MODELS_DIR, f"{model_prefix}_mlp.keras")
     model.save(model_path)
@@ -297,16 +302,54 @@ def train_and_evaluate_mlp_with_scaler(
     )
     cm = confusion_matrix(y_test, y_pred)
 
-    print(f"[{model_title}] Saved '{model_path}', '{labels_path}', & '{scaler_path}'")
-    print(f"[{model_title}] Validation Accuracy: {val_acc * 100:.2f}% (Loss: {val_loss:.4f})")
+    hist_clean = {
+        k: [float(v) for v in vals]
+        for k, vals in history.history.items()
+    }
+    val_losses = hist_clean.get("val_loss", [])
+    best_epoch = int(np.argmin(val_losses) + 1) if val_losses else len(hist_clean.get("loss", []))
 
-    return model, le, scaler, {
+    metrics_payload = {
+        "model_prefix": model_prefix,
+        "model_title": model_title,
+        "input_dim": int(X.shape[1]),
+        "num_classes": int(num_classes),
+        "train_samples": int(X_train.shape[0]),
+        "val_samples": int(X_test.shape[0]),
+        "epochs_ran": int(len(hist_clean.get("loss", []))),
+        "best_epoch": int(best_epoch),
+        "train_acc": float(train_acc),
+        "train_loss": float(train_loss),
         "val_acc": float(val_acc),
         "val_loss": float(val_loss),
+        "classes": target_names,
+        "report": report,
+        "cm": cm.tolist(),
+        "history": hist_clean,
+    }
+    metrics_path = os.path.join(MODELS_DIR, f"{model_prefix}_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as mf:
+        json.dump(metrics_payload, mf, indent=2)
+
+    print(f"[{model_title}] Saved '{model_path}', '{labels_path}', '{scaler_path}', & '{metrics_path}'")
+    print(
+        f"[{model_title}] Train Acc: {train_acc * 100:.2f}% | "
+        f"Val Acc: {val_acc * 100:.2f}% (Val Loss: {val_loss:.4f}, Best Epoch: {best_epoch}/{metrics_payload['epochs_ran']})"
+    )
+
+    return model, le, scaler, {
+        "train_acc": float(train_acc),
+        "train_loss": float(train_loss),
+        "val_acc": float(val_acc),
+        "val_loss": float(val_loss),
+        "best_epoch": int(best_epoch),
+        "epochs_ran": int(metrics_payload["epochs_ran"]),
+        "train_samples": int(X_train.shape[0]),
+        "val_samples": int(X_test.shape[0]),
         "report": report,
         "cm": cm,
         "classes": target_names,
-        "history": history.history,
+        "history": hist_clean,
     }
 
 

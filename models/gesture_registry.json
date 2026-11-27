@@ -86,7 +86,6 @@
     "Thank you",
     "YOU",
     "backspace",
-    "hello",
     "neutral",
     "space",
     "start",
@@ -96,7 +95,8 @@
     "How are you",
     "J",
     "Nice to meet you",
-    "Z"
+    "Z",
+    "hello"
   ],
   "dynamic_keyframes": [
     "How are you_END",
@@ -106,7 +106,9 @@
     "Nice to meet you_END",
     "Nice to meet you_START",
     "Z_END",
-    "Z_START"
+    "Z_START",
+    "hello_END",
+    "hello_START"
   ],
   "label_to_type": {
     "A": "static_asl",
@@ -147,7 +149,8 @@
     "Z_END": "dynamic_gestures",
     "Z_START": "dynamic_gestures",
     "backspace": "static_words",
-    "hello": "static_words",
+    "hello_END": "dynamic_gestures",
+    "hello_START": "dynamic_gestures",
     "neutral": "static_words",
     "space": "static_words",
     "start": "static_words",

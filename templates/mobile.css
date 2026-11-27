@@ -90,8 +90,23 @@ body {
 }
 
 .brand-icon {
-    font-size: 1.35rem;
-    filter: drop-shadow(0 0 10px rgba(0, 240, 255, 0.5));
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    border: 1px solid rgba(0, 240, 255, 0.4);
+    overflow: hidden;
+    flex-shrink: 0;
+    box-shadow: 0 0 12px rgba(0, 240, 255, 0.3);
+}
+
+.brand-logo-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
 }
 
 .brand-title {
@@ -196,6 +211,9 @@ body {
     left: 0;
     width: 100%;
     height: 100%;
+    object-fit: cover;
+    object-position: center;
+    background: transparent !important;
     pointer-events: none;
     z-index: 10;
     transform: scaleX(-1);

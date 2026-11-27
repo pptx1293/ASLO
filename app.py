@@ -13,10 +13,14 @@ import traceback
 
 import cv2
 from flask import Flask, Response, jsonify, make_response, render_template, request
+from werkzeug.serving import WSGIRequestHandler
 try:
     from flask_cors import CORS
 except ImportError:
     CORS = None
+
+# Enable persistent HTTP/1.1 keep-alive connections so /predict_landmarks reuses one warm TCP socket
+WSGIRequestHandler.protocol_version = "HTTP/1.1"
 
 import numpy as np
 import tensorflow as tf
@@ -35,13 +39,41 @@ from speech_to_text import SUPPORTED_LANGUAGES, engine as stt_engine
 
 app = Flask(__name__, static_folder="templates", static_url_path="")
 if CORS is not None:
-    CORS(app, resources={r"/*": {"origins": "*"}})
+    CORS(app, resources={r"/*": {"origins": "*"}}, max_age=86400)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+
+def _load_warmup_hand_jpeg() -> bytes:
+    """Preloads a tiny 320x240 real hand JPEG in RAM so browser MediaPipe compiles hand-landmark WebGL shaders at page load."""
+    for sub in ("picture_file/B", "picture_file/hello", "picture_file/A"):
+        if os.path.isdir(sub):
+            for fn in os.listdir(sub):
+                if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+                    img = cv2.imread(os.path.join(sub, fn))
+                    if img is not None:
+                        small = cv2.resize(img, (320, 240))
+                        ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                        if ok:
+                            return buf.tobytes()
+    blank = np.zeros((240, 320, 3), dtype=np.uint8)
+    _, buf = cv2.imencode(".jpg", blank)
+    return buf.tobytes()
+
+
+_WARMUP_HAND_JPEG = _load_warmup_hand_jpeg()
 
 
 @app.route("/ping", methods=["GET"])
 def ping():
     return jsonify({"status": "online", "engine": "local"}), 200
+
+
+@app.route("/warmup_hand.jpg", methods=["GET"])
+def warmup_hand_jpg():
+    resp = make_response(_WARMUP_HAND_JPEG)
+    resp.headers["Content-Type"] = "image/jpeg"
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 
 
 # ── Stateless Cooperative Multi-MLP Ensemble Router ────────────────────────
@@ -306,6 +338,7 @@ def process_landmarks_data(
     # Build Canonical 3D Palm-Frame Feature Vectors for ASL (124-dim) and Static Words (252-dim)
     asl_features = None
     word_features = None
+    single_hand_word_features = None
     detected_hand = "both" if is_two_hand_inference else "right"
     is_resting_single = False
 
@@ -313,11 +346,27 @@ def process_landmarks_data(
     if is_two_hand_inference:
         r_lms = aslo_features.HandLandmarks(r_pts)
         l_lms = aslo_features.HandLandmarks(l_pts)
-        word_features = aslo_features.extract_static_word_features((r_lms, l_lms), hand_type="both")
+        r_wy = float(r_lms.landmark[0].y)
+        l_wy = float(l_lms.landmark[0].y)
+        single_wrist_y = r_wy
+        # Always extract Right-hand 1-hand features too so a passive Left hand in the camera frame
+        # NEVER blocks 1-hand ASL letters, 1-hand words, or 1-hand dynamic signs!
+        asl_features = aslo_features.extract_asl_features(r_lms)
+        single_hand_word_features = aslo_features.extract_static_word_features(r_lms, hand_type="right")
+
+        # If the Left hand is clearly lower/resting while the Right hand is actively raised signing,
+        # immediately treat it as a 1-hand Right-hand sign.
+        if (l_wy >= 0.80 and r_wy < 0.72) or (l_wy >= 0.62 and (l_wy - r_wy) >= 0.16):
+            is_two_hand_inference = False
+            detected_hand = "right"
+            word_features = single_hand_word_features
+        else:
+            word_features = aslo_features.extract_static_word_features((r_lms, l_lms), hand_type="both")
     elif single_pts and len(single_pts) >= 21:
         single_lms = aslo_features.HandLandmarks(single_pts)
         asl_features = aslo_features.extract_asl_features(single_lms)
         word_features = aslo_features.extract_static_word_features(single_lms, hand_type="right")
+        single_hand_word_features = word_features
         single_wrist_y = float(single_lms.landmark[0].y)
         is_resting_single = single_wrist_y > 0.90
 
@@ -356,6 +405,7 @@ def process_landmarks_data(
     route_res = mlp_router.route_and_predict(
         asl_features_1d=asl_features,
         word_features_1d=word_features,
+        single_hand_word_features_1d=single_hand_word_features,
         hand_type=effective_hand_type,
         mode=mode_clean,
         sequence_buffer=mirrored_seq,
@@ -713,7 +763,7 @@ def api_dictionary():
         "X": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Index finger bent into a curved hook, other fingers curled into palm.", "tips": "Bend the top knuckle of the index finger like a pirate's hook."},
         "Y": {"category": "static", "type": "alphabet", "handedness": "right", "desc": "Thumb and pinky extended outward like 'hang loose' / phone, three middle fingers curled.", "tips": "Extend thumb and pinky as wide as comfortable."},
         "Z": {"category": "dynamic", "type": "alphabet", "handedness": "right", "desc": "Index finger extended, tracing a 'Z' zigzag path horizontally, diagonally down, and horizontally.", "tips": "Draw the letter Z cleanly in the air with the index fingertip."},
-        "HELLO": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Open hand touching side of forehead/temple and waving gently outward in a salute.", "tips": "Salute outward from temple toward the conversation partner."},
+        "HELLO": {"category": "dynamic", "type": "phrase", "handedness": "right", "desc": "Start with open hand tilted inward near temple/forehead, then sweep/wave outward to complete the greeting.", "tips": "Start tilted near temple (HELLO_START), then wave outward until tilted away (HELLO_END)."},
         "THANK YOU": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Flat open hand touches chin/lips and extends forward and outward toward receiver.", "tips": "Palm faces upward/inward as hand extends forward toward the person."},
         "I LOVE YOU": {"category": "static", "type": "phrase", "handedness": "right", "desc": "Thumb, index, and pinky extended upright (combines I, L, Y); middle and ring curled.", "tips": "Universal ASL 'ILY' sign with palm facing forward."},
         "LOVE": {"category": "static", "type": "phrase", "handedness": "both", "desc": "Both hands crossed over chest in a gentle hug.", "tips": "Cross wrists over upper chest with hands resting against shoulders."},
@@ -794,4 +844,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting ASLO Flask Server on port {port}...")
     print(f"Navigate to http://localhost:{port} in your browser.")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

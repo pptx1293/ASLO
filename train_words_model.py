@@ -121,6 +121,11 @@ def build_augmented_words_dataset(
         if lbl_lower in STRICT_ONE_HAND_WORDS:
             l_base = np.zeros((21, 3), dtype=np.float32)
             has_l = False
+            if lbl_lower == "you":
+                # Drop contaminated pinky-extended frames mislabeled as 'YOU' in CSV
+                sh_r = extract_static_word_features((r_base, l_base), hand_type="right")
+                if float(sh_r[82]) > float(sh_r[79]) + 0.04:
+                    continue
 
         if lbl_lower in STRICT_TWO_HAND_WORDS and not has_l:
             l_base = r_base.copy()

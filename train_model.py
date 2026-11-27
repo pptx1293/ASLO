@@ -17,9 +17,8 @@ Usage:
 """
 
 import argparse
-import matplotlib.pyplot as plt
-import seaborn as sns
 
+import generate_training_report
 import merge_models
 import train_asl_model
 import train_dynamic_model
@@ -63,32 +62,10 @@ def main():
         print(f"4. Merged Meta-Router MLP           : Val Acc = {merge_res['meta_router']['val_acc']*100:6.2f}%")
         print("=" * 72 + "\n")
 
-        plt.figure(figsize=(16, 12))
-        if "CLUSTER_FIST" in asl_res["specialists"]:
-            st_f = asl_res["specialists"]["CLUSTER_FIST"]
-            plt.subplot(2, 2, 1)
-            sns.heatmap(st_f["cm"], annot=True, fmt="d", cmap="Blues", xticklabels=st_f["classes"], yticklabels=st_f["classes"])
-            plt.title(f"Model 1: ASL Fist Specialist ({st_f['val_acc']*100:.1f}%)")
-
-        st_w = words_res["words"]
-        plt.subplot(2, 2, 2)
-        sns.heatmap(st_w["cm"], annot=True, fmt="d", cmap="Purples", xticklabels=st_w["classes"], yticklabels=st_w["classes"])
-        plt.title(f"Model 2: Pure Static Words ({st_w['val_acc']*100:.1f}%)")
-
-        st_d = dyn_res["dynamic_trajectory"]
-        plt.subplot(2, 2, 3)
-        sns.heatmap(st_d["cm"], annot=True, fmt="d", cmap="Greens", xticklabels=st_d["classes"], yticklabels=st_d["classes"])
-        plt.title(f"Model 3A: Dynamic 25-Frame ({st_d['val_acc']*100:.1f}%)")
-
-        st_m = merge_res["meta_router"]
-        plt.subplot(2, 2, 4)
-        sns.heatmap(st_m["cm"], annot=True, fmt="d", cmap="Oranges", xticklabels=st_m["classes"], yticklabels=st_m["classes"])
-        plt.title(f"Merger: Meta-Router MLP ({st_m['val_acc']*100:.1f}%)")
-
-        plt.tight_layout()
-        plt.savefig("training_report.png")
-        plt.close()
-        print("Saved multi-model confusion matrix report to 'training_report.png'.")
+        generate_training_report.main()
+    else:
+        # Also refresh visual reports whenever any subset finishes and metrics exist
+        generate_training_report.main()
 
 
 if __name__ == "__main__":

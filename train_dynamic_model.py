@@ -112,7 +112,7 @@ def _build_static_hold_dynamic_samples(df_csv: pd.DataFrame, rng) -> Tuple[np.nd
         if (
             lbl_str.upper().endswith("_START")
             or lbl_str.upper().endswith("_END")
-            or lbl_str.upper() in ("J", "Z", "HOW ARE YOU", "NICE TO MEET YOU")
+            or lbl_str.upper() in ("J", "Z", "HELLO", "HOW ARE YOU", "NICE TO MEET YOU")
         ):
             continue
         r_vals = df_csv[df_csv["label"] == lbl].iloc[:4, 0:63].values.astype(np.float32)
@@ -125,15 +125,15 @@ def _build_static_hold_dynamic_samples(df_csv: pd.DataFrame, rng) -> Tuple[np.nd
         if (
             lbl_str.upper().endswith("_START")
             or lbl_str.upper().endswith("_END")
-            or lbl_str.upper() in ("J", "Z", "HOW ARE YOU", "NICE TO MEET YOU")
+            or lbl_str.upper() in ("J", "Z", "HELLO", "HOW ARE YOU", "NICE TO MEET YOU")
         ):
             continue
-        rows = df_csv[df_csv["label"] == lbl].iloc[:9, 0:63].values.astype(np.float32)
+        rows = df_csv[df_csv["label"] == lbl].iloc[:12, 0:63].values.astype(np.float32)
         rows = rows[np.any(rows != 0, axis=1)]
         n_take = (
-            9
+            12
             if lbl_str.upper()
-            in ("X", "Q", "D", "G", "P", "L", "I", "Y", "YOU", "FINE", "HELLO", "START", "STOP", "ME", "LOVE")
+            in ("B", "F", "W", "X", "Q", "D", "G", "P", "L", "I", "Y", "YOU", "FINE", "THANK YOU", "START", "STOP", "ME", "LOVE")
             else 6
         )
         for r_idx, r63 in enumerate(rows[:n_take]):
@@ -183,7 +183,7 @@ def build_dynamic_dataset(
     """
     Builds the 25-frame Dynamic Gestures dataset (`EXPECTED_DYNAMIC_DIM = 393`) for `models/dynamic_mlp.keras`.
     """
-    cache_path = os.path.join(MODELS_DIR, "dynamic_sequences_v5_cache.npz")
+    cache_path = os.path.join(MODELS_DIR, "dynamic_sequences_v6_cache.npz")
     rng = np.random.default_rng(42)
     if os.path.exists(cache_path):
         try:
@@ -296,11 +296,36 @@ def build_dynamic_dataset(
                     raw_trajectories.append(traj)
 
             if len(raw_trajectories) < 4 and len(image_files) >= 6:
-                chunk_size = max(6, min(25, len(image_files) // 4))
-                for c_start in range(0, len(image_files), chunk_size):
-                    chunk = image_files[c_start : c_start + chunk_size]
-                    if len(chunk) < 4:
-                        continue
+                import re as _re
+                def _img_ts_sec(fname: str) -> int:
+                    m = _re.search(r"_(\d{2})_(\d{2})_(\d{2})_Pro", fname)
+                    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) if m else -1
+
+                # Group consecutive burst captures (gap <= 5s) as genuine temporal motion sequences!
+                burst_chunks = []
+                if _img_ts_sec(image_files[0]) >= 0:
+                    cur_b = [image_files[0]]
+                    for im_f in image_files[1:]:
+                        t_prev = _img_ts_sec(cur_b[-1])
+                        t_cur = _img_ts_sec(im_f)
+                        if t_prev >= 0 and t_cur >= 0 and (t_cur - t_prev) > 5:
+                            if len(cur_b) >= 6:
+                                burst_chunks.append(cur_b)
+                            cur_b = [im_f]
+                        else:
+                            cur_b.append(im_f)
+                    if len(cur_b) >= 6:
+                        burst_chunks.append(cur_b)
+
+                if not burst_chunks:
+                    chunk_size = max(6, min(25, len(image_files) // 4))
+                    burst_chunks = [
+                        image_files[c_start : c_start + chunk_size]
+                        for c_start in range(0, len(image_files), chunk_size)
+                        if len(image_files[c_start : c_start + chunk_size]) >= 4
+                    ]
+
+                for chunk in burst_chunks:
                     traj = []
                     for im_name in chunk:
                         img = cv2.imread(os.path.join(class_dir, im_name))
@@ -312,8 +337,12 @@ def build_dynamic_dataset(
                         pts = _extract_dominant_hand_21x3(res)
                         if pts is not None:
                             traj.append(pts)
-                    if len(traj) >= 4:
+                    if len(traj) >= 6:
                         raw_trajectories.append(traj)
+                        if len(traj) >= 24:
+                            n_tr = len(traj)
+                            raw_trajectories.append(traj[int(n_tr * 0.05) : int(n_tr * 0.85)])
+                            raw_trajectories.append(traj[int(n_tr * 0.15) : n_tr])
 
         start_col_lbl = f"{dyn_label}_START"
         end_col_lbl = f"{dyn_label}_END"
@@ -364,6 +393,10 @@ def build_dynamic_dataset(
                                     z_dir * 1.15 * amp * sc * u,
                                     (1.05 + 0.15 * u) * amp * sc,
                                 )
+                        elif dyn_upper == "HELLO":
+                            # Outward temple/forehead salute or wave sweep (+X outward, gentle arc in Y)
+                            dx = 0.85 * amp * sc * t
+                            dy = 0.12 * amp * sc * np.sin(np.pi * t)
                         elif "HOW ARE YOU" in dyn_upper:
                             dx = 0.45 * amp * sc * np.sin(np.pi * 0.5 * t)
                             dy = 0.95 * amp * sc * t
@@ -454,10 +487,26 @@ def build_augmented_dynamic_keyframes_dataset(
             feats_list.append(extract_static_word_features((l_base, r_base), hand_type="both"))
             labels_list.append(lbl)
 
-        for _ in range(num_augs + (2 if not has_l else 0)):
+        n_kf_augs = (
+            (num_augs + 6)
+            if lbl_lower == "hello_end"
+            else (num_augs + (2 if not has_l else 0))
+        )
+        rz_range = (-5.0, 5.0) if lbl_lower in ("hello_start", "hello_end") else (-13.0, 13.0)
+        if lbl_lower == "hello_end":
+            rz_range = (-2.0, 14.0)  # Keep hello_END tilted outward (>= +9 deg, never rotating into upright B!)
+        elif lbl_lower == "hello_start":
+            rz_range = (-12.0, 2.0)  # Keep hello_START tilted inward (<= -16 deg, never rotating into upright B!)
+
+        for aug_i in range(n_kf_augs):
             r_pts = r_base.copy()
             l_pts = l_base.copy()
             if has_r:
+                # Also synthesize open-thumb 5-finger variations for hello_START / hello_END so waving with an open thumb works too
+                if lbl_lower in ("hello_start", "hello_end") and (aug_i % 2 == 1):
+                    v_out = (r_pts[5] - r_pts[17]) * float(rng.uniform(0.35, 0.70)) + (r_pts[9] - r_pts[0]) * 0.25
+                    r_pts[3] = r_pts[2] + v_out * 0.55
+                    r_pts[4] = r_pts[2] + v_out * 1.10
                 r_pts[:, 2] *= float(rng.uniform(0.30, 1.65))
                 r_noise = rng.normal(0.0, 0.024, size=r_pts.shape).astype(np.float32)
                 r_noise[0] = 0.0
@@ -465,7 +514,7 @@ def build_augmented_dynamic_keyframes_dataset(
                     r_pts + r_noise,
                     float(rng.uniform(-11.0, 11.0)),
                     float(rng.uniform(-11.0, 11.0)),
-                    float(rng.uniform(-13.0, 13.0)),
+                    float(rng.uniform(rz_range[0], rz_range[1])),
                 )
                 r_pts[0] = 0.0
             if has_l:

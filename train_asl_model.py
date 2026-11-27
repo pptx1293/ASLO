@@ -54,7 +54,7 @@ def build_augmented_asl_dataset(
         feats_list.append(extract_asl_features(base_pts))
         labels_list.append(lbl)
 
-        augs_for_row = 3 if lbl in ("U", "V", "R", "K", "P", "Q", "X") else num_augs
+        augs_for_row = 6 if lbl in ("P", "Q", "X") else (3 if lbl in ("U", "V", "R", "K") else num_augs)
         for _ in range(augs_for_row):
             pts = base_pts.copy()
             z_scale = float(rng.uniform(0.30, 1.65))
@@ -102,26 +102,35 @@ def build_augmented_asl_dataset(
                     pts[4, 1] = min(float(pts[4, 1]), -1.24)
             elif lbl == "X":
                 pts += noise
-                hook_drop = float(rng.uniform(0.0, 0.22))
-                pts[8, 1] = min(float(pts[8, 1]) + hook_drop, -0.95)
-                pts[8, 2] = float(pts[8, 2]) - float(rng.uniform(0.0, 0.12))
-                pts[4, 1] = min(float(pts[4, 1]), -0.25)
+                # Span full natural hook depth (light hook -> deep hook) so live webcam X always detects cleanly
+                hook_drop = float(rng.uniform(0.0, 0.52))
+                pts[8, 1] = float(pts[8, 1]) + hook_drop
+                pts[7, 1] = float(pts[7, 1]) + hook_drop * 0.45
+                pts[8, 2] = float(pts[8, 2]) - float(rng.uniform(0.0, 0.22))
+                pts[4, 1] = min(float(pts[4, 1]), -0.20)
             elif lbl == "Q":
                 pts += noise
-                pts[8, 1] = max(float(pts[8, 1]), 0.15)
-                pts[4, 1] = max(float(pts[4, 1]), 0.35)
+                pts[8, 1] = max(float(pts[8, 1]), 0.10)
+                pts[4, 1] = max(float(pts[4, 1]), 0.25)
             elif lbl == "P":
                 pts += noise
-                pts[8, 1] = float(np.clip(pts[8, 1], -0.98, 0.05))
-                pts[4, 1] = min(float(pts[4, 1]), 0.10)
             else:
                 pts += noise
 
-            rz_lim = 3.5 if lbl == "B" else 11.0
+            if lbl in ("P", "Q"):
+                rx_lim, ry_lim, rz_lim = 26.0, 38.0, 20.0
+            elif lbl == "X":
+                rx_lim, ry_lim, rz_lim = 20.0, 42.0, 16.0
+            elif lbl == "B":
+                rx_lim, ry_lim, rz_lim = 9.0, 9.0, 3.5
+            elif lbl == "Y":
+                rx_lim, ry_lim, rz_lim = 18.0, 22.0, 38.0
+            else:
+                rx_lim, ry_lim, rz_lim = 9.0, 9.0, 11.0
             pts = _rotate_pts_3d(
                 pts,
-                float(rng.uniform(-9.0, 9.0)),
-                float(rng.uniform(-9.0, 9.0)),
+                float(rng.uniform(-rx_lim, rx_lim)),
+                float(rng.uniform(-ry_lim, ry_lim)),
                 float(rng.uniform(-rz_lim, rz_lim)),
             )
             pts[0] = 0.0

@@ -76,8 +76,11 @@ let mobileSmoothedConf = 0;
 // ── Dual-Host API Resolver & Engine Auto-Negotiation ────────────────────────
 const CLOUD_BACKEND_URL = "https://aslo-1.onrender.com";
 const isLocalHost = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
-const API_BASE_URL = isLocalHost
+const LOCAL_IPV4_ORIGIN = (window.location.hostname === '127.0.0.1' && window.location.port)
     ? ''
+    : `http://127.0.0.1:${window.location.port || '5000'}`;
+const API_BASE_URL = isLocalHost
+    ? LOCAL_IPV4_ORIGIN
     : (window.location.hostname.includes('onrender.com') ? '' : CLOUD_BACKEND_URL);
 
 let currentInferenceUrl = API_BASE_URL;
@@ -88,7 +91,8 @@ async function checkLocalServerAlive() {
     try {
         const controller = new AbortController();
         const tid = setTimeout(() => controller.abort(), 600);
-        const res = await fetch("http://127.0.0.1:5000/ping", {
+        const pingBase = LOCAL_IPV4_ORIGIN || "http://127.0.0.1:5000";
+        const res = await fetch(`${pingBase}/ping`, {
             method: "GET",
             mode: "cors",
             signal: controller.signal
@@ -116,7 +120,7 @@ async function updateMobileServerNegotiation() {
 
     if (serverMode === "local") {
         if (isLocalAlive || isLocalHost) {
-            currentInferenceUrl = isLocalHost ? "" : "http://127.0.0.1:5000";
+            currentInferenceUrl = isLocalHost ? LOCAL_IPV4_ORIGIN : "http://127.0.0.1:5000";
             if (pill) {
                 pill.textContent = "Local (0ms)";
                 pill.style.background = "#10b981";
@@ -141,9 +145,9 @@ async function updateMobileServerNegotiation() {
         }
         if (downloadLink) downloadLink.style.display = "none";
     } else {
-        // "auto" mode: when served from localhost/127.0.0.1, ALWAYS use the local server (same origin)
+        // "auto" mode: use explicit IPv4 127.0.0.1 so Windows never hits 2s IPv6 [::1] SYN timeouts on localhost
         if (isLocalHost || isLocalAlive) {
-            currentInferenceUrl = isLocalHost ? "" : "http://127.0.0.1:5000";
+            currentInferenceUrl = isLocalHost ? LOCAL_IPV4_ORIGIN : "http://127.0.0.1:5000";
             if (pill) {
                 pill.textContent = "Auto: Local (0ms)";
                 pill.style.background = "#10b981";
@@ -173,7 +177,7 @@ function initMobileServerNegotiator() {
         });
     }
     updateMobileServerNegotiation();
-    setInterval(updateMobileServerNegotiation, 10000);
+    setInterval(updateMobileServerNegotiation, 4000);
 }
 
 // ── State Hysteresis & Latching Constants & State ──────────────────────────
@@ -372,7 +376,7 @@ const HAND_CONNECTIONS = [
  * while dynamically increasing cutoff frequency during fast motion to eliminate lag.
  */
 class MobileOneEuroFilter {
-    constructor(minCutoff = 1.2, beta = 1.2, dCutoff = 1.0) {
+    constructor(minCutoff = 3.0, beta = 20.0, dCutoff = 1.5) {
         this.minCutoff = minCutoff;
         this.beta = beta;
         this.dCutoff = dCutoff;
@@ -426,17 +430,16 @@ class MobileOneEuroFilter {
 }
 
 /**
- * Resolves the physical hand considering camera mirroring.
- * On front selfie camera (isMirrored === true), MediaPipe's non-mirrored model
- * classifies the user's physical Right hand as "Left".
+ * Resolves the signer's actual physical hand from MediaPipe's handedness metadata.
+ * Raw <video> frames passed into MediaPipe are always unflipped (CSS scaleX only flips display),
+ * so MediaPipe always reports inverted handedness ("Left" for signer's Right, "Right" for signer's Left)
+ * on BOTH front (mirror) and rear (true/environment) cameras.
  */
 function getActualPhysicalHand(handednessObj) {
     if (!handednessObj) return "Right";
     const raw = (handednessObj.label || (handednessObj.classification && handednessObj.classification[0] && handednessObj.classification[0].label) || "").trim();
-    if (isMirrored) {
-        if (raw === "Left") return "Right";
-        if (raw === "Right") return "Left";
-    }
+    if (raw === "Left") return "Right";
+    if (raw === "Right") return "Left";
     return raw || "Right";
 }
 
@@ -543,13 +546,14 @@ function isolatePrimaryUserHands(multiHandLandmarks, multiHandedness) {
             (primary.physicalHand === "Left" && cand.physicalHand === "Right")
         );
         if (!isOpposite) {
-            // Assign opposite based on horizontal position so touching/overlapping hands in START/STOP pair reliably
+            // Raw MediaPipe coordinates are ALWAYS unflipped regardless of CSS mirror display:
+            // facing the camera, the signer's physical Right hand has smaller wrist.x than Left.
             if (cand.wrist.x < primary.wrist.x) {
-                cand.physicalHand = isMirrored ? "Right" : "Left";
-                primary.physicalHand = isMirrored ? "Left" : "Right";
+                cand.physicalHand = "Right";
+                primary.physicalHand = "Left";
             } else {
-                cand.physicalHand = isMirrored ? "Left" : "Right";
-                primary.physicalHand = isMirrored ? "Right" : "Left";
+                cand.physicalHand = "Left";
+                primary.physicalHand = "Right";
             }
         }
 
@@ -622,7 +626,7 @@ class MobileLandmarkEMASmoother {
     }
 }
 
-const mobileLandmarkEMASmoother = new MobileLandmarkEMASmoother(0.65);
+const mobileLandmarkEMASmoother = new MobileLandmarkEMASmoother(0.85);
 
 // ── Mobile 25-Frame Rolling Sequence Buffer & Unified 3-MLP Cooperative Mode ──
 const MOBILE_DYNAMIC_SEQ_LEN = 25;
@@ -733,7 +737,7 @@ function updateMobilePipelineStatusUI(status) {
  * Resolves hands by spatial continuity (wrist proximity) rather than noisy handedness classification.
  */
 class MobileSpatialHandTracker {
-    constructor(minCutoff = 1.2, beta = 1.2, dCutoff = 1.0) {
+    constructor(minCutoff = 3.0, beta = 20.0, dCutoff = 1.5) {
         this.minCutoff = minCutoff;
         this.beta = beta;
         this.dCutoff = dCutoff;
@@ -1060,7 +1064,7 @@ class MobileJTrajectoryTracker {
 
 const mobileJTrajectoryTracker = new MobileJTrajectoryTracker();
 
-const mobileStabilizer = new MobileSpatialHandTracker(1.0, 0.05, 1.0);
+const mobileStabilizer = new MobileSpatialHandTracker(3.0, 20.0, 1.5);
 let currentMobileStabilizedHands = [];
 
 function getMobileTemporalSmoothedLandmarks(handKey, rawPts, timestamp = performance.now()) {
@@ -1081,9 +1085,46 @@ function toMobileLandmarkArray(landmarks) {
 let mobileHands = null;
 let mobileCamera = null;
 let lastMobilePredictTime = 0;
-const MOBILE_PREDICT_INTERVAL = 45; // ~22 Hz fast stream for ultra-low latency (every 45ms)
-let currentMobileMinDetectionConfidence = 0.55;
+const MOBILE_PREDICT_INTERVAL = 60; // ~16.5 Hz non-blocking inference stream
 let mobileDroppedFramesCount = 0;
+let mobileCanvasDirty = false;
+let isMobileMpWarmupRunning = false;
+let isMobileMpWarmupComplete = false;
+let mobileMpWarmupPromise = null;
+
+async function prewarmMobileMediaPipe() {
+    if (isMobileMpWarmupComplete || !mobileHands) return;
+    if (mobileMpWarmupPromise) return mobileMpWarmupPromise;
+    mobileMpWarmupPromise = (async () => {
+        isMobileMpWarmupRunning = true;
+        try {
+            if (typeof mobileHands.initialize === "function") {
+                await mobileHands.initialize();
+            }
+            await new Promise((resolve) => {
+                const img = new Image();
+                img.crossOrigin = "anonymous";
+                const timer = setTimeout(resolve, 2500);
+                img.onload = async () => {
+                    clearTimeout(timer);
+                    try { await mobileHands.send({ image: img }); } catch (_) { }
+                    resolve();
+                };
+                img.onerror = () => {
+                    clearTimeout(timer);
+                    resolve();
+                };
+                const base = currentInferenceUrl || "";
+                img.src = `${base}/warmup_hand.jpg`;
+            });
+        } catch (_) {
+        } finally {
+            isMobileMpWarmupRunning = false;
+            isMobileMpWarmupComplete = true;
+        }
+    })();
+    return mobileMpWarmupPromise;
+}
 
 function initMobileMediaPipe() {
     if (mobileHands) return mobileHands;
@@ -1094,43 +1135,42 @@ function initMobileMediaPipe() {
             locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
         });
 
-        // Decoupled Dual-Threshold Confidence
+        // Fixed options set ONCE (avoids expensive WASM graph rebuilds inside onResults;
+        // minTrackingConfidence 0.50 retains lightweight ROI crop mode)
         mobileHands.setOptions({
-            maxNumHands: 4,
+            maxNumHands: 2,
             modelComplexity: 1,
-            minDetectionConfidence: 0.55,
-            minTrackingConfidence: 0.65
+            minDetectionConfidence: 0.50,
+            minTrackingConfidence: 0.50
         });
 
         mobileHands.onResults((results) => {
+            if (isMobileMpWarmupRunning) return;
             const canvas = dom.landmarkCanvas;
             if (!canvas) return;
             const ctx = canvas.getContext("2d");
             if (!ctx) return;
 
-            // Tracking fallback: if tracking drops > 4 frames, drop detection confidence to 0.45
             const hasRawHands = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
             if (!hasRawHands) {
                 mobileDroppedFramesCount++;
-                if (mobileDroppedFramesCount > 4 && currentMobileMinDetectionConfidence !== 0.45) {
-                    currentMobileMinDetectionConfidence = 0.45;
-                    mobileHands.setOptions({ minDetectionConfidence: 0.45, minTrackingConfidence: 0.65 });
-                }
             } else {
                 mobileDroppedFramesCount = 0;
-                if (currentMobileMinDetectionConfidence !== 0.55) {
-                    currentMobileMinDetectionConfidence = 0.55;
-                    mobileHands.setOptions({ minDetectionConfidence: 0.55, minTrackingConfidence: 0.65 });
-                }
             }
 
-            const rect = canvas.getBoundingClientRect();
-            if (canvas.width !== rect.width || canvas.height !== rect.height) {
-                canvas.width = rect.width;
-                canvas.height = rect.height;
+            const vw = (dom.webcam && dom.webcam.videoWidth) || 640;
+            const vh = (dom.webcam && dom.webcam.videoHeight) || 480;
+            const targetW = 480;
+            const targetH = Math.max(240, Math.round((480 * vh) / Math.max(1, vw)));
+            if (canvas.width !== targetW || canvas.height !== targetH) {
+                canvas.width = targetW;
+                canvas.height = targetH;
             }
 
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (hasRawHands || mobileCanvasDirty) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                mobileCanvasDirty = hasRawHands;
+            }
 
             // 1. Single-person hand isolation before skeleton rendering and inference
             const isolation = isolatePrimaryUserHands(results.multiHandLandmarks, results.multiHandedness);
@@ -1201,37 +1241,11 @@ function initMobileMediaPipe() {
                 }
             }
 
-            // Trajectory-Based State Machine for Dynamic "J" on Mobile
-            if (currentMobileStabilizedHands.length === 1 && isolation.hands.length === 1 && isolation.hands[0].physicalHand === "Right") {
-                const jResult = mobileJTrajectoryTracker.update(currentMobileStabilizedHands[0].landmarks, now);
-                if (jResult.committed) {
-                    activeSign = "J";
-                    lastConfirmedGesture = "J";
-                    lockUntil = Date.now() + HYSTERESIS_LOCK_MS;
-                    if (isRecording) {
-                        appendMobileSignToSentence("J");
-                    }
-                    showToast("Dynamic Sign: J");
-                    applyMobileTelemetry({
-                        ok: true,
-                        prediction: "J",
-                        live_gesture: "J",
-                        live_conf: 1.0,
-                        confidence: 1.0,
-                        detected_hand: "right",
-                        status: "running"
-                    });
-                    return;
-                }
-                if (jResult.suppressStatic) {
-                    updateMobilePipelineStatusUI("DYNAMIC: J (IN MOTION)");
-                    return; // Suppress static single-frame updates
-                }
-            } else if (currentMobileStabilizedHands.length === 0) {
+            if (currentMobileStabilizedHands.length === 0) {
                 mobileJTrajectoryTracker.reset();
             }
 
-            // 2. Throttled backend landmark prediction (non-blocking lock)
+            // 2. Throttled backend landmark prediction (non-blocking lock; dynamic J uses unified J_START -> Timer -> J_END flow)
             const nowTime = performance.now();
             if (nowTime - lastMobilePredictTime >= MOBILE_PREDICT_INTERVAL) {
                 if (isRequestPending || isPredicting) return;
@@ -1278,6 +1292,81 @@ function updateTranscriptDOM() {
     }
 }
 
+// ── Static "I" vs Dynamic "J" ──
+// "I" uses the same handshape as the first frame of "J" (J_START).
+// Repositioning the hand (raising up, shifting sideways, or holding still) stays static "I".
+// Dynamic "J" only starts when the pinky & wrist follow the downward/curved J drawing pattern.
+let clientIPoseLastSeen = 0;
+let clientLastICommitTime = 0;
+
+function isDrawingJPattern(seqBuf, rawPredUpper) {
+    if (!seqBuf || seqBuf.length < 5) return false;
+    const n = seqBuf.length;
+    const cur = seqBuf[n - 1];
+    const lookback = Math.min(n - 1, 12);
+    const startIdx = n - 1 - lookback;
+    const scale = Math.max(0.05, Math.hypot(cur[0][0] - cur[9][0], cur[0][1] - cur[9][1]));
+
+    let minPinkyY = cur[20][1];
+    let minPinkyIdx = n - 1;
+    for (let i = startIdx; i < n; i++) {
+        if (seqBuf[i][20][1] < minPinkyY) {
+            minPinkyY = seqBuf[i][20][1];
+            minPinkyIdx = i;
+        }
+    }
+    const ref = seqBuf[startIdx];
+    const peak = seqBuf[minPinkyIdx];
+
+    const pinkyDrop = (cur[20][1] - peak[20][1]) / scale;
+    const wristDrop = (cur[0][1] - peak[0][1]) / scale;
+    const netDy20 = (cur[20][1] - ref[20][1]) / scale;
+    const netDx20 = Math.abs(cur[20][0] - ref[20][0]) / scale;
+    const prev3 = seqBuf[Math.max(0, n - 4)];
+    const recentDy20 = (cur[20][1] - prev3[20][1]) / scale;
+
+    if (rawPredUpper === "J_END") {
+        return (pinkyDrop >= 0.18 || wristDrop >= 0.14 || Math.hypot(netDx20, netDy20) >= 0.25);
+    }
+
+    return (
+        pinkyDrop >= 0.32
+        && wristDrop >= 0.16
+        && netDy20 >= 0.24
+        && recentDy20 >= 0.06
+        && netDy20 >= 0.55 * netDx20
+    );
+}
+
+function isDrawingZPattern(seqBuf) {
+    if (!seqBuf || seqBuf.length < 5) return false;
+    const n = seqBuf.length;
+    const cur = seqBuf[n - 1];
+    const lookback = Math.min(n - 1, 12);
+    const startIdx = n - 1 - lookback;
+    const scale = Math.max(0.05, Math.hypot(cur[0][0] - cur[9][0], cur[0][1] - cur[9][1]));
+    const ref = seqBuf[startIdx];
+    const prev3 = seqBuf[Math.max(0, n - 4)];
+
+    const netDx8 = Math.abs(cur[8][0] - ref[8][0]) / scale;
+    const netDy8 = (cur[8][1] - ref[8][1]) / scale;
+    const recentDx8 = Math.abs(cur[8][0] - prev3[8][0]) / scale;
+    return (
+        netDx8 >= 0.30
+        && recentDx8 >= 0.06
+        && netDy8 > -0.35
+        && netDx8 >= 0.65 * Math.abs(netDy8)
+    );
+}
+
+function retractRecentStaticI(now) {
+    if (clientLastICommitTime && (now - clientLastICommitTime) < 3500 && clientSentence.endsWith("I")) {
+        clientSentence = clientSentence.slice(0, -1);
+        updateTranscriptDOM();
+    }
+    clientLastICommitTime = 0;
+}
+
 function appendSignToTranscript(sign) {
     if (!sign || sign === "—" || sign.toUpperCase() === "NEUTRAL" || sign.toUpperCase() === "IDLE") return;
     const clean = stripInternalSuffix(sign).trim();
@@ -1288,7 +1377,7 @@ function appendSignToTranscript(sign) {
     const now = Date.now();
 
     // Prevent duplicate consecutive multi-word phrases within 1.4s cooldown
-    const isDynamicPhrase = cleanUpper.includes(" ") || cleanUpper === "HOW ARE YOU" || cleanUpper === "NICE TO MEET YOU";
+    const isDynamicPhrase = cleanUpper.includes(" ") || cleanUpper === "HOW ARE YOU" || cleanUpper === "NICE TO MEET YOU" || cleanUpper === "HELLO";
     if (isDynamicPhrase) {
         if (cleanUpper === clientLastDynamicCommitted.gesture && (now - clientLastDynamicCommitted.time < 1400)) {
             return;
@@ -1308,6 +1397,7 @@ function appendSignToTranscript(sign) {
             clientSentence += clean + " ";
         } else {
             clientSentence += clean;
+            if (cleanUpper === "I") clientLastICommitTime = now;
         }
     }
     updateTranscriptDOM();
@@ -1423,7 +1513,7 @@ async function sendMobileLandmarks(results, stabilizedHands = [], precomputedIso
             const emaSmoothed = mobileLandmarkEMASmoother.smooth("Right", smoothedOneEuro);
             updateMobileRollingSequence(emaSmoothed);
             const landmarks = toMobileLandmarkArray(emaSmoothed);
-            const includeSeq = (mobileSequenceBuffer.length >= 4);
+            const includeSeq = (mobileSequenceBuffer.length >= 8) && (mobileMotionSpeed >= 0.020 || clientDynamicGesture !== null);
 
             const payload = {
                 landmarks: landmarks,
@@ -1432,7 +1522,7 @@ async function sendMobileLandmarks(results, stabilizedHands = [], precomputedIso
                 sequence_buffer: includeSeq ? mobileSequenceBuffer : [],
                 motion_speed: Number(mobileMotionSpeed.toFixed(4)),
                 mode: mobileGestureRoutingMode,
-                is_mirrored: isMirrored,
+                is_mirrored: true,
                 seq_id: currentSeq
             };
 
@@ -1470,7 +1560,7 @@ async function sendMobileLandmarks(results, stabilizedHands = [], precomputedIso
 
             const rPts = toMobileLandmarkArray(rEma);
             const lPts = toMobileLandmarkArray(lEma);
-            const includeSeq = (mobileSequenceBuffer.length >= 4);
+            const includeSeq = (mobileSequenceBuffer.length >= 8) && (mobileMotionSpeed >= 0.020 || clientDynamicGesture !== null);
 
             const allHands = [
                 { label: "Right", points: rPts },
@@ -1486,7 +1576,7 @@ async function sendMobileLandmarks(results, stabilizedHands = [], precomputedIso
                 sequence_buffer: includeSeq ? mobileSequenceBuffer : [],
                 motion_speed: Number(mobileMotionSpeed.toFixed(4)),
                 mode: mobileGestureRoutingMode,
-                is_mirrored: isMirrored,
+                is_mirrored: true,
                 seq_id: currentSeq
             };
 
@@ -1550,10 +1640,18 @@ async function sendMobileInferenceRequest(payload, seqId) {
 
 // ── Mobile Client Webcam Lifecycle ──────────────────────────────────────────
 let mobileFrameLoopId = null;
+let mobileLoopToken = 0;
+let mobileMpInputCanvas = null;
+let mobileMpInputCtx = null;
+const MOBILE_MP_INPUT_WIDTH = 384;
+const MOBILE_MP_ACTIVE_MS = 65; // ~15.5 FPS when hand(s) in view
+const MOBILE_MP_IDLE_MS = 135;  // ~7.5 FPS when 0 hands in view
+const MOBILE_MP_WATCHDOG_MS = 8000; // Catastrophe-only WASM lock timeout
 
 async function startMobileWebcam() {
     try {
         initMobileMediaPipe();
+        const mobileWarmupTask = prewarmMobileMediaPipe();
 
         // 1. Cancel previous frame loop
         if (mobileFrameLoopId) {
@@ -1610,72 +1708,72 @@ async function startMobileWebcam() {
             await dom.webcam.play();
             dom.webcam.style.display = "block";
         }
+        await mobileWarmupTask;
 
         isWebcamActive = true;
         updateCameraMirrorDisplay();
         if (dom.camFallback) dom.camFallback.style.display = "none";
 
-        // Mobile low-light luminance preprocessor
-        let lumMobileCanvas = null;
-        let lumMobileCtx = null;
-        let lastMobileLumTime = 0;
-
-        function evaluateMobileLowLight(videoEl) {
-            if (!videoEl || videoEl.videoWidth === 0) return;
-            const now = performance.now();
-            if (now - lastMobileLumTime < 300) return;
-            lastMobileLumTime = now;
-
-            if (!lumMobileCanvas) {
-                lumMobileCanvas = document.createElement("canvas");
-                lumMobileCanvas.width = 40;
-                lumMobileCanvas.height = 30;
-                lumMobileCtx = lumMobileCanvas.getContext("2d", { willReadFrequently: true });
-            }
-
-            try {
-                lumMobileCtx.drawImage(videoEl, 0, 0, 40, 30);
-                const data = lumMobileCtx.getImageData(0, 0, 40, 30).data;
-                let sumY = 0;
-                const total = 40 * 30;
-                for (let i = 0; i < data.length; i += 4) {
-                    sumY += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-                }
-                const avgLuminance = sumY / total;
-                if (avgLuminance < 45) {
-                    videoEl.style.filter = "brightness(1.25) contrast(1.15)";
-                } else {
-                    videoEl.style.filter = "none";
-                }
-            } catch (e) { }
+        if (!mobileMpInputCanvas) {
+            mobileMpInputCanvas = document.createElement("canvas");
+            mobileMpInputCanvas.width = MOBILE_MP_INPUT_WIDTH;
+            mobileMpInputCanvas.height = 360;
+            mobileMpInputCtx = mobileMpInputCanvas.getContext("2d", { alpha: false, desynchronized: true });
         }
 
-        // 5. Continuous frame processing loop directly into MediaPipe Hands with WASM mutex lock
+        // 5. Self-healing rAF loop + downscaled MediaPipe input (prevents 0-FPS freezes & lag)
+        const myMobileToken = ++mobileLoopToken;
         let isProcessingMobileFrame = false;
-        const onFrame = async () => {
-            if (!isWebcamActive) return;
-            evaluateMobileLowLight(dom.webcam);
-            if (mobileHands && !isProcessingMobileFrame && dom.webcam && dom.webcam.readyState >= 2 && !dom.webcam.paused) {
-                isProcessingMobileFrame = true;
-                try {
-                    await mobileHands.send({ image: dom.webcam });
-                } catch (_) { }
-                finally {
+        let mobileProcStartMs = 0;
+        let lastMobileMpMs = 0;
+
+        const onFrame = async (nowMs) => {
+            if (!isWebcamActive || myMobileToken !== mobileLoopToken) return;
+            mobileFrameLoopId = requestAnimationFrame(onFrame);
+
+            if (document.hidden) return;
+
+            if (dom.webcam && dom.webcam.paused && dom.webcam.srcObject) {
+                dom.webcam.play().catch(() => {});
+                return;
+            }
+            if (!mobileHands || !dom.webcam || dom.webcam.readyState < 2 || dom.webcam.videoWidth === 0) return;
+
+            const ts = nowMs || performance.now();
+            if (isProcessingMobileFrame) {
+                if (ts - mobileProcStartMs > MOBILE_MP_WATCHDOG_MS) {
                     isProcessingMobileFrame = false;
+                } else {
+                    return;
                 }
             }
-            if ("requestVideoFrameCallback" in dom.webcam) {
-                dom.webcam.requestVideoFrameCallback(onFrame);
-            } else {
-                mobileFrameLoopId = requestAnimationFrame(onFrame);
+
+            const isMobileFastMotion = (mobileMotionSpeed >= 0.015 || clientDynamicGesture !== null);
+            const mobileInterval = (mobileDroppedFramesCount >= 5)
+                ? MOBILE_MP_IDLE_MS
+                : (isMobileFastMotion ? 28 : 48);
+            if (ts - lastMobileMpMs < mobileInterval) return;
+            lastMobileMpMs = ts;
+
+            const vw = dom.webcam.videoWidth;
+            const vh = dom.webcam.videoHeight;
+            const targetH = Math.max(180, Math.round((MOBILE_MP_INPUT_WIDTH * vh) / Math.max(1, vw)));
+            if (mobileMpInputCanvas.height !== targetH) {
+                mobileMpInputCanvas.height = targetH;
+            }
+
+            isProcessingMobileFrame = true;
+            mobileProcStartMs = ts;
+            try {
+                mobileMpInputCtx.drawImage(dom.webcam, 0, 0, MOBILE_MP_INPUT_WIDTH, mobileMpInputCanvas.height);
+                await mobileHands.send({ image: mobileMpInputCanvas });
+            } catch (_) { }
+            finally {
+                isProcessingMobileFrame = false;
             }
         };
 
-        if ("requestVideoFrameCallback" in dom.webcam) {
-            dom.webcam.requestVideoFrameCallback(onFrame);
-        } else {
-            mobileFrameLoopId = requestAnimationFrame(onFrame);
-        }
+        mobileFrameLoopId = requestAnimationFrame(onFrame);
 
         showToast(`Active: ${currentFacingMode === "user" ? "Front (Selfie)" : "Rear (Environment)"} Camera`);
     } catch (err) {
@@ -1715,7 +1813,7 @@ function applyMobileTelemetry(data) {
     const upperLive = (liveSign || "").toUpperCase();
     const rawPredUpper = String(data.raw_pred || data.prediction || "").toUpperCase().trim();
     const cleanPredUpper = stripInternalSuffix(data.prediction || "").toUpperCase().trim();
-    const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "J", "Z"]);
+    const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "HELLO", "J", "Z"]);
 
     let displaySign = CONTROL_SIGNS_MAP[upperLive] || liveSign;
     if (CONTROL_SIGNS_MAP[upperLive] || CONTROL_SIGNS_MAP[cleanPredUpper]) {
@@ -1723,7 +1821,9 @@ function applyMobileTelemetry(data) {
         displaySign = ctrl;
     } else if (clientDynamicGesture) {
         displaySign = `${clientDynamicGesture} (IN MOTION)`;
-    } else if (rawPredUpper.endsWith("_END") || rawPredUpper.endsWith("_START") || DYNAMIC_GESTURES.has(cleanPredUpper)) {
+    } else if (rawPredUpper === "J_START") {
+        displaySign = "I";
+    } else if (rawPredUpper.endsWith("_START") || DYNAMIC_GESTURES.has(cleanPredUpper)) {
         displaySign = cleanPredUpper;
     }
 
@@ -1773,9 +1873,16 @@ function applyMobileTelemetry(data) {
     const rawPred = String(data.raw_pred || data.prediction || "").toUpperCase().trim();
 
     // 2. Dynamic Gesture Sequence Countdown Handling
+    if (typeof window._mDynOtherStreak === "undefined") {
+        window._mDynOtherStreak = 0;
+        window._mDynStaticBStreak = 0;
+        window._mHelloStartStreak = 0;
+    }
     if (clientDynamicGesture) {
         const elapsedSec = (now - clientDynamicStartTime) / 1000.0;
-        const dynamicMaxSec = (clientDynamicGesture === "NICE TO MEET YOU") ? 4.2 : 3.0;
+        const dynamicMaxSec = (clientDynamicGesture === "NICE TO MEET YOU")
+            ? 4.2
+            : (clientDynamicGesture === "HELLO" ? 2.0 : 3.0);
         const remainingSec = Math.max(0, dynamicMaxSec - elapsedSec);
         const ratio = Math.max(0, Math.min(100, (remainingSec / dynamicMaxSec) * 100));
 
@@ -1784,14 +1891,16 @@ function applyMobileTelemetry(data) {
         if (dom.dynTimer) dom.dynTimer.textContent = remainingSec.toFixed(1) + "s";
         if (dom.dynBarFill) dom.dynBarFill.style.width = ratio + "%";
 
-        // Transient neutral poses during hand transitions are tolerated (allow up to 1.2s of neutral)
-        const isFrameNeutral = (rawPred === "NEUTRAL" || data.is_neutral || data.prediction === "—" || !data.prediction);
+        const isFrameNeutral = (rawPred === "NEUTRAL" || data.is_neutral || data.prediction === "—" || !data.prediction || detHand === "none");
         if (isFrameNeutral) {
+            const neutralLimitMs = (detHand === "none") ? 350 : 900;
             if (!clientDynamicNeutralStart) {
                 clientDynamicNeutralStart = now;
-            } else if (now - clientDynamicNeutralStart > 1200) {
+            } else if (now - clientDynamicNeutralStart > neutralLimitMs) {
                 clientDynamicGesture = null;
                 clientDynamicNeutralStart = 0;
+                window._mDynOtherStreak = 0;
+                window._mDynStaticBStreak = 0;
                 if (dom.dynBanner) dom.dynBanner.style.display = "none";
                 clientStabilityBuffer = [];
                 updateStabilityDots(0);
@@ -1801,34 +1910,51 @@ function applyMobileTelemetry(data) {
             clientDynamicNeutralStart = 0;
         }
 
-        // Check completion trigger: requires minimum elapsed movement time and true final pose
-        let isEndSignal = false;
+        // Check completion trigger: requires minimum elapsed movement time AND consecutive _END hold frames
+        if (typeof window._mDynEndStreak === "undefined") window._mDynEndStreak = 0;
+        let isEndFrame = false;
+        let requiredEndFrames = 2;
         if (clientDynamicGesture === "NICE TO MEET YOU") {
-            // "Nice to meet you" has 3 parts:
-            // 1. NICE (sliding palms, ~0.0s - 1.2s)
-            // 2. MEET (hands together in middle, ~1.2s - 1.5s) -> Must NOT complete early here!
-            // 3. True LAST FRAME (held at >= 1.5s): user performs end pose (Nice to meet you_END or YOU)
             const isPointingYou = (rawPredUpper === "YOU" || cleanPredUpper === "YOU" || (data.right_gesture && String(data.right_gesture).toUpperCase() === "YOU"));
-            const isNiceEndPose = (rawPredUpper === "NICE TO MEET YOU_END" || rawPredUpper.endsWith("_END"));
-            if (elapsedSec >= 1.5 && (isNiceEndPose || isPointingYou)) {
-                isEndSignal = true;
+            const isNiceEndPose = (rawPredUpper === "NICE TO MEET YOU_END" || (rawPredUpper.endsWith("_END") && cleanPredUpper === "NICE TO MEET YOU"));
+            requiredEndFrames = 3;
+            if (elapsedSec >= 1.65 && (isNiceEndPose || isPointingYou)) {
+                isEndFrame = true;
             }
         } else if (clientDynamicGesture === "HOW ARE YOU") {
             const isPointingYou = (rawPredUpper === "YOU" || cleanPredUpper === "YOU" || (data.right_gesture && String(data.right_gesture).toUpperCase() === "YOU"));
-            const isHowEndPose = (rawPredUpper === "HOW ARE YOU_END" || rawPredUpper.endsWith("_END"));
-            if (elapsedSec >= 0.8 && (isPointingYou || isHowEndPose)) {
-                isEndSignal = true;
+            const isHowEndPose = (rawPredUpper === "HOW ARE YOU_END" || (rawPredUpper.endsWith("_END") && cleanPredUpper === "HOW ARE YOU"));
+            requiredEndFrames = 3;
+            if (elapsedSec >= 1.15 && (isPointingYou || isHowEndPose)) {
+                isEndFrame = true;
+            }
+        } else if (clientDynamicGesture === "HELLO") {
+            const isHelloEnd = (rawPredUpper === "HELLO_END" || (rawPredUpper.endsWith("_END") && cleanPredUpper === "HELLO"));
+            requiredEndFrames = 2;
+            if (isHelloEnd && elapsedSec >= 0.40) {
+                isEndFrame = true;
             }
         } else {
             // Other dynamic gestures (e.g. J, Z)
-            if (rawPredUpper.endsWith("_END") && elapsedSec >= 0.4) {
-                isEndSignal = true;
+            requiredEndFrames = 2;
+            if (rawPredUpper === `${clientDynamicGesture}_END` && elapsedSec >= 0.50) {
+                isEndFrame = true;
             }
         }
+        if (isEndFrame) {
+            window._mDynEndStreak++;
+        } else if (!isFrameNeutral) {
+            window._mDynEndStreak = 0;
+        }
+        const isEndSignal = (window._mDynEndStreak >= requiredEndFrames);
         if (isEndSignal) {
+            window._mDynEndStreak = 0;
             const completedGesture = clientDynamicGesture;
+            if (completedGesture === "J") retractRecentStaticI(now);
             clientDynamicGesture = null;
             clientDynamicNeutralStart = 0;
+            window._mDynOtherStreak = 0;
+            window._mDynStaticBStreak = 0;
             clientDynamicCooldownUntil = now + 1000;
             clientSuppressYouUntil = now + 1800;
             activeSign = completedGesture;
@@ -1848,31 +1974,139 @@ function applyMobileTelemetry(data) {
             return;
         }
 
-        // Cancel if timeout reached without reaching the completion pose
-        if (remainingSec <= 0) {
-            clientDynamicGesture = null;
-            clientDynamicNeutralStart = 0;
-            if (dom.dynBanner) dom.dynBanner.style.display = "none";
-            clientStabilityBuffer = [];
-            updateStabilityDots(0);
+        // Preempt / stop dynamic timer immediately when user performs another gesture!
+        let mCancelledByOther = false;
+        const mIsOneHandDyn = (clientDynamicGesture === "HELLO" || clientDynamicGesture === "J" || clientDynamicGesture === "Z");
+        if (!isFrameNeutral) {
+            const mIsOtherStart = rawPredUpper.endsWith("_START") && cleanPredUpper !== clientDynamicGesture && (mIsOneHandDyn || detHand === "both");
+            const mIsTwoHandSwitch = mIsOneHandDyn && (detHand === "both" || Boolean(CONTROL_SIGNS_MAP[cleanPredUpper]));
+            let mIncompat = false;
+            if (clientDynamicGesture === "HELLO") {
+                if (cleanPredUpper === "B" && mobileMotionSpeed < 0.018) {
+                    window._mDynStaticBStreak++;
+                } else {
+                    window._mDynStaticBStreak = 0;
+                }
+                if (cleanPredUpper !== "HELLO" && cleanPredUpper !== "B" && confVal >= 0.55) {
+                    mIncompat = true;
+                }
+            } else if (clientDynamicGesture === "J") {
+                if (
+                    (cleanPredUpper === "Y" && mobileMotionSpeed < 0.020)
+                    || (rawPredUpper === "J_START" && mobileMotionSpeed < 0.018)
+                ) {
+                    window._mDynStaticBStreak++;
+                } else {
+                    window._mDynStaticBStreak = 0;
+                }
+                if (cleanPredUpper !== "J" && cleanPredUpper !== "I" && cleanPredUpper !== "Y" && confVal >= 0.62) {
+                    mIncompat = true;
+                }
+            } else if (clientDynamicGesture === "Z") {
+                if (["D", "X", "P", "Q", "Z"].includes(cleanPredUpper) && rawPredUpper !== "Z_END" && mobileMotionSpeed < 0.018) {
+                    window._mDynStaticBStreak++;
+                } else {
+                    window._mDynStaticBStreak = 0;
+                }
+                if (!["Z", "D", "G", "L", "X", "P", "Q", "YOU"].includes(cleanPredUpper) && confVal >= 0.62) {
+                    mIncompat = true;
+                }
+            } else if ((cleanPredUpper === "START" || cleanPredUpper === "STOP") && confVal >= 0.65) {
+                mIncompat = true;
+            }
+
+            if (mIsTwoHandSwitch || mIsOtherStart || mIncompat) {
+                window._mDynOtherStreak++;
+            } else {
+                window._mDynOtherStreak = 0;
+            }
+
+            if (window._mDynOtherStreak >= 2 || window._mDynStaticBStreak >= 6) {
+                clientDynamicGesture = null;
+                clientDynamicNeutralStart = 0;
+                window._mDynOtherStreak = 0;
+                window._mDynStaticBStreak = 0;
+                if (dom.dynBanner) dom.dynBanner.style.display = "none";
+                mCancelledByOther = true;
+            }
+        }
+
+        if (!mCancelledByOther) {
+            // Cancel if timeout reached without reaching the completion pose
+            if (remainingSec <= 0) {
+                clientDynamicGesture = null;
+                clientDynamicNeutralStart = 0;
+                window._mDynOtherStreak = 0;
+                window._mDynStaticBStreak = 0;
+                if (dom.dynBanner) dom.dynBanner.style.display = "none";
+                clientStabilityBuffer = [];
+                updateStabilityDots(0);
+                return;
+            }
             return;
         }
-        return;
     } else {
         if (dom.dynBanner) dom.dynBanner.style.display = "none";
     }
 
     // 3. Initiate dynamic gesture ONLY on a genuine _START frame with solid confidence
-    // (Never on bare names or _END frames, preventing accidental initiation)
+    // ── Static "I" vs Dynamic "J" ──
+    let forceJStart = false;
+    let forceJBackdateMs = 0;
+    const mIsJMotionPattern = isDrawingJPattern(mobileSequenceBuffer, rawPredUpper);
+    if (!clientDynamicGesture && rawPredUpper === "J_START") {
+        clientIPoseLastSeen = now;
+        if (now < clientDynamicCooldownUntil) {
+            updateStabilityDots(0);
+            return;
+        }
+        if (!mIsJMotionPattern) {
+            // Holding or repositioning the hand (upward/sideways/slight shift) in I pose -> static letter "I"
+            if (now < lockUntil && activeSign !== null) {
+                if (dom.signVal) dom.signVal.textContent = activeSign;
+            } else {
+                handlePrediction("I", confVal, data.status);
+                if (dom.signVal) dom.signVal.textContent = (activeSign !== null) ? activeSign : "I";
+            }
+            return;
+        }
+        // Hand is actively drawing the downward J stroke -> start dynamic "J"
+        forceJStart = true;
+    } else if (
+        !clientDynamicGesture
+        && now >= clientDynamicCooldownUntil
+        && (now - clientIPoseLastSeen) < 1400
+        && mIsJMotionPattern
+        && (cleanPredUpper === "J" || cleanPredUpper === "Y" || cleanPredUpper === "I")
+    ) {
+        // Hand just left the "I" pose and is drawing the J curve (mid-swoop / J_END) -> start "J"
+        forceJStart = true;
+        if (rawPredUpper === "J_END") forceJBackdateMs = 400;
+    }
+
     const isStartCandidate = (now >= clientDynamicCooldownUntil) && (
         rawPredUpper.endsWith("_START")
     );
-    if (isStartCandidate && confVal >= 0.40 && DYNAMIC_GESTURES.has(cleanPredUpper)) {
-        const candidate = cleanPredUpper;
+    if (forceJStart || (isStartCandidate && confVal >= 0.50 && DYNAMIC_GESTURES.has(cleanPredUpper))) {
+        if (!forceJStart && cleanPredUpper === "Z" && !isDrawingZPattern(mobileSequenceBuffer)) {
+            return;
+        }
+        if (!forceJStart && cleanPredUpper === "HELLO") {
+            window._mHelloStartStreak = (window._mHelloStartStreak || 0) + 1;
+            if (window._mHelloStartStreak < 2) {
+                return;
+            }
+        } else {
+            window._mHelloStartStreak = 0;
+        }
+        const candidate = forceJStart ? "J" : cleanPredUpper;
         clientDynamicGesture = candidate;
-        clientDynamicStartTime = now;
+        clientDynamicStartTime = now - forceJBackdateMs;
         clientDynamicNeutralStart = 0;
-        const candidateMaxSec = (candidate === "NICE TO MEET YOU") ? 4.5 : 3.0;
+        window._mDynOtherStreak = 0;
+        window._mDynStaticBStreak = 0;
+        window._mHelloStartStreak = 0;
+        const candidateMaxSec = (candidate === "NICE TO MEET YOU") ? 4.2 : (candidate === "HELLO" ? 2.0 : 3.0);
         if (dom.dynBanner) {
             dom.dynBanner.style.display = "flex";
             if (dom.dynTitle) dom.dynTitle.textContent = candidate;
@@ -1881,6 +2115,8 @@ function applyMobileTelemetry(data) {
         }
         clientStabilityBuffer = [];
         return;
+    } else {
+        window._mHelloStartStreak = 0;
     }
 
     // Dynamic Frame Guard:
@@ -1945,6 +2181,10 @@ function applyMobileTelemetry(data) {
     const candUpper = (cleanPred || "").toUpperCase().trim();
     const predUpper = (data.prediction || "").toUpperCase().trim();
 
+    if (now < clientSuppressYouUntil && (candUpper === "YOU" || predUpper === "YOU")) {
+        return;
+    }
+
     if (now < lockUntil && activeSign !== null) {
         // Cooldown lockout: maintain current sign without volatile interim swapping
         if (dom.signVal) dom.signVal.textContent = activeSign;
@@ -1969,7 +2209,7 @@ function commitSignToUI(sign) {
     updateMobilePipelineStatusUI("Stable");
     updateStabilityDots(CONFIRM_WIN_COUNT);
 
-    const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "J", "Z"]);
+    const DYNAMIC_GESTURES = new Set(["HOW ARE YOU", "NICE TO MEET YOU", "HELLO", "J", "Z"]);
     if (upper === "NEUTRAL" || upper === "IDLE") {
         mobileHasPassedThroughNeutral = true;
         return;
